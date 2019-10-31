@@ -59,6 +59,8 @@ struct raft_params {
         , leadership_expiry_(0)
         , allow_temporary_zero_priority_leader_(true)
         , auto_forwarding_(false)
+        , use_bg_thread_for_urgent_commit_(true)
+        , use_separate_lock_for_user_threads_(true)
         , return_method_(blocking)
         {}
 
@@ -371,6 +373,16 @@ public:
     // to the current leader.
     // Otherwise, it will return error to client immediately.
     bool auto_forwarding_;
+
+    // If true, creating replication (append_entries) requests will be
+    // done by a backgroudn thread, instead of doing it in user threads.
+    // There can be some delay a little bit, but it improves reducing
+    // the lock contention.
+    bool use_bg_thread_for_urgent_commit_;
+
+    // If true, user threads will not share the same lock used
+    // by Raft background workers. It will reduce the lock contention.
+    bool use_separate_lock_for_user_threads_;
 
     // To choose blocking call or asynchronous call.
     return_method_type return_method_;
