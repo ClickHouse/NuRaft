@@ -333,7 +333,7 @@ public:
 
             // Verify CRC.
             if (crc_local != crc_hdr) {
-                auto received_data = std::string(header_data, RPC_REQ_HEADER_SIZE);
+                auto received_data = std::string(reinterpret_cast<char *>(header_data), RPC_REQ_HEADER_SIZE);
                 p_er("CRC mismatch: local calculation %x, from header %x, message: %s, received from socket %s:%u",
                      crc_local, crc_hdr, received_data.c_str(), cached_address_.c_str(), cached_port_);
                 this->stop();
