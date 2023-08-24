@@ -32,11 +32,12 @@ ptr<raft_server> raft_launcher::init(ptr<state_machine> sm,
                                      int port_number,
                                      const asio_service::options& asio_options,
                                      const raft_params& params_given,
-                                     const raft_server::init_options& opt)
+                                     const raft_server::init_options& opt,
+                                     const bool enable_ipv6)
 {
     asio_svc_ = cs_new<asio_service>(asio_options, lg);
 
-    auto asio_listener = asio_svc_->create_rpc_listener(port_number, lg);
+    auto asio_listener = asio_svc_->create_rpc_listener(port_number, lg, enable_ipv6);
     if (!asio_listener) return nullptr;
 
     asio_listeners_.emplace_back(std::move(asio_listener));
