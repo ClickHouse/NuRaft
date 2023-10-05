@@ -378,7 +378,7 @@ public:
 
             header_->pos(RPC_REQ_HEADER_SIZE - CRC_FLAGS_LEN - DATA_SIZE_LEN);
             int32 data_size = header_->get_int();
-            
+
             if (data_size < 0) {
                 p_er("bad log data size in the header %d, stop "
                      "this session to protect further corruption",
@@ -391,22 +391,8 @@ public:
                 p_wn("large data size in the header %d", data_size);
             }
 
-            if (data_size == 0) {
-                // Don't carry data, immediately process request.
-                this->read_complete(header_, nullptr);
-
-            } else {
-                // Carry some data, need to read further.
-                ptr<buffer> log_ctx = buffer::alloc((size_t)data_size);
-                aa::read( ssl_enabled_, ssl_socket_, socket_,
-                          asio::buffer( log_ctx->data(),
-                                        (size_t)data_size ),
-                          std::bind( &rpc_session::read_log_data,
-                                     self,
-                                     log_ctx,
-                                     std::placeholders::_1,
-                                     std::placeholders::_2 ) );
-            }
+            data_left_ = data_size;
+            this->read_complete(header_);
         } );
     }
 
@@ -459,22 +445,155 @@ private:
 #endif
     }
 
-    void read_log_data(ptr<buffer> log_ctx,
-                       const ERROR_CODE& err,
-                       size_t bytes_read) {
-        if (!err) {
-            this->read_complete(header_, log_ctx);
-        } else {
-            p_er( "session %" PRIu64 " failed to read rpc log data from socket due "
-                  "to error %d, %s",
-                  session_id_,
-                  err.value(),
-                  err.message().c_str() );
+    void finish(ptr<req_msg> req)
+    {
+        ptr<rpc_session> self = this->shared_from_this();
+
+        read_data_ = false;
+
+        // If callback is given, verify meta
+        // (if meta is empty, invoke callback according to the flag).
+        if ( impl_->get_options().read_req_meta_ &&
+             ( !meta_str_.empty() ||
+               impl_->get_options().invoke_req_cb_on_empty_meta_ ) ) {
+            if ( !impl_->get_options().read_req_meta_
+                  ( req_to_params(req), meta_str_ ) ) {
+                this->stop();
+                return;
+            }
+        }
+
+        // === RAFT server processes the request here. ===
+        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req);
+        if (!resp) {
+            p_wn("no response is returned from raft message handler");
             this->stop();
+            return;
+        }
+
+        if (resp->has_async_cb()) {
+            // Response will be ready later, setup a callback function
+            // (only for auto-forwarding with `client_request` type
+            //  in async handling mode).
+            ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
+
+            // WARNING: `self` should be captured to avoid releasing this `rpc_session`.
+            ret->when_ready(
+                [this, self, req, resp]
+                ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
+                  ptr<std::exception>& exp ) {
+                    resp->set_ctx(res.get());
+                    on_resp_ready(req, resp);
+                    // This is needed to avoid circular reference.
+                    res.reset();
+                }
+            );
+
+        } else {
+            // Response should already be ready when we reach here.
+            if (resp->has_cb()) {
+                // If callback function exists, get new response message.
+                resp = resp->call_cb(resp);
+            }
+            on_resp_ready(req, resp);
         }
     }
 
-    void read_complete(ptr<buffer> hdr, ptr<buffer> log_ctx) {
+    void read_log_header(ptr<req_msg> req) {
+        ptr<rpc_session> self = this->shared_from_this();
+        log_header_->pos(0);
+
+        aa::read( ssl_enabled_, ssl_socket_, socket_,
+                    asio::buffer( log_header_->data(),
+                                log_header_->size() ),
+                    [self, req](auto /*error_code*/, auto bytes_read) { self->on_read_log_header(req, bytes_read); } );
+
+    }
+
+    void on_read_meta_len(ptr<req_msg> req, size_t meta_len) {
+        ptr<rpc_session> self = this->shared_from_this();
+
+        if (meta_len == 0)
+        {
+            if (read_data_)
+                read_log_header(std::move(req));
+
+            return;
+        }
+
+        auto meta_buf = buffer::alloc(meta_len);
+        aa::read( ssl_enabled_, ssl_socket_, socket_,
+                    asio::buffer(meta_buf->data(),
+                                    meta_buf->size() ),
+                [req, meta_buf, meta_len, self](auto /*error_code*/, auto bytes_read) {
+                    auto & l_ = self->l_;
+                    if (bytes_read != meta_len) {
+                        // Possibly corrupted packet. Stop here.
+                        p_wn("failed to read meta string expected %zu got %zu, stop this session",
+                                meta_len, bytes_read);
+                        self->stop();
+                        return;
+                    }
+
+                    self->meta_str_ = std::string{reinterpret_cast<const char *>(meta_buf->data_begin()), meta_buf->size()};
+
+                    if (self->read_data_)
+                        self->read_log_header(req);
+                    else
+                        self->finish(req);
+                });
+    }
+
+    void on_read_log_header(ptr<req_msg> req, size_t bytes_read) {
+        ptr<rpc_session> self = this->shared_from_this();
+
+        if (bytes_read < log_entry_size_) {
+            // Possibly corrupted packet. Stop here.
+            p_wn("wrong log ctx size %zu expected %zu, stop this session",
+                    bytes_read, log_entry_size_);
+            this->stop();
+            return;
+        }
+
+        data_left_ -= log_entry_size_;
+
+        buffer_serializer ss(log_header_);
+        ulong term = ss.get_u64();
+        log_val_type val_type = (log_val_type)ss.get_u8();
+        uint64_t timestamp = (flags_ & INCLUDE_LOG_TIMESTAMP) ? ss.get_u64() : 0;
+
+        size_t val_size = ss.get_i32();
+
+        ptr<buffer> log_buf( buffer::alloc(val_size) );
+
+        aa::read( ssl_enabled_, ssl_socket_, socket_,
+                    asio::buffer( log_buf->data(),
+                                log_buf->size() ),
+                    [self, req, val_size, term, val_type, timestamp, log_buf](auto /* error_code */, auto bytes_read) {
+                        auto & l_ = self->l_;
+                        if (bytes_read < val_size) {
+                            // Out-of-bound size.
+                            p_wn("wrong value size %zu expected %zu, "
+                                "stop this session",
+                                bytes_read, val_size);
+                            self->stop();
+                            return;
+                        }
+                        ptr<log_entry> entry(
+                            cs_new<log_entry>(term, log_buf, val_type, timestamp) );
+                        req->log_entries().push_back(entry);
+
+                        self->data_left_ -= val_size;
+
+                        if (self->data_left_) {
+                            self->read_log_header(req);
+                        } else {
+                            self->finish(req);
+                        }
+                    } );
+    }
+
+    void read_complete(ptr<buffer> hdr) {
         ptr<rpc_session> self = this->shared_from_this();
 
        try {
@@ -525,104 +644,38 @@ private:
             }
         }
 
-        std::string meta_str;
         ptr<req_msg> req = cs_new<req_msg>
                            ( term, t, src, dst, last_term, last_idx, commit_idx );
-        if (hdr->get_int() > 0 && log_ctx) {
-            buffer_serializer ss(log_ctx);
-            size_t log_ctx_size = log_ctx->size();
 
-            // If flag is set, read meta first.
-            if (flags_ & INCLUDE_META) {
-                size_t meta_len = 0;
-                const byte* meta_raw = (const byte*)ss.get_bytes(meta_len);
-                if (meta_len) {
-                    meta_str = std::string((const char*)meta_raw, meta_len);
-                }
-            }
-
-            size_t LOG_ENTRY_SIZE = 8 + 1 + 4;
+        if (hdr->get_int() > 0 && data_left_) {
+            log_entry_size_ = 8 + 1 + 4;
             if (flags_ & INCLUDE_LOG_TIMESTAMP) {
-                LOG_ENTRY_SIZE += 8;
+                log_entry_size_ += 8;
             }
 
-            while (log_ctx_size > ss.pos()) {
-                if (log_ctx_size - ss.pos() < LOG_ENTRY_SIZE) {
-                    // Possibly corrupted packet. Stop here.
-                    p_wn("wrong log ctx size %zu pos %zu, stop this session",
-                         log_ctx_size, ss.pos());
-                    this->stop();
-                    return;
-                }
-                ulong term = ss.get_u64();
-                log_val_type val_type = (log_val_type)ss.get_u8();
-                uint64_t timestamp = (flags_ & INCLUDE_LOG_TIMESTAMP) ? ss.get_u64() : 0;
-
-                size_t val_size = ss.get_i32();
-                if (log_ctx_size - ss.pos() < val_size) {
-                    // Out-of-bound size.
-                    p_wn("wrong value size %zu log ctx %zu %zu, "
-                         "stop this session",
-                         val_size, log_ctx_size, ss.pos());
-                    this->stop();
-                    return;
-                }
-
-                ptr<buffer> buf( buffer::alloc(val_size) );
-                ss.get_buffer(buf);
-                ptr<log_entry> entry(
-                    cs_new<log_entry>(term, buf, val_type, timestamp) );
-                req->log_entries().push_back(entry);
-            }
+            log_header_ = buffer::alloc(log_entry_size_);
+            read_data_ = true;
         }
 
-        // If callback is given, verify meta
-        // (if meta is empty, invoke callback according to the flag).
-        if ( impl_->get_options().read_req_meta_ &&
-             ( !meta_str.empty() ||
-               impl_->get_options().invoke_req_cb_on_empty_meta_ ) ) {
-            if ( !impl_->get_options().read_req_meta_
-                  ( req_to_params(req), meta_str ) ) {
-                this->stop();
-                return;
-            }
-        }
-
-        // === RAFT server processes the request here. ===
-        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req);
-        if (!resp) {
-            p_wn("no response is returned from raft message handler");
-            this->stop();
+        // If flag is set, read meta first.
+        if (flags_ & INCLUDE_META) {
+            auto meta_buf = buffer::alloc(4);
+            aa::read(ssl_enabled_, ssl_socket_, socket_,
+                        asio::buffer(meta_buf->data(),
+                                     meta_buf->size()),
+                    [req, meta_buf, self](auto /*error_code*/, auto /*bytes_read*/) {
+                        buffer_serializer ss(*meta_buf);
+                        auto meta_len = ss.get_u32();
+                        self->on_read_meta_len(req, meta_len);
+                    });
             return;
         }
 
-        if (resp->has_async_cb()) {
-            // Response will be ready later, setup a callback function
-            // (only for auto-forwarding with `client_request` type
-            //  in async handling mode).
-            ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
-
-            // WARNING: `self` should be captured to avoid releasing this `rpc_session`.
-            ret->when_ready(
-                [this, self, req, resp]
-                ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
-                  ptr<std::exception>& exp ) {
-                    resp->set_ctx(res.get());
-                    on_resp_ready(req, resp);
-                    // This is needed to avoid circular reference.
-                    res.reset();
-                }
-            );
-
-        } else {
-            // Response should already be ready when we reach here.
-            if (resp->has_cb()) {
-                // If callback function exists, get new response message.
-                resp = resp->call_cb(resp);
-            }
-            on_resp_ready(req, resp);
+        if (read_data_) {
+            read_log_header(req);
+        } else  {
+            finish(std::move(req));
         }
-
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to process request message "
               "due to error: %s",
@@ -736,6 +789,11 @@ private:
     ssl_socket ssl_socket_;
     bool ssl_enabled_;
     uint32_t flags_;
+    size_t data_left_;
+    bool read_data_{false};
+    std::string meta_str_;
+    ptr<buffer> log_header_{nullptr};
+    size_t log_entry_size_{0};
     ptr<buffer> log_data_;
     ptr<buffer> header_;
     ptr<logger> l_;
