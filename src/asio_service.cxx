@@ -55,7 +55,6 @@ limitations under the License.
 #include <thread>
 #include <string>
 #include <sstream>
-#include <regex>
 
 #ifdef USE_BOOST_ASIO
     using namespace boost;
@@ -378,7 +377,7 @@ public:
 
             header_->pos(RPC_REQ_HEADER_SIZE - CRC_FLAGS_LEN - DATA_SIZE_LEN);
             int32 data_size = header_->get_int();
-            
+
             if (data_size < 0) {
                 p_er("bad log data size in the header %d, stop "
                      "this session to protect further corruption",
