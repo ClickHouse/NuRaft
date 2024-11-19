@@ -33,6 +33,8 @@ limitations under the License.
 #include <thread>
 #include <unordered_map>
 
+#include "thread.hxx"
+
 class EventAwaiter;
 
 namespace nuraft {
@@ -157,7 +159,7 @@ private:
     /**
      * A dedicated thread for reading snapshot object.
      */
-    std::thread io_thread_;
+    nuraft_thread io_thread_;
 
     /**
      * Event awaiter for `io_thread_`.

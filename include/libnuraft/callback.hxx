@@ -211,12 +211,39 @@ public:
         ResignationFromLeader = 27,
 
         /**
+         * Initial batch of entries commited.
+         * Useful on server init when server startup from
+         * huge log storage.
+         * ctx: null
+         */
+        InitialBatchCommited = 28,
+
+        /**
+         * Called before log is appended to the entries on leader node.
+         * ctx: pointer to the ptr<log_entry>
+         */
+        PreAppendLogLeader = 29,
+
+        /**
+         * Called when appending a log fails.
+         * Happens on leader only.
+         * ctx: pointer to the ptr<log_entry>
+         */
+        AppendLogFailed = 30,
+
+        /**
+         * Called before log is appended to the entries on follower node.
+         * ctx: pointer to the ptr<log_entry>
+         */
+        PreAppendLogFollower = 31,
+
+        /**
          * When a peer RPC errors count exceeds raft_server::limits.warning_limit_, or
          * a peer doesn't respond for a long time (raft_params::leadership_expiry_),
          * the peer is considered lost.
          * ctx: null.
          */
-        FollowerLost = 28,
+        FollowerLost = 32,
 
         /**
          * When the server receives a misbehaving message from a peer,
@@ -228,7 +255,7 @@ public:
          *
          * ctx: pointer to `ReqResp` instance.
          */
-        ReceivedMisbehavingMessage = 29,
+        ReceivedMisbehavingMessage = 33,
     };
 
     struct Param {

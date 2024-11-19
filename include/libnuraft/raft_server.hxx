@@ -31,6 +31,7 @@ limitations under the License.
 #include "srv_role.hxx"
 #include "srv_state.hxx"
 #include "timer_task.hxx"
+#include "thread.hxx"
 
 #include <list>
 #include <map>
@@ -916,6 +917,7 @@ protected:
     ptr<resp_msg> handle_priority_change_req(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
+    ptr<resp_msg> handle_leader_status_req(req_msg& req);
 
     void handle_join_cluster_resp(resp_msg& resp);
     void handle_log_sync_resp(resp_msg& resp);
@@ -984,15 +986,16 @@ protected:
     void on_retryable_req_err(ptr<peer>& p, ptr<req_msg>& req);
     ulong term_for_log(ulong log_idx);
 
-    void commit_in_bg();
-    bool commit_in_bg_exec(size_t timeout_ms = 0);
+    virtual void commit_in_bg();
+    bool commit_in_bg_exec(size_t timeout_ms = 0, bool initial_commit_exec = false);
 
     void append_entries_in_bg();
     void append_entries_in_bg_exec();
 
     void commit_app_log(ulong idx_to_commit,
                         ptr<log_entry>& le,
-                        bool need_to_handle_commit_elem);
+                        bool need_to_handle_commit_elem,
+                        bool initial_commit_exec);
     void commit_conf(ulong idx_to_commit, ptr<log_entry>& le);
 
     ptr< cmd_result< ptr<buffer> > >
@@ -1050,13 +1053,13 @@ protected:
      * (Read-only)
      * Background thread for commit and snapshot.
      */
-    std::thread bg_commit_thread_;
+    nuraft_thread bg_commit_thread_;
 
     /**
      * (Read-only)
      * Background thread for sending quick append entry request.
      */
-    std::thread bg_append_thread_;
+    nuraft_thread bg_append_thread_;
 
     /**
      * Condition variable to invoke append thread.
@@ -1546,6 +1549,13 @@ protected:
      * The term when `vote_init_timer_` was reset.
      */
     std::atomic<ulong> vote_init_timer_term_;
+
+    /**
+     * This flag is true only for the first execution of commit. Useful when we
+     * need to detect the case when we commiting log store to state-machine during
+     * server startup.
+     */
+    std::atomic<bool> initial_commit_exec_{true};
 
     /**
      * (Experimental)

@@ -33,12 +33,12 @@ void peer::send_req( ptr<peer> myself,
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
-             config_->get_id());
+             get_config().get_id());
         return;
     }
 
     if (req) {
-        p_tr("send req %d -> %d, type %s",
+        p_ts("send req %d -> %d, type %s",
              req->get_src(),
              req->get_dst(),
              msg_type_to_string( req->get_type() ).c_str() );
@@ -50,7 +50,7 @@ void peer::send_req( ptr<peer> myself,
         if (!rpc_) {
             // Nothing will be sent, immediately free it
             // to serve next operation.
-            p_tr("rpc local is null");
+            p_ts("rpc local is null");
             set_free();
             return;
         }
@@ -95,12 +95,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
     } );
 
     if (abandoned_) {
-        p_in("peer %d has been shut down, ignore response.", config_->get_id());
+        p_in("peer %d has been shut down, ignore response.", get_config().get_id());
         return;
     }
 
     if (req) {
-        p_tr( "resp of req %d -> %d, type %s, %s",
+        p_ts( "resp of req %d -> %d, type %s, %s",
               req->get_src(),
               req->get_dst(),
               msg_type_to_string( req->get_type() ).c_str(),
@@ -118,7 +118,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 p_wn( "[EDGE CASE] got stale RPC response from %d: "
                       "current %p (%" PRIu64 "), from parameter %p (%" PRIu64 "). "
                       "will ignore this response",
-                      config_->get_id(),
+                      get_config().get_id(),
                       rpc_.get(),
                       cur_rpc_id,
                       my_rpc_client.get(),
@@ -224,7 +224,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reconn_backoff_.set_duration_ms(new_duration_ms);
 
         rpc_ = factory->create_client(config->get_endpoint());
-        p_tr("%p reconnect peer %d", rpc_.get(), config_->get_id());
+        p_ts("%p reconnect peer %d", rpc_.get(), get_config().get_id());
 
         // WARNING:
         //   A reconnection attempt should be treated as an activity,
@@ -236,7 +236,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         return true;
 
     } else {
-        p_tr("skip reconnect this time");
+        p_ts("skip reconnect this time");
     }
     return false;
 }

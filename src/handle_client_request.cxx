@@ -35,6 +35,44 @@ limitations under the License.
 
 namespace nuraft {
 
+ptr<resp_msg> raft_server::handle_leader_status_req(req_msg& req) {
+    const auto get_leader_status = [&, this] {
+        ulong cur_term = state_->get_term();
+
+        auto resp = cs_new<resp_msg>( cur_term,
+                                 msg_type::leader_status_response,
+                                 id_,
+                                 req.get_src(),
+                                 0,
+                                 true );
+        if (role_ != srv_role::leader || write_paused_) {
+            resp->set_result_code( cmd_result_code::NOT_LEADER );
+            return resp;
+        }
+
+        auto ctx = buffer::alloc(8 + 8);
+        ctx->put(cur_term);
+        ctx->put(sm_commit_index_.load());
+        ctx->pos(0);
+        resp->set_ctx(std::move(ctx));
+        return resp;
+    };
+
+    ptr<raft_params> params = ctx_->get_params();
+    switch (params->locking_method_type_) {
+        case raft_params::single_mutex: {
+            recur_lock(lock_);
+            return get_leader_status();
+        }
+        case raft_params::dual_mutex:
+        default: {
+            // TODO: Use RW lock here.
+            auto_lock(cli_lock_);
+            return get_leader_status();
+        }
+    }
+}
+
 ptr<resp_msg> raft_server::handle_cli_req_prelock(req_msg& req,
                                                   const req_ext_params& ext_params)
 {
@@ -111,19 +149,47 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
     }
 
     std::vector< ptr<log_entry> >& entries = req.log_entries();
+
     size_t num_entries = entries.size();
 
     for (size_t i = 0; i < num_entries; ++i) {
-        // force the log's term to current term
-        entries.at(i)->set_term(cur_term);
-        entries.at(i)->set_timestamp(timestamp_us);
+        auto & entry = entries.at(i);
 
-        ulong next_slot = store_log_entry(entries.at(i));
-        p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
-             next_slot, timestamp_us);
+        // force the log's term to current term
+        entry->set_term(cur_term);
+        entry->set_timestamp(timestamp_us);
+        ulong next_slot = 0;
+
+        try
+        {
+            cb_func::Param param(id_, leader_);
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::PreAppendLogLeader, &param);
+            if (rc == CbReturnCode::ReturnNull) return nullptr;
+
+            // force the log's term to current term
+            entry->set_term(cur_term);
+
+            next_slot = store_log_entry(entry);
+            p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
+                 next_slot, timestamp_us);
+        }
+        catch (const std::exception & e)
+        {
+            p_er("failed to append entry: %s\n", e.what());
+            try_update_precommit_index(last_idx);
+
+            cb_func::Param param(id_, leader_);
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::AppendLogFailed, &param);
+            if (rc == CbReturnCode::ReturnNull) return nullptr;
+
+            throw;
+        }
+
         last_idx = next_slot;
 
-        ptr<buffer> buf = entries.at(i)->get_buf_ptr();
+        ptr<buffer> buf = entry->get_buf_ptr();
         buf->pos(0);
         ret_value = state_machine_->pre_commit_ext
                     ( state_machine::ext_op_params( last_idx, buf ) );

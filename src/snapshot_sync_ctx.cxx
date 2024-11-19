@@ -69,7 +69,7 @@ snapshot_io_mgr::snapshot_io_mgr()
     : io_thread_ea_(new EventAwaiter())
     , terminating_(false)
 {
-    io_thread_ = std::thread(&snapshot_io_mgr::async_io_loop, this);
+    io_thread_ = nuraft_thread(&snapshot_io_mgr::async_io_loop, this);
 }
 
 snapshot_io_mgr::~snapshot_io_mgr() {

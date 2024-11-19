@@ -458,6 +458,12 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
 }
 
 bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard) {
+ const auto handle_install_failure = [&]
+ {
+    ctx_->state_mgr_->system_exit(raft_err::N13_snapshot_install_failed);
+    _sys_exit(-1);
+ };
+
  try {
     // if offset == 0, it is the first object.
     bool is_first_obj = (req.get_offset()) ? false : true;
@@ -523,11 +529,13 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
         // while they are being compacted
         guard.unlock();
         pause_state_machine_exeuction();
+
         size_t wait_count = 0;
         while (!wait_for_state_machine_pause(500)) {
             p_in("waiting for state machine pause before applying snapshot: count %zu",
                  ++wait_count);
         }
+        
         guard.lock();
 
         struct ExecAutoResume {
@@ -605,11 +613,16 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
         }
     }
 
+ } catch (const std::exception & e) {
+    // LCOV_EXCL_START
+    p_er("failed to handle snapshot installation due to error: %s", e.what());
+    handle_install_failure();
+    return false;
+    // LCOV_EXCL_STOP
  } catch (...) {
     // LCOV_EXCL_START
     p_er("failed to handle snapshot installation due to system errors");
-    ctx_->state_mgr_->system_exit(raft_err::N13_snapshot_install_failed);
-    _sys_exit(-1);
+    handle_install_failure();
     return false;
     // LCOV_EXCL_STOP
  }

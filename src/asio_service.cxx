@@ -18,6 +18,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 **************************************************************************/
 
+#include <asio/ip/address.hpp>
 #define ASIO_HAS_STD_CHRONO 1
 #if defined(__EDG_VERSION__)
 #undef __EDG_VERSION__
@@ -47,8 +48,11 @@ limitations under the License.
 #include <atomic>
 #include <ctime>
 #include <exception>
+#include <ios>
 #include <list>
 #include <thread>
+#include <string>
+#include <sstream>
 
 #ifdef USE_BOOST_ASIO
     using namespace boost;
@@ -206,7 +210,7 @@ private:
     std::condition_variable stopping_cv_;
     std::atomic<uint32_t> num_active_workers_;
     std::atomic<uint32_t> worker_id_;
-    std::list< ptr<std::thread> > worker_handles_;
+    std::list< ptr<nuraft_thread> > worker_handles_;
     asio_service::options my_opt_;
     std::atomic<uint64_t> client_id_counter_;
     ptr<logger> l_;
@@ -367,8 +371,14 @@ public:
             // Verify CRC (if entire message validation is disbaled).
             if ( !(flags_ & CRC_ON_ENTIRE_MESSAGE) &&
                  crc_header_ != crc_from_msg_ ) {
-                p_er("header CRC mismatch: local calculation %x, from message %x",
-                     crc_header_, crc_from_msg_);
+                auto received_data = std::string(reinterpret_cast<char *>(header_data), RPC_REQ_HEADER_SIZE);
+                std::stringstream ss;
+                for (auto ch : received_data) {
+                    ss << "0x" << std::hex << static_cast<int>(ch) << ' ';
+                }
+                auto received_data_bytes = ss.str();
+                p_er("CRC mismatch: local calculation %x, from header %x, message: %s, message in bytes: %s: received from socket %s:%u",
+                     crc_header_, crc_from_msg_, received_data.c_str(), received_data_bytes.c_str(), cached_address_.c_str(), cached_port_);
 
                 if (impl_->get_options().corrupted_msg_handler_) {
                     impl_->get_options().corrupted_msg_handler_(header_, nullptr);
@@ -411,7 +421,7 @@ public:
             h_bs.pos(RPC_REQ_HEADER_SIZE - CRC_FLAGS_LEN - DATA_SIZE_LEN);
             int32 data_size = h_bs.get_i32();
             // Up to 1GB.
-            if (data_size < 0 || data_size > 0x40000000) {
+            if (data_size < 0) {
                 p_er("bad log data size in the header %d, stop "
                      "this session to protect further corruption",
                      data_size);
@@ -422,6 +432,10 @@ public:
 
                 this->stop();
                 return;
+            }
+            // Warning for 1GB+
+            if (data_size > 0x40000000) {
+                p_wn("large data size in the header %d", data_size);
             }
 
             if (data_size == 0) {
@@ -893,19 +907,43 @@ public:
                        ssl_context& ssl_ctx,
                        ushort port,
                        bool _enable_ssl,
+                       ptr<logger>& l,
+                       bool _enable_ipv6 = true )
+        : asio_rpc_listener(_impl, io, ssl_ctx, _enable_ssl, l, asio::ip::tcp::endpoint(_enable_ipv6 ? asio::ip::tcp::v6() : asio::ip::tcp::v4(), port))
+        {}
+
+    asio_rpc_listener( asio_service_impl* _impl,
+                       asio::io_service& io,
+                       ssl_context& ssl_ctx,
+                       const std::string & host,
+                       ushort port,
+                       bool _enable_ssl,
                        ptr<logger>& l )
+        : asio_rpc_listener(_impl, io, ssl_ctx, _enable_ssl, l, asio::ip::tcp::endpoint(asio::ip::make_address(host), port))
+        {}
+
+    asio_rpc_listener( asio_service_impl* _impl,
+                       asio::io_service& io,
+                       ssl_context& ssl_ctx,
+                       bool _enable_ssl,
+                       ptr<logger>& l,
+                       const asio::ip::tcp::endpoint& endpoint )
         : impl_(_impl)
         , io_svc_(io)
         , ssl_ctx_(ssl_ctx)
         , handler_()
         , stopped_(false)
-        , acceptor_(io, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
+        , acceptor_(io, endpoint)
         , session_id_cnt_(1)
         , ssl_enabled_(_enable_ssl)
         , l_(l)
     {
-        p_in("Raft ASIO listener initiated, %s",
-             ssl_enabled_ ? "SSL ENABLED" : "UNSECURED");
+        asio::socket_base::reuse_address option(true);
+        acceptor_.set_option(option);
+
+        auto endpoint_address = endpoint.address().to_string();
+        p_in("Raft ASIO listener initiated on %s:%d, %s",
+             endpoint_address.c_str(), endpoint.port(), ssl_enabled_ ? "SSL enabled" : "unsecured");
     }
 
     __nocopy__(asio_rpc_listener);
@@ -940,7 +978,7 @@ public:
     }
 
 private:
-    void start(std::lock_guard<std::mutex> & listener_lock) {
+    void start(std::lock_guard<std::mutex> & listener_lock_) {
         if (!acceptor_.is_open()) {
             return;
         }
@@ -1061,11 +1099,11 @@ public:
                                      std::placeholders::_2 ) );
 #endif
         }
-        p_tr("asio client created: %p", this);
+        p_ts("asio client created: %p", this);
     }
 
     virtual ~asio_rpc_client() {
-        p_tr("asio client destroyed: %p", this);
+        p_ts("asio client destroyed: %p", this);
         close_socket();
     }
 
@@ -1146,7 +1184,7 @@ public:
 
         ptr<asio_rpc_client> self = this->shared_from_this();
         while (!socket().is_open()) { // Dummy one-time loop
-            p_db( "socket %p to %s:%s is not opened yet",
+            p_ts( "socket %p to %s:%s is not opened yet",
                   this, host_.c_str(), port_.c_str() );
 
             // WARNING:
@@ -1266,14 +1304,14 @@ public:
 
         for (auto& entry: req->log_entries()) {
             ptr<log_entry>& le = entry;
+            auto& le_buf = le->get_buf();
             ptr<buffer> entry_buf = buffer::alloc
                                     ( LOG_ENTRY_SIZE + le->get_buf().size() );
 #if 0
             entry_buf->put( le->get_term() );
             entry_buf->put( (byte)le->get_val_type() );
-            entry_buf->put( (int32)le->get_buf().size() );
-            le->get_buf().pos(0);
-            entry_buf->put( le->get_buf() );
+            entry_buf->put( (int32)le_buf.size() );
+            entry_buf->put_raw( le_buf.data_begin(), le_buf.size() );
             entry_buf->pos( 0 );
 #else
             buffer_serializer ss(entry_buf);
@@ -1878,6 +1916,7 @@ asio_service_impl::asio_service_impl(const asio_service::options& _opt,
                                                 DEFAULT_SERVER_CTX))
     , ssl_client_ctx_(get_or_create_ssl_context(_opt.ssl_context_provider_client_,
                                                 DEFAULT_CLIENT_CTX))
+
 #else
     , ssl_server_ctx_(DEFAULT_SERVER_CTX)  // Any version
     , ssl_client_ctx_(DEFAULT_CLIENT_CTX)
@@ -1897,7 +1936,6 @@ asio_service_impl::asio_service_impl(const asio_service::options& _opt,
 #ifdef SSL_LIBRARY_NOT_FOUND
         assert(0); // Should not reach here.
 #else
-
         // Provider gives properly configured server contex
         if (!_opt.ssl_context_provider_server_) {
             p_in("server SSL context method %d", DEFAULT_SERVER_CTX);
@@ -1949,11 +1987,10 @@ asio_service_impl::asio_service_impl(const asio_service::options& _opt,
         cpu_cnt = 1;
     }
 
-    try
-    {
+    try {
         for (unsigned int i = 0; i < cpu_cnt; ++i) {
-            ptr<std::thread> t =
-                cs_new<std::thread>( std::bind(&asio_service_impl::worker_entry, this) );
+            ptr<nuraft_thread> t =
+                cs_new<nuraft_thread>( std::bind(&asio_service_impl::worker_entry, this) );
             worker_handles_.push_back(t);
         }
     } catch (...) {
@@ -2078,7 +2115,7 @@ void asio_service_impl::stop() {
         std::this_thread::yield();
     }
 
-    for (ptr<std::thread>& t: worker_handles_) {
+    for (ptr<nuraft_thread>& t: worker_handles_) {
         if (t && t->joinable()) {
             t->join();
         }
@@ -2130,16 +2167,6 @@ ptr<rpc_client> asio_service::create_client(const std::string& endpoint) {
     // NOTE:
     //   Abandoned regular expression due to bug in GCC < 4.9.
     //   And also support `endpoint` which doesn't start with `tcp://`.
-#if 0
-    // the endpoint is expecting to be protocol://host:port,
-    // and we only support tcp for this factory
-    // which is endpoint must be tcp://hostname:port
-    static std::regex reg("^tcp://(([a-zA-Z0-9\\-]+\\.)*([a-zA-Z0-9]+)):([0-9]+)$");
-    std::smatch mresults;
-    if (!std::regex_match(endpoint, mresults, reg) || mresults.size() != 5) {
-        return ptr<rpc_client>();
-    }
-#endif
     bool valid_address = false;
     std::string hostname;
     std::string port;
@@ -2175,8 +2202,29 @@ ptr<rpc_client> asio_service::create_client(const std::string& endpoint) {
                    l_ );
 }
 
+ptr<rpc_listener> asio_service::create_rpc_listener(const std::string& host,
+                                      ushort listening_port,
+                                      ptr<logger>& l)
+{
+    try {
+        return cs_new< asio_rpc_listener >
+                     ( impl_,
+                       impl_->io_svc_,
+                       impl_->ssl_server_ctx_,
+                       host,
+                       listening_port,
+                       impl_->my_opt_.enable_ssl_,
+                       l);
+    } catch (std::exception& ee) {
+        // Most likely exception happens due to wrong endpoint.
+        p_er("got exception on %s:%u: %s", host.c_str(), listening_port, ee.what());
+        return nullptr;
+    }
+}
+
 ptr<rpc_listener> asio_service::create_rpc_listener( ushort listening_port,
-                                                     ptr<logger>& l )
+                                                     ptr<logger>& l,
+                                                     bool _enable_ipv6 )
 {
     try {
         return cs_new< asio_rpc_listener >
@@ -2185,10 +2233,11 @@ ptr<rpc_listener> asio_service::create_rpc_listener( ushort listening_port,
                        impl_->ssl_server_ctx_,
                        listening_port,
                        impl_->my_opt_.enable_ssl_,
-                       l );
+                       l,
+                       _enable_ipv6 );
     } catch (std::exception& ee) {
         // Most likely exception happens due to wrong endpoint.
-        p_er("got exception: %s", ee.what());
+        p_er("got exception: %s on port %u", ee.what(), listening_port);
         return nullptr;
     }
 }
@@ -2223,4 +2272,3 @@ ptr<asio_service> nuraft_global_mgr::get_asio_service() {
     std::lock_guard<std::mutex> l(mgr->asio_service_lock_);
     return mgr->asio_service_;
 }
-

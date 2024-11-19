@@ -36,6 +36,7 @@ limitations under the License.
 #include "state_machine.hxx"
 #include "state_mgr.hxx"
 #include "tracer.hxx"
+#include "thread.hxx"
 
 #include <cassert>
 #include <random>
@@ -200,10 +201,10 @@ raft_server::raft_server(context* ctx, const init_options& opt)
                               log_store_->start_index() );
           i < log_store_->next_slot();
           ++i ) {
-        auto const entry = log_store_->entry_at(i);
-        if (entry->get_val_type() == log_val_type::conf) {
+        if (log_store_->is_conf(i))
+        {
             p_in( "detect a configuration change "
-                  "that is not committed yet at index %" PRIu64 "", i );
+                    "that is not committed yet at index %" PRIu64 "", i );
             config_changing_ = true;
             break;
         }
@@ -278,10 +279,10 @@ void raft_server::start_server(bool skip_initial_election_timeout)
     } else {
         p_in("global manager does not exist. "
              "will use local thread for commit and append");
-        bg_commit_thread_ = std::thread(std::bind(&raft_server::commit_in_bg, this));
+        bg_commit_thread_ = nuraft_thread(std::bind(&raft_server::commit_in_bg, this));
 
         bg_append_ea_ = new EventAwaiter();
-        bg_append_thread_ = std::thread(std::bind(&raft_server::append_entries_in_bg, this));
+        bg_append_thread_ = nuraft_thread(std::bind(&raft_server::append_entries_in_bg, this));
     }
 
     if (skip_initial_election_timeout) {
@@ -345,7 +346,7 @@ void raft_server::update_rand_timeout() {
         distribution( params->election_timeout_lower_bound_,
                       params->election_timeout_upper_bound_ );
     rand_timeout_ = std::bind(distribution, engine);
-    p_in("new timeout range: %d -- %d",
+    p_in("new election timeout range: %d - %d",
          params->election_timeout_lower_bound_,
          params->election_timeout_upper_bound_);
 }
@@ -388,7 +389,7 @@ void raft_server::apply_and_log_current_params() {
     }
 
     p_in( "parameters: "
-          "timeout %d - %d, heartbeat %d, "
+          "election timeout range %d - %d, heartbeat %d, "
           "leadership expiry %d, "
           "max batch %d, backoff %d, snapshot distance %d, "
           "enable randomized snapshot creation %s, "
@@ -413,16 +414,16 @@ void raft_server::apply_and_log_current_params() {
           params->log_sync_stop_gap_,
           params->reserved_log_items_,
           params->client_req_timeout_,
-          ( params->auto_forwarding_ ? "ON" : "OFF" ),
+          ( params->auto_forwarding_ ? "on" : "off" ),
           ( params->return_method_ == raft_params::blocking
-            ? "BLOCKING" : "ASYNC" ),
+            ? "blocking" : "async" ),
           params->custom_commit_quorum_size_,
           params->custom_election_quorum_size_,
-          params->exclude_snp_receiver_from_quorum_ ? "EXCLUDED" : "INCLUDED",
+          params->exclude_snp_receiver_from_quorum_ ? "excluded" : "included",
           params->leadership_transfer_min_wait_time_,
           params->grace_period_of_lagging_state_machine_,
-          params->use_bg_thread_for_snapshot_io_ ? "ASYNC" : "BLOCKING",
-          params->parallel_log_appending_ ? "ON" : "OFF" );
+          params->use_bg_thread_for_snapshot_io_ ? "async" : "blocking",
+          params->parallel_log_appending_ ? "on" : "off" );
 
     status_check_timer_.set_duration_ms(params->heart_beat_interval_);
     status_check_timer_.reset();
@@ -494,7 +495,7 @@ void raft_server::shutdown() {
     // Clear shared_ptrs that the current server is holding.
     {   std::lock_guard<std::mutex> l(ctx_->ctx_lock_);
         ctx_->logger_.reset();
-        ctx_->rpc_listener_.reset();
+        ctx_->rpc_listeners_.clear();
         ctx_->rpc_cli_factory_.reset();
         ctx_->scheduler_.reset();
     }
@@ -698,6 +699,10 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
         return handle_cli_req_prelock(req, ext_params);
     }
 
+    if ( req.get_type() == msg_type::leader_status_request ) {
+        return handle_leader_status_req(req);
+    }
+
     recur_lock(lock_);
     if ( req.get_type() == msg_type::append_entries_request ||
          req.get_type() == msg_type::request_vote_request ||
@@ -856,7 +861,7 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
           resp->get_term(),
           resp->get_next_idx() );
 
-    p_tr("src: %d, dst: %d, resp->get_term(): %d\n",
+    p_ts("src: %d, dst: %d, resp->get_term(): %d\n",
          (int)resp->get_src(), (int)resp->get_dst(), (int)resp->get_term());
 
     if (resp->get_accepted()) {
@@ -1058,8 +1063,17 @@ void raft_server::become_leader() {
         ulong s_idx = sm_commit_index_ + 1;
         ulong e_idx = log_store_->next_slot();
         for (ulong ii = s_idx; ii < e_idx; ++ii) {
+            if (!log_store_->is_conf(ii))
+                continue;
+
             ptr<log_entry> le = log_store_->entry_at(ii);
-            if (le->get_val_type() != log_val_type::conf) continue;
+            if (last_config->get_log_idx() > ii)
+            {
+                p_in("Currently assigned config is newer than some "
+                     "uncomitted config. This can only happen during startup or "
+                     "force recovery. If that is not the case, this is a bug.");
+                break;
+            }
 
             p_in("found uncommitted config at %" PRIu64 ", size %zu",
                  ii, le->get_buf().size());

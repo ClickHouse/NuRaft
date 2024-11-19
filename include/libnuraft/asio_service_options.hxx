@@ -210,6 +210,10 @@ struct asio_service_options {
      */
     std::function< bool(const std::string&) > verify_sn_;
 
+    // If true will try to load CA from default path
+    // call (SSL_CTX_set_default_verify_paths)
+    bool load_default_ca_file_;
+
     /**
      * Callback function that provides pre-configured SSL_CTX.
      * Asio takes ownership of the provided object

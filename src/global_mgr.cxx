@@ -23,6 +23,8 @@ limitations under the License.
 #include "logger.hxx"
 #include "raft_server.hxx"
 #include "tracer.hxx"
+#include "thread.hxx"
+
 
 #include <memory>
 
@@ -90,7 +92,7 @@ struct nuraft_global_mgr::worker_handle {
 
     size_t id_;
     EventAwaiter ea_;
-    ptr<std::thread> thread_;
+    ptr<nuraft_thread> thread_;
     std::atomic<bool> stopping_;
     std::atomic<status> status_;
 };
@@ -139,7 +141,7 @@ void nuraft_global_mgr::init_thread_pool() {
     for (size_t ii = 0; ii < config_.num_commit_threads_; ++ii) {
         ptr<worker_handle> w_hdl =
             cs_new<worker_handle>( thread_id_counter_.fetch_add(1) );
-        w_hdl->thread_ = cs_new<std::thread>( &nuraft_global_mgr::commit_worker_loop,
+        w_hdl->thread_ = cs_new<nuraft_thread>( &nuraft_global_mgr::commit_worker_loop,
                                               this,
                                               w_hdl );
         commit_workers_.push_back(w_hdl);
@@ -148,7 +150,7 @@ void nuraft_global_mgr::init_thread_pool() {
     for (size_t ii = 0; ii < config_.num_append_threads_; ++ii) {
         ptr<worker_handle> w_hdl =
             cs_new<worker_handle>( thread_id_counter_.fetch_add(1) );
-        w_hdl->thread_ = cs_new<std::thread>( &nuraft_global_mgr::append_worker_loop,
+        w_hdl->thread_ = cs_new<nuraft_thread>( &nuraft_global_mgr::append_worker_loop,
                                               this,
                                               w_hdl );
         append_workers_.push_back(w_hdl);
@@ -305,6 +307,8 @@ void nuraft_global_mgr::commit_worker_loop(ptr<worker_handle> handle) {
         }
         if (!target) continue;
 
+
+        bool is_initial_commit_exec = target->initial_commit_exec_.exchange(false);
         ptr<logger>& l_ = target->l_;
 
         // Whenever we find a task to execute, skip next sleeping for any tasks
@@ -329,7 +333,7 @@ void nuraft_global_mgr::commit_worker_loop(ptr<worker_handle> handle) {
 
         p_tr("execute commit by global worker, queue length %zu", queue_length);
         bool finished_in_time =
-            target->commit_in_bg_exec(config_.max_scheduling_unit_ms_);
+            target->commit_in_bg_exec(config_.max_scheduling_unit_ms_, is_initial_commit_exec);
         if (!finished_in_time) {
             // Commit took too long time and aborted in the middle.
             // Put this server to queue again.

@@ -243,9 +243,10 @@ void raft_server::update_target_priority() {
     }
     priority_change_timer_.reset();
 
+
     hb_alive_ = true;
     pre_vote_.reset(state_->get_term());
-    p_tr("(update) new target priority: %d", target_priority_);
+    p_ts("(update) new target priority: %d", target_priority_);
 }
 
 } // namespace nuraft;
