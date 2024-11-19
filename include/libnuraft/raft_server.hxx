@@ -1462,7 +1462,7 @@ protected:
     /**
      * Lock of handling client request and role change.
      */
-    std::mutex cli_lock_;
+    std::recursive_mutex cli_lock_;
 
     /**
      * Condition variable to invoke BG commit thread.
