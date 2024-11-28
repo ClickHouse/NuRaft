@@ -153,11 +153,13 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    ptr<cluster_config> cur_config = get_config();
-    if (cur_config->get_servers().size() > 1) {
-        p_in("this server is already in a cluster, ignore the request");
-        return resp;
-    }
+    // Keeper will always start with a configuration defined in configuration files
+    // Until that is changed, this check would just not allow new server to join the cluster
+    //ptr<cluster_config> cur_config = get_config();
+    //if (cur_config->get_servers().size() > 1) {
+    //    p_in("this server is already in a cluster, ignore the request");
+    //    return resp;
+    //}
 
     // MONSTOR-8244:
     //   Adding server may be called multiple times while previous process is
