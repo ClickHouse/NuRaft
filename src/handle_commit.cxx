@@ -491,6 +491,7 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
 }
 
 ulong raft_server::create_snapshot() {
+    std::lock_guard<std::mutex> ll(commit_lock_);
     uint64_t committed_idx = sm_commit_index_;
     p_in("manually create a snapshot on %" PRIu64 "", committed_idx);
     return snapshot_and_compact(committed_idx, true) ? committed_idx : 0;
