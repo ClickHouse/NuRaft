@@ -1451,6 +1451,15 @@ private:
             asio::ip::tcp::resolver::iterator itor ) -> void
         {
             if (!err) {
+                if (send_timeout_ms != 0) {
+                    operation_timer_.expires_after
+                    ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
+                    operation_timer_.async_wait(
+                        std::bind( &asio_rpc_client::cancel_socket,
+                                   this,
+                                   std::placeholders::_1 ) );
+                }
                 asio::async_connect
                     ( socket(),
                       itor,
@@ -1461,15 +1470,6 @@ private:
                                  send_timeout_ms,
                                  std::placeholders::_1,
                                  std::placeholders::_2 ) );
-                if (send_timeout_ms != 0) {
-                    operation_timer_.expires_after
-                    ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
-                    operation_timer_.async_wait(
-                        std::bind( &asio_rpc_client::cancel_socket,
-                                   this,
-                                   std::placeholders::_1 ) );
-                }
             } else {
                 ptr<resp_msg> rsp;
                 ptr<rpc_exception> except
