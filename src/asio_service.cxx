@@ -76,6 +76,10 @@ limitations under the License.
     using ssl_context = asio::ssl::context;
 #endif
 
+#ifndef ASIO_VERSION
+#define ASIO_VERSION BOOST_ASIO_VERSION
+#endif
+
 // Note: both req & resp header structures have been modified by Jung-Sang Ahn.
 //       They MUST NOT be combined with the original code.
 
