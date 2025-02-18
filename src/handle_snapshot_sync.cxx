@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "raft_server.hxx"
 
+#include "cluster_config.hxx"
 #include "context.hxx"
 #include "error_code.hxx"
 #include "event_awaiter.hxx"
@@ -152,10 +153,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
             destroy_user_snp_ctx(sync_ctx);
         }
 
-        // Timeout: heartbeat * response limit.
-        ulong snp_timeout_ms = ctx_->get_params()->heart_beat_interval_ *
-                               raft_server::raft_limits_.response_limit_;
-        p.set_snapshot_in_sync(snp, snp_timeout_ms);
+        p.set_snapshot_in_sync(snp, ulong(get_snapshot_sync_ctx_timeout()));
     }
 
     if (params->use_bg_thread_for_snapshot_io_) {
@@ -183,14 +181,12 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
         data = buffer::alloc((size_t)(std::min((ulong)blk_sz, sz_left)));
         int32 sz_rd = state_machine_->read_snapshot_data(*snp, offset, *data);
         if ((size_t)sz_rd < data->size()) {
-            // LCOV_EXCL_START
             p_er( "only %d bytes could be read from snapshot while %zu "
                   "bytes are expected, must be something wrong, exit.",
                   sz_rd, data->size() );
             ctx_->state_mgr_->system_exit(raft_err::N18_partial_snapshot_block);
             _sys_exit(-1);
             return ptr<req_msg>();
-            // LCOV_EXCL_STOP
         }
         last_request = (offset + (ulong)data->size()) >= snp->size();
         data_idx = offset;
@@ -241,7 +237,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
 }
 
 ptr<resp_msg> raft_server::handle_install_snapshot_req(req_msg& req, std::unique_lock<std::recursive_mutex>& guard) {
-    if (req.get_term() == state_->get_term() && !catching_up_) {
+    if (req.get_term() == state_->get_term() && !state_->is_catching_up()) {
         if (role_ == srv_role::candidate) {
             become_follower();
 
@@ -268,7 +264,7 @@ ptr<resp_msg> raft_server::handle_install_snapshot_req(req_msg& req, std::unique
                            req.get_src(),
                            log_store_->next_slot() );
 
-    if (!catching_up_ && req.get_term() < state_->get_term()) {
+    if (!state_->is_catching_up() && req.get_term() < state_->get_term()) {
         p_wn("received an install snapshot request (%" PRIu64 ") which has lower term "
              "than this server (%" PRIu64 "), decline the request",
              req.get_term(), state_->get_term());
@@ -578,10 +574,22 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
                 // LCOV_EXCL_STOP
             }
 
-            reconfigure(req.get_snapshot().get_last_config());
-
+            auto snap_conf = req.get_snapshot().get_last_config();
             ptr<cluster_config> c_conf = get_config();
-            ctx_->state_mgr_->save_config(*c_conf);
+            if (snap_conf->get_log_idx() > c_conf->get_log_idx()) {
+                ctx_->state_mgr_->save_config(*snap_conf);
+                reconfigure(snap_conf);
+                c_conf = get_config();
+            } else {
+                p_in("snapshot config idx %" PRIu64 " prev idx %" PRIu64
+                     " is not newer than "
+                     "current config idx %" PRIu64 " prev idx %" PRIu64
+                     ", will not apply it",
+                     snap_conf->get_log_idx(),
+                     snap_conf->get_prev_log_idx(),
+                     c_conf->get_log_idx(),
+                     c_conf->get_prev_log_idx());
+            }
 
             precommit_index_ = req.get_snapshot().get_last_log_idx();
             sm_commit_index_ = req.get_snapshot().get_last_log_idx();

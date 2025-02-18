@@ -118,6 +118,7 @@ public:
             , reconnect_limit_(50)
             , leave_limit_(5)
             , vote_limit_(5)
+            , busy_connection_limit_(20)
             {}
 
         limits(const limits& src) {
@@ -177,6 +178,19 @@ public:
          * Active only when `auto_adjust_quorum_for_small_cluster_` is enabled.
          */
         std::atomic<int32> vote_limit_;
+
+        /**
+         * If a connection is stuck due to a network black hole or similar issues,
+         * the sender may not receive either a response to the previous request or
+         * an explicit error, preventing any progress through that connection.
+         * Such situations are unlikely to resolve on their own, and sometimes
+         * restarting the process is the only solution. If the connection remains
+         * busy beyond this threshold, `system_exit` will be invoked with
+         * `N22_unrecoverable_isolation`.
+         *
+         * If zero, this feature is disabled.
+         */
+        std::atomic<int32> busy_connection_limit_;
     };
 
     raft_server(context* ctx, const init_options& opt = init_options());
@@ -199,7 +213,7 @@ public:
      *
      * @return `true` if it is in catch-up mode.
      */
-    bool is_catching_up() const { return catching_up_; }
+    bool is_catching_up() const { return state_->is_catching_up(); }
 
     /**
      * Check if this server is receiving snapshot from leader.
@@ -409,6 +423,13 @@ public:
      * @return Custom context.
      */
     std::string get_user_ctx() const;
+
+    /**
+    * Get timeout for snapshot_sync_ctx
+    *
+    * @return snapshot_sync_ctx_timeout.
+    */
+    int32 get_snapshot_sync_ctx_timeout() const;
 
     /**
      * Get ID of this server.
@@ -795,15 +816,36 @@ public:
     void notify_log_append_completion(bool ok);
 
     /**
+     * Options for manual snapshot creation.
+     */
+    struct create_snapshot_options {
+        create_snapshot_options()
+            : serialize_commit_(false)
+            {}
+        /**
+         * If `true`, the background commit will be blocked until `create_snapshot`
+         * returns. However, it will not block the commit for the entire duration
+         * of the snapshot creation process, as long as your state machine creates
+         * the snapshot asynchronously.
+         *
+         * The purpose of this flag is to ensure that the log index used for
+         * the snapshot creation is the most recent one.
+         */
+        bool serialize_commit_;
+    };
+
+    /**
      * Manually create a snapshot based on the latest committed
      * log index of the state machine.
      *
      * Note that snapshot creation will fail immediately if the previous
      * snapshot task is still running.
      *
+     * @params options Options for snapshot creation.
      * @return Log index number of the created snapshot or`0` if failed.
      */
-    ulong create_snapshot();
+    ulong create_snapshot(const create_snapshot_options& options =
+                              create_snapshot_options());
 
     /**
      * Manually and asynchronously create a snapshot on the next earliest
@@ -835,18 +877,20 @@ protected:
     struct pre_vote_status_t {
         pre_vote_status_t()
             : quorum_reject_count_(0)
-            , failure_count_(0)
+            , no_response_failure_count_(0)
+            , busy_connection_failure_count_(0)
             { reset(0); }
         void reset(ulong _term) {
             term_ = _term;
             done_ = false;
-            live_ = dead_ = abandoned_ = 0;
+            live_ = dead_ = abandoned_ = connection_busy_ = 0;
         }
         ulong term_;
         std::atomic<bool> done_;
         std::atomic<int32> live_;
         std::atomic<int32> dead_;
         std::atomic<int32> abandoned_;
+        std::atomic<int32> connection_busy_;
 
         /**
          * Number of pre-vote rejections by quorum.
@@ -854,9 +898,14 @@ protected:
         std::atomic<int32> quorum_reject_count_;
 
         /**
-         * Number of pre-vote failures due to not-responding peers.
+         * Number of pre-vote failures due to non-responding peers.
          */
-        std::atomic<int32> failure_count_;
+        std::atomic<int32> no_response_failure_count_;
+
+        /**
+         * Number of pre-vote failures due to busy connections.
+         */
+        std::atomic<int32> busy_connection_failure_count_;
     };
 
     /**
@@ -931,6 +980,7 @@ protected:
     void request_vote(bool force_vote);
     void request_append_entries();
     bool request_append_entries(ptr<peer> p);
+    bool send_request(ptr<peer>& p, ptr<req_msg>& msg, rpc_handler& m_handler, bool streaming = false);
     void handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err);
     void handle_append_entries_resp(resp_msg& resp);
     void handle_install_snapshot_resp(resp_msg& resp);
@@ -948,7 +998,7 @@ protected:
     void handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p);
     void reset_srv_to_join();
     void reset_srv_to_leave();
-    ptr<req_msg> create_append_entries_req(ptr<peer>& pp);
+    ptr<req_msg> create_append_entries_req(ptr<peer>& pp, ulong custom_last_log_idx = 0);
     ptr<req_msg> create_sync_snapshot_req(ptr<peer>& pp,
                                           ulong last_log_idx,
                                           ulong term,
@@ -1176,13 +1226,6 @@ protected:
      * Protected by `lock_`.
      */
     bool config_changing_;
-
-    /**
-     * `true` if this server falls behind leader so that
-     * catching up the latest log. It will not receive
-     * normal `append_entries` request while in catch-up status.
-     */
-    std::atomic<bool> catching_up_;
 
     /**
      * `true` if this server receives out of log range message
