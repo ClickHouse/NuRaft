@@ -490,10 +490,19 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
     return true;
 }
 
-ulong raft_server::create_snapshot() {
-    uint64_t committed_idx = sm_commit_index_;
-    p_in("manually create a snapshot on %" PRIu64 "", committed_idx);
-    return snapshot_and_compact(committed_idx, true) ? committed_idx : 0;
+ulong raft_server::create_snapshot(const create_snapshot_options& options) {
+    auto exec_internal = [&]() {
+        uint64_t committed_idx = sm_commit_index_;
+        p_in("manually create a snapshot on %" PRIu64 "", committed_idx);
+        return snapshot_and_compact(committed_idx, true) ? committed_idx : 0;
+    };
+
+    if (options.serialize_commit_) {
+        auto_lock(commit_lock_);
+        return exec_internal();
+    } else {
+        return exec_internal();
+    }
 }
 
 ptr< cmd_result<uint64_t> > raft_server::schedule_snapshot_creation() {
@@ -564,7 +573,8 @@ bool raft_server::snapshot_and_compact(ulong committed_idx, bool forced_creation
         if (forced_creation || snp_creation_scheduled_)
             return true;
 
-        return !local_snapshot || committed_idx >= snapshot_distance + local_snapshot->get_last_log_idx();
+        return !local_snapshot ||
+               committed_idx >= snapshot_distance + local_snapshot->get_last_log_idx();
     };
 
     if ( can_create_snapshot(local_snp) &&
@@ -782,13 +792,21 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
         if (id_ == (*it)->get_id()) {
             my_priority_ = (*it)->get_priority();
             steps_to_down_ = 0;
-            if (role_ == srv_role::follower &&
-                catching_up_) {
-                // If this node is newly added, start election timer
-                // without waiting for the next append_entries message.
+            if (!(*it)->is_new_joiner() &&
+                role_ == srv_role::follower &&
+                state_->is_catching_up()) {
+                // Except for new joiner type, if this server is added
+                // to the cluster config, that means the sync is done.
+                // Start election timer without waiting for
+                // the next append_entries message.
+                //
+                // If this server is a new joiner, `catching_up_` flag
+                // will be cleared when it becomes a regular member,
+                // that is also notified by a new cluster config.
                 p_in("now this node is the part of cluster, "
                      "catch-up process is done, clearing the flag");
-                catching_up_ = false;
+                state_->set_catching_up(false);
+                ctx_->state_mgr_->save_state(*state_);
                 restart_election_timer();
             }
         }
@@ -824,6 +842,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
         str_buf << "add peer " << srv_added->get_id()
                 << ", " << srv_added->get_endpoint()
                 << ", " << (srv_added->is_learner() ? "learner" : "voting member")
+                << ", " << (srv_added->is_new_joiner() ? "new joiner" : "regular")
                 << std::endl;
 
         peers_.insert(std::make_pair(srv_added->get_id(), p));
@@ -844,7 +863,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
     for ( std::vector<int32>::const_iterator it = srvs_removed.begin();
           it != srvs_removed.end(); ++it ) {
         int32 srv_removed = *it;
-        if (srv_removed == id_ && !catching_up_) {
+        if (srv_removed == id_ && !state_->is_catching_up()) {
             p_in("this server (%d) has been removed from the cluster, "
                  "will step down itself soon. config log idx %" PRIu64,
                  id_,
@@ -965,6 +984,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
                  << ", DC ID " << s_conf->get_dc_id()
                  << ", " << s_conf->get_endpoint()
                  << ", " << (s_conf->is_learner() ? "learner" : "voting member")
+                 << ", " << (s_conf->is_new_joiner() ? "new joiner" : "regular member")
                  << ", " << s_conf->get_priority()
                  << std::endl;
     }

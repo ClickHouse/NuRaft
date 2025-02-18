@@ -30,6 +30,7 @@ limitations under the License.
 #include "srv_config.hxx"
 
 #include <atomic>
+#include <cassert>
 
 namespace nuraft {
 
@@ -65,6 +66,7 @@ public:
         , network_recoveries_(0)
         , manual_free_(false)
         , rpc_errs_(0)
+        , stale_rpc_responses_(0)
         , last_sent_idx_(0)
         , cnt_not_applied_(0)
         , leave_requested_(false)
@@ -77,6 +79,8 @@ public:
         , lost_by_leader_(false)
         , rsv_msg_(nullptr)
         , rsv_msg_handler_(nullptr)
+        , last_streamed_log_idx_(0)
+        , bytes_in_flight_(0)
         , l_(logger)
     {
         reset_ls_timer();
@@ -100,6 +104,10 @@ public:
     bool is_learner() const {
         std::lock_guard<std::mutex> lock(config_mutex_);
         return config_->is_learner();
+    }
+
+    bool is_new_joiner() const {
+        return config_->is_new_joiner();
     }
 
     const srv_config& get_config() {
@@ -222,7 +230,8 @@ public:
 
     void send_req(ptr<peer> myself,
                   ptr<req_msg>& req,
-                  rpc_handler& handler);
+                  rpc_handler& handler,
+                  bool streaming = false);
 
     void shutdown();
 
@@ -256,6 +265,10 @@ public:
     void reset_rpc_errs()   { rpc_errs_ = 0; }
     void inc_rpc_errs()     { rpc_errs_.fetch_add(1); }
     int32 get_rpc_errs()    { return rpc_errs_; }
+
+    void reset_stale_rpc_responses()    { stale_rpc_responses_ = 0; }
+    int32_t inc_stale_rpc_responses()   { return stale_rpc_responses_.fetch_add(1); }
+    int32_t get_stale_rpc_responses()   { return stale_rpc_responses_; }
 
     void set_last_sent_idx(ulong to)    { last_sent_idx_ = to; }
     ulong get_last_sent_idx() const     { return last_sent_idx_.load(); }
@@ -308,6 +321,37 @@ public:
     ptr<req_msg> get_rsv_msg() const { return rsv_msg_; }
     rpc_handler get_rsv_msg_handler() const { return rsv_msg_handler_; }
 
+    ulong get_last_streamed_log_idx() {
+        return last_streamed_log_idx_.load();
+    }
+
+    void set_last_streamed_log_idx(ulong expected, ulong idx) {
+        last_streamed_log_idx_.compare_exchange_strong(expected, idx);
+    }
+
+    void reset_stream() {
+        last_streamed_log_idx_.store(0);
+    }
+
+    int64_t get_bytes_in_flight() {
+        return bytes_in_flight_.load();
+    }
+
+    void bytes_in_flight_add(size_t req_size_bytes) {
+        bytes_in_flight_.fetch_add(req_size_bytes);
+    }
+
+    void bytes_in_flight_sub(size_t req_size_bytes) {
+        bytes_in_flight_.fetch_sub(req_size_bytes);
+        assert(bytes_in_flight_ >= 0);
+    }
+
+    void reset_bytes_in_flight() {
+        bytes_in_flight_.store(0);
+    }
+
+    void try_set_free(msg_type type, bool streaming);
+
     bool is_lost() const { return lost_by_leader_; }
     void set_lost() { lost_by_leader_ = true; }
     void set_recovered() { lost_by_leader_ = false; }
@@ -317,6 +361,8 @@ private:
                            ptr<rpc_client> my_rpc_client,
                            ptr<req_msg>& req,
                            ptr<rpc_result>& pending_result,
+                           bool streaming,
+                           size_t req_size_bytes,
                            ptr<resp_msg>& resp,
                            ptr<rpc_exception>& err);
 
@@ -457,6 +503,11 @@ private:
     std::atomic<int32> rpc_errs_;
 
     /**
+     * For tracking stale RPC responses from the old client.
+     */
+    std::atomic<int32> stale_rpc_responses_;
+
+    /**
      * Start log index of the last sent append entries request.
      */
     std::atomic<ulong> last_sent_idx_;
@@ -525,6 +576,16 @@ private:
      * Handler for reserved message.
      */
     rpc_handler rsv_msg_handler_;
+
+    /**
+     * Last log index sent in stream mode.
+     */
+    std::atomic<ulong> last_streamed_log_idx_;
+
+    /**
+     * Current bytes of in-flight append entry requests.
+     */
+    std::atomic<int64_t> bytes_in_flight_;
 
     /**
      * Logger instance.

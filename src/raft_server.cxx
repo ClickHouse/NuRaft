@@ -65,7 +65,6 @@ raft_server::raft_server(context* ctx, const init_options& opt)
     , hb_alive_(false)
     , election_completed_(true)
     , config_changing_(false)
-    , catching_up_(false)
     , out_of_log_range_(false)
     , data_fresh_(false)
     , stopping_(false)
@@ -161,6 +160,8 @@ raft_server::raft_server(context* ctx, const init_options& opt)
              << "term " << state_->get_term() << "\n"
              << "election timer " << ( state_->is_election_timer_allowed()
                                        ? "allowed" : "not allowed" ) << "\n"
+             << "catching-up " << ( state_->is_catching_up()
+                                    ? "yes" : "no" ) << "\n"
              << "log store start " << log_store_->start_index()
              << ", end " << log_store_->next_slot() - 1 << "\n"
              << "config log idx " << c_conf->get_log_idx()
@@ -394,6 +395,7 @@ void raft_server::apply_and_log_current_params() {
           "max batch %d, backoff %d, snapshot distance %d, "
           "enable randomized snapshot creation %s, "
           "log sync stop gap %d, "
+          "use new joiner type %s, "
           "reserved logs %d, client timeout %d, "
           "auto forwarding %s, API call type %s, "
           "custom commit quorum size %d, "
@@ -402,7 +404,8 @@ void raft_server::apply_and_log_current_params() {
           "leadership transfer wait time %d, "
           "grace period of lagging state machine %d, "
           "snapshot IO: %s, "
-          "parallel log appending: %s",
+          "parallel log appending: %s, "
+          "streaming mode max log gap %d, max bytes %" PRIu64,
           params->election_timeout_lower_bound_,
           params->election_timeout_upper_bound_,
           params->heart_beat_interval_,
@@ -412,6 +415,7 @@ void raft_server::apply_and_log_current_params() {
           params->snapshot_distance_,
           params->enable_randomized_snapshot_creation_ ? "YES" : "NO",
           params->log_sync_stop_gap_,
+          params->use_new_joiner_type_ ? "YES" : "NO",
           params->reserved_log_items_,
           params->client_req_timeout_,
           ( params->auto_forwarding_ ? "on" : "off" ),
@@ -423,7 +427,9 @@ void raft_server::apply_and_log_current_params() {
           params->leadership_transfer_min_wait_time_,
           params->grace_period_of_lagging_state_machine_,
           params->use_bg_thread_for_snapshot_io_ ? "async" : "blocking",
-          params->parallel_log_appending_ ? "on" : "off" );
+          params->parallel_log_appending_ ? "on" : "off",
+          params->max_log_gap_in_stream_,
+          params->max_bytes_in_flight_in_stream_ );
 
     status_check_timer_.set_duration_ms(params->heart_beat_interval_);
     status_check_timer_.reset();
@@ -546,6 +552,9 @@ bool raft_server::is_regular_member(const ptr<peer>& p) {
 
     // Skip learner.
     if (p->is_learner()) return false;
+
+    // Skip new joiner.
+    if (p->is_new_joiner()) return false;
 
     return true;
 }
@@ -1050,9 +1059,12 @@ void raft_server::become_leader() {
             // Reset RPC client for all peers.
             // NOTE: Now we don't reset client, as we already did it
             //       during pre-vote phase.
+            // NOTE: In the case that this peer takeover the leadership,
+            //       connection will be re-used
             // reconnect_client(*pp);
 
             pp->set_next_log_idx(log_store_->next_slot());
+            pp->reset_stream();
             enable_hb_for_peer(*pp);
             pp->set_recovered();
         }
@@ -1107,7 +1119,7 @@ void raft_server::become_leader() {
     next_leader_candidate_ = -1;
     initialized_ = true;
     pre_vote_.quorum_reject_count_ = 0;
-    pre_vote_.failure_count_ = 0;
+    pre_vote_.no_response_failure_count_ = 0;
     data_fresh_ = true;
 
     request_append_entries();
@@ -1406,6 +1418,7 @@ void raft_server::become_follower() {
     {   std::lock_guard<std::recursive_mutex> ll(cli_lock_);
         for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
             it->second->enable_hb(false);
+            it->second->reset_stream();
         }
 
         srv_to_join_.reset();
@@ -1422,7 +1435,7 @@ void raft_server::become_follower() {
         initialized_ = true;
         uncommitted_config_.reset();
         pre_vote_.quorum_reject_count_ = 0;
-        pre_vote_.failure_count_ = 0;
+        pre_vote_.no_response_failure_count_ = 0;
 
         ptr<raft_params> params = ctx_->get_params();
         if ( params->auto_adjust_quorum_for_small_cluster_ &&
@@ -1675,6 +1688,13 @@ std::string raft_server::get_user_ctx() const {
     return c_conf->get_user_ctx();
 }
 
+int32 raft_server::get_snapshot_sync_ctx_timeout() const {
+    if (ctx_->get_params()->snapshot_sync_ctx_timeout_ == 0) {
+        return raft_limits_.response_limit_ * ctx_->get_params()->heart_beat_interval_;
+    }
+    return ctx_->get_params()->snapshot_sync_ctx_timeout_;
+}
+
 int32 raft_server::get_dc_id(int32 srv_id) const {
     ptr<cluster_config> c_conf = get_config();
     ptr<srv_config> s_conf = c_conf->get_server(srv_id);
@@ -1778,7 +1798,36 @@ ulong raft_server::store_log_entry(ptr<log_entry>& entry, ulong index) {
         }
 
         if ( role_ == srv_role::leader ) {
+            // WARNING:
+            // Configuration changes, such as adding or removing a member,
+            // can run concurrently with normal log appending operations. This
+            // concurrency can lead to an inversion issue between precommit and
+            // commit orders, particularly when there is only one member in the
+            // cluster.
+            //
+            // Let's consider the following scenario: T1 is the thread handling
+            // log appending, T2 is the thread processing configuration changes,
+            // and T3 is the commit thread.
+            // The initial precommit and commit index is 10.
+            //
+            // [T1] Acquires `cli_lock_` and enters `handle_cli_req()`.
+            // [T1] Appends a log at index 11 by calling `store_log_entry()`.
+            // [T2] Appends a log at index 12 by calling `store_log_entry()`.
+            // [T2] Calls `try_update_precommit_index()`,
+            //      updating the precommit index to 12.
+            // [T2] Calls `request_append_entries()` and `commit()`,
+            //      updating the commit index to 12.
+            // [T3] Calls `state_machine::commit()` for logs 11 and 12.
+            // [T1] Calls `state_machine::pre_commit()` for log 11.
+            //      => order inversion happens here.
+            //
+            // To prevent this inversion, T2 should acquire the same `cli_lock_`
+            // before calling `try_update_precommit_index()`. This ensures that T2
+            // cannot update the precommit index between T1's `store_log_entry()`
+            // and `state_machine::pre_commit()` calls, maintaining the correct
+            // order of operations.
             recur_lock(cli_lock_);
+
             // Need to progress precommit index for config.
             try_update_precommit_index(log_index);
         }
