@@ -185,7 +185,7 @@ public:
         my_listener_ = asio_svc_->create_rpc_listener(port_, logger);
 
         raft_params params;
-        context* ctx( new context( s_mgr_, sm_, my_listener_, logger,
+        context* ctx( new context( s_mgr_, sm_, {my_listener_}, logger,
                     rpc_cli_factory, scheduler, params ) );
         const raft_server::init_options& opt = raft_server::init_options();
         my_msg_handler_ = cs_new<stream_msg_handler>(ctx, opt);
