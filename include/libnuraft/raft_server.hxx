@@ -119,6 +119,8 @@ public:
             , leave_limit_(5)
             , vote_limit_(5)
             , busy_connection_limit_(20)
+            , full_consensus_leader_limit_(3)
+            , full_consensus_follower_limit_(2)
             {}
 
         limits(const limits& src) {
@@ -192,6 +194,21 @@ public:
          * If zero, this feature is disabled.
          */
         std::atomic<int32> busy_connection_limit_;
+
+        /**
+         * In full consensus mode, the leader will consider a follower as
+         * not responding if it does not receive a response from the follower
+         * within this limit (multiplied by heartbeat interval).
+         */
+        std::atomic<int32> full_consensus_leader_limit_;
+
+        /**
+         * In full consensus mode, the follower will consider that it is
+         * isolated and not the part of the quorum if it does not receive
+         * a response from the leader within this limit (multiplied by
+         * heartbeat interval).
+         */
+        std::atomic<int32> full_consensus_follower_limit_;
     };
 
     raft_server(context* ctx, const init_options& opt = init_options());
@@ -221,7 +238,7 @@ public:
      *
      * @return `true` if it is receiving snapshot.
      */
-    bool is_receiving_snapshot() const { return receiving_snapshot_; }
+    bool is_receiving_snapshot() const { return state_->is_receiving_snapshot(); }
 
     /**
      * Add a new server to the current cluster.
@@ -261,6 +278,18 @@ public:
      */
     ptr< cmd_result< ptr<buffer> > >
         append_entries(const std::vector< ptr<buffer> >& logs);
+
+    /**
+     * Flip learner flag of given server.
+     * Learner will be excluded from the quorum.
+     * Only leader will accept this operation.
+     * This is also an asynchronous task.
+     *
+     * @param srv_id ID of the server to set as a learner.
+     * @param to If `true`, set the server as a learner, otherwise, clear learner flag.
+     * @return `ret->get_result_code()` will be OK on success.
+     */
+    ptr<cmd_result<ptr<buffer>>> flip_learner_flag(int32 srv_id, bool to);
 
     /**
      * Parameters for `req_ext_cb` callback function.
@@ -413,6 +442,7 @@ public:
 
     /**
      * Set custom context to Raft cluster config.
+     * It will create a new configuration log and replicate it.
      *
      * @param ctx Custom context.
      */
@@ -601,6 +631,23 @@ public:
     void get_srv_config_all(std::vector< ptr<srv_config> >& configs_out) const;
 
     /**
+     * Update the server configuration, only leader will accept this operation.
+     * This function will update the current cluster config
+     * and replicate it to all peers.
+     *
+     * We don't allow changing multiple server configurations at once,
+     * due to safety reason.
+     *
+     * Change on endpoint will not be accepted (should be removed and then re-added).
+     * If the server is in new joiner state, it will be rejected.
+     * If the server ID does not exist, it will also be rejected.
+     *
+     * @param new_config Server configuration to update.
+     * @return `true` on success, `false` if rejected.
+     */
+    bool update_srv_config(const srv_config& new_config);
+
+    /**
      * Peer info structure.
      */
     struct peer_info {
@@ -780,7 +827,7 @@ public:
      *                   there is a possibility that the state machine execution
      *                   is still happening.
      */
-    void pause_state_machine_exeuction(size_t timeout_ms = 0);
+    void pause_state_machine_execution(size_t timeout_ms = 0);
 
     /**
      * Resume the background execution of state machine.
@@ -870,6 +917,22 @@ public:
      */
     ulong get_last_snapshot_idx() const;
 
+    /**
+     * Set the self mark down flag of this server.
+     *
+     * @return The self mark down flag before the update.
+     */
+    bool set_self_mark_down(bool to);
+
+    /**
+     * Check if this server is the part of the quorum of full consensus.
+     * What it means is that, as long as the return value is `true`, this server
+     * has the latest committed log at the moment that `true` was returned.
+     *
+     * @return `true` if this server is the part of the full consensus.
+     */
+    bool is_part_of_full_consensus();
+
 protected:
     typedef std::unordered_map<int32, ptr<peer>>::const_iterator peer_itor;
 
@@ -938,10 +1001,11 @@ protected:
     int32 get_quorum_for_commit();
     int32 get_leadership_expiry();
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
-    size_t get_not_responding_peers_count(int expiry = 0);
+    size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
 
-    void apply_to_not_responding_peers(const std::function<void(const ptr<peer>&)>&, int expiry = 0);
+    void for_each_voting_members(
+        const std::function<void(const ptr<peer>&, int32_t)>& callback);
 
     ptr<resp_msg> handle_append_entries(req_msg& req);
     ptr<resp_msg> handle_prevote_req(req_msg& req);
@@ -957,8 +1021,11 @@ protected:
 
     void drop_all_pending_commit_elems();
 
-    ptr<resp_msg> handle_ext_msg(req_msg& req, std::unique_lock<std::recursive_mutex>& guard);
-    ptr<resp_msg> handle_install_snapshot_req(req_msg& req, std::unique_lock<std::recursive_mutex>& guard);
+    ptr<resp_msg> handle_ext_msg(req_msg& req,
+                                 std::unique_lock<std::recursive_mutex>& guard);
+    ptr<resp_msg> handle_install_snapshot_req(
+        req_msg& req,
+        std::unique_lock<std::recursive_mutex>& guard);
     ptr<resp_msg> handle_rm_srv_req(req_msg& req);
     ptr<resp_msg> handle_add_srv_req(req_msg& req);
     ptr<resp_msg> handle_log_sync_req(req_msg& req);
@@ -973,7 +1040,8 @@ protected:
     void handle_log_sync_resp(resp_msg& resp);
     void handle_leave_cluster_resp(resp_msg& resp);
 
-    bool handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard);
+    bool handle_snapshot_sync_req(snapshot_sync_req& req,
+                                  std::unique_lock<std::recursive_mutex>& guard);
 
     bool check_cond_for_zp_election();
     void request_prevote();
@@ -981,7 +1049,10 @@ protected:
     void request_vote(bool force_vote);
     void request_append_entries();
     bool request_append_entries(ptr<peer> p);
-    bool send_request(ptr<peer>& p, ptr<req_msg>& msg, rpc_handler& m_handler, bool streaming = false);
+    bool send_request(ptr<peer>& p,
+                      ptr<req_msg>& msg,
+                      rpc_handler& m_handler,
+                      bool streaming = false);
     void handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err);
     void handle_append_entries_resp(resp_msg& resp);
     void handle_install_snapshot_resp(resp_msg& resp);
@@ -1090,7 +1161,7 @@ protected:
 
     uint64_t get_current_leader_index();
 
-    global_mgr * get_global_mgr() const;
+    global_mgr* get_global_mgr() const;
 
 protected:
     static const int default_snapshot_sync_block_size;
@@ -1417,11 +1488,6 @@ protected:
     ptr<state_machine> state_machine_;
 
     /**
-     * `true` if this server is receiving a snapshot.
-     */
-    std::atomic<bool> receiving_snapshot_;
-
-    /**
      * Election timeout count while receiving snapshot.
      * This happens when the sender (i.e., leader) is too slow
      * so that cannot send message before election timeout.
@@ -1616,6 +1682,22 @@ protected:
      * If `true`, test mode is enabled.
      */
     std::atomic<bool> test_mode_flag_;
+
+    /**
+     * If `true`, this server is marked down by itself.
+     */
+    std::atomic<bool> self_mark_down_;
+
+    /**
+     * If `true`, this server is marked down by the leader.
+     */
+    std::atomic<bool> excluded_from_the_quorum_;
+
+    /**
+     * Timer that will be reset on receiving
+     * a successful `AppendEntries` request.
+     */
+    timer_helper last_rcvd_append_entries_req_;
 };
 
 } // namespace nuraft;

@@ -144,8 +144,10 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
 
         if (snp->get_last_log_idx() != prev_sync_snp_log_idx) {
             p_in( "trying to sync snapshot with last index %" PRIu64 " to peer %d, "
-                  "its last log idx %" PRIu64 "",
-                  snp->get_last_log_idx(), p.get_id(), last_log_idx );
+                  "its last log idx %" PRIu64 ", my start index %" PRIu64
+                  ", my last log idx %" PRIu64,
+                  snp->get_last_log_idx(), p.get_id(), last_log_idx,
+                  log_store_->start_index(), log_store_->next_slot() - 1 );
         }
         if (sync_ctx) {
             // If previous user context exists, should free it
@@ -361,6 +363,12 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
                 p->set_matched_idx(sync_ctx->get_snapshot()->get_last_log_idx());
                 clear_snapshot_sync_ctx(*p);
 
+                if (p->is_snapshot_sync_needed()) {
+                    p->set_snapshot_sync_is_needed(false);
+                    p_in("peer %d is no longer in snapshot sync mode",
+                         p->get_id());
+                }
+
                 need_to_catchup = p->clear_pending_commit() ||
                                   p->get_next_log_idx() < log_store_->next_slot();
                 p_in("snapshot done %" PRIu64 ", %" PRIu64 ", %d",
@@ -493,7 +501,11 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
     }
 
     // Set flag to avoid initiating election by this node.
-    receiving_snapshot_ = true;
+    if (!state_->is_receiving_snapshot()) {
+        state_->set_receiving_snapshot(true);
+        ctx_->state_mgr_->save_state(*state_);
+        p_in("set receiving snapshot flag");
+    }
     et_cnt_receiving_snapshot_ = 0;
 
     // Set initialized flag
@@ -524,8 +536,7 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
         // let's pause committing in backgroud so it doesn't access logs
         // while they are being compacted
         guard.unlock();
-        pause_state_machine_exeuction();
-
+        pause_state_machine_execution();
         size_t wait_count = 0;
         while (!wait_for_state_machine_pause(500)) {
             p_in("waiting for state machine pause before applying snapshot: count %zu",
@@ -540,8 +551,9 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
             std::function<void()> clean_func_;
         } exec_auto_resume([this](){ resume_state_machine_execution(); });
 
-
-        receiving_snapshot_ = false;
+        state_->set_receiving_snapshot(false);
+        ctx_->state_mgr_->save_state(*state_);
+        p_in("clear receiving snapshot flag");
 
         // Only follower will run this piece of code, but let's check it again
         if (role_ != srv_role::follower) {

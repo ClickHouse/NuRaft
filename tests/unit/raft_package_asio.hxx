@@ -15,6 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 **************************************************************************/
 
+#pragma once
+
 #include "asio_service_options.hxx"
 #include "raft_functional_common.hxx"
 #include "internal_timer.hxx"
@@ -55,6 +57,7 @@ public:
         , useCustomResolver(false)
         , useLogTimestamp(false)
         , useCrcOnEntireMessage(false)
+        , customIoContext(nullptr)
         , myLogWrapper(nullptr)
         , myLog(nullptr)
         {}
@@ -104,7 +107,7 @@ public:
         if (use_stream_asio) {
             asio_opt.streaming_mode_ = true;
         }
-        
+
         if (enable_ssl) {
             asio_opt.enable_ssl_        = enable_ssl;
             asio_opt.verify_sn_         = RaftAsioPkg::verifySn;
@@ -149,6 +152,9 @@ public:
         asio_opt.invoke_req_cb_on_empty_meta_ = alwaysInvokeCb;
         asio_opt.invoke_resp_cb_on_empty_meta_ = alwaysInvokeCb;
 
+        if (customIoContext) {
+            asio_opt.custom_io_context_ = customIoContext;
+        }
         asioSvc = use_global_asio
                   ? nuraft_global_mgr::init_asio_service(asio_opt, myLog)
                   : cs_new<asio_service>(asio_opt, myLog);
@@ -282,6 +288,12 @@ public:
     bool useLogTimestamp;
 
     bool useCrcOnEntireMessage;
+
+#ifdef USE_BOOST_ASIO
+    boost::asio::io_context* customIoContext;
+#else
+    asio::io_context* customIoContext;
+#endif
 
     ptr<logger_wrapper> myLogWrapper;
     ptr<logger> myLog;
