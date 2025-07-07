@@ -713,6 +713,12 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
     }
 
     recur_lock(lock_);
+    // recheck under lock
+    if (stopping_) {
+        p_wn("stopping, return null");
+        return nullptr;
+    }
+
     if ( req.get_type() == msg_type::append_entries_request ||
          req.get_type() == msg_type::request_vote_request ||
          req.get_type() == msg_type::install_snapshot_request ) {
