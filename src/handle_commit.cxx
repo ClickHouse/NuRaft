@@ -113,8 +113,12 @@ void raft_server::commit_in_bg() {
      bool is_log_store_commit_exec = initial_commit_exec_.exchange(false);
 
      try {
+        // WARNING:
+        //   If `sm_commit_paused_` is set, we shouldn't enter
+        //   `commit_in_bg_exec()`, as it will cause an infinite loop.
         while ( quick_commit_index_ <= sm_commit_index_ ||
-                sm_commit_index_ >= log_store_->next_slot() - 1 ) {
+                sm_commit_index_ >= log_store_->next_slot() - 1 ||
+                sm_commit_paused_ ) {
             std::unique_lock<std::mutex> lock(commit_cv_lock_);
 
             auto wait_check = [this]() {
@@ -791,6 +795,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
         }
         if (id_ == (*it)->get_id()) {
             my_priority_ = (*it)->get_priority();
+            im_learner_ = (*it)->is_learner();
             steps_to_down_ = 0;
             if (!(*it)->is_new_joiner() &&
                 role_ == srv_role::follower &&
@@ -1003,7 +1008,7 @@ void raft_server::remove_peer_from_peers(const ptr<peer>& pp) {
     peers_.erase(pp->get_id());
 }
 
-void raft_server::pause_state_machine_exeuction(size_t timeout_ms) {
+void raft_server::pause_state_machine_execution(size_t timeout_ms) {
     p_in( "pause state machine execution, previously %s, state machine %s, "
           "timeout %zu ms",
           sm_commit_paused_ ? "PAUSED" : "ACTIVE",

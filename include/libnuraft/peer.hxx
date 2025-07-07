@@ -81,6 +81,8 @@ public:
         , rsv_msg_handler_(nullptr)
         , last_streamed_log_idx_(0)
         , bytes_in_flight_(0)
+        , snapshot_sync_is_needed_(false)
+        , self_mark_down_(false)
         , l_(logger)
     {
         reset_ls_timer();
@@ -356,6 +358,24 @@ public:
     void set_lost() { lost_by_leader_ = true; }
     void set_recovered() { lost_by_leader_ = false; }
 
+    void set_snapshot_sync_is_needed(bool to) {
+        snapshot_sync_is_needed_ = to;
+    }
+    bool is_snapshot_sync_needed() const {
+        return snapshot_sync_is_needed_;
+    }
+
+    bool is_self_mark_down() const {
+        return self_mark_down_;
+    }
+    bool set_self_mark_down(bool to) {
+        bool old = self_mark_down_;
+        if (old != to) {
+            self_mark_down_ = to;
+        }
+        return old;
+    }
+
 private:
     void handle_rpc_result(ptr<peer> myself,
                            ptr<rpc_client> my_rpc_client,
@@ -586,6 +606,18 @@ private:
      * Current bytes of in-flight append entry requests.
      */
     std::atomic<int64_t> bytes_in_flight_;
+
+    /**
+     * Set to `true` if this peer was in the middle of receiving snapshot,
+     * but received a normal request. In such a case, even though
+     * `next_log_idx_` is within the range, we should send a snapshot.
+     */
+    std::atomic<bool> snapshot_sync_is_needed_;
+
+    /**
+     * If `true`, this peer marks itself down.
+     */
+    std::atomic<bool> self_mark_down_;
 
     /**
      * Logger instance.

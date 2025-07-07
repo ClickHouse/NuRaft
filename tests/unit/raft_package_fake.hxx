@@ -15,6 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 **************************************************************************/
 
+#pragma once
+
 #include "fake_network.hxx"
 #include "raft_functional_common.hxx"
 
@@ -54,7 +56,8 @@ public:
 
     void initServer(raft_params* given_params = nullptr,
                     const raft_server::init_options& opt =
-                        raft_server::init_options(false, true, true))
+                        raft_server::init_options(false, true, true),
+                    std::function<void(RaftPkg*)> init_cb = nullptr)
     {
         fNet = cs_new<FakeNetwork>( myEndpoint, fBase );
         fBase->addNetwork(fNet);
@@ -87,6 +90,12 @@ public:
 
         ctx = new context( sMgr, sm, {listener}, myLog,
                            rpcCliFactory, scheduler, params );
+
+        if (init_cb) {
+            // Before initialization, invoke the callback.
+            init_cb(this);
+        }
+
         raftServer = cs_new<raft_server>(ctx, opt);
     }
 
@@ -233,7 +242,9 @@ static cb_func::ReturnCode ATTR_UNUSED cb_default(
 static INT_UNUSED launch_servers(const std::vector<RaftPkg*>& pkgs,
                                  raft_params* custom_params = nullptr,
                                  bool restart = false,
-                                 cb_func::func_type callback = cb_default) {
+                                 cb_func::func_type callback = cb_default,
+                                 std::function<void(RaftPkg*)> init_cb = nullptr)
+{
     size_t num_srvs = pkgs.size();
     CHK_GT(num_srvs, 0);
 
@@ -245,7 +256,7 @@ static INT_UNUSED launch_servers(const std::vector<RaftPkg*>& pkgs,
         if (restart) {
             ff->restartServer(custom_params, opt);
         } else {
-            ff->initServer(custom_params, opt);
+            ff->initServer(custom_params, opt, init_cb);
         }
         ff->fNet->listen(ff->raftServer);
         ff->fTimer->invoke( timer_task_type::election_timer );
