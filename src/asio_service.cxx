@@ -1369,7 +1369,7 @@ public:
 
         // serialize req, send and read response
         std::vector<ptr<buffer>> log_entry_bufs;
-        int32 log_data_size(0);
+        int64 log_data_size(0);
 
         uint32_t flags = 0x0;
         size_t LOG_ENTRY_SIZE = 8 + 1 + 4;
