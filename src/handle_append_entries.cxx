@@ -517,8 +517,12 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     if ((last_log_idx + 1) >= cur_nxt_idx) {
         log_entries = ptr<std::vector<ptr<log_entry>>>();
     } else if (entries_valid) {
+        int64 batch_size_hint = p.get_next_batch_size_hint_in_bytes() == 0
+                                    ? params->max_append_size_bytes_
+                                    : std::min(params->max_append_size_bytes_,
+                                               p.get_next_batch_size_hint_in_bytes());
         log_entries = log_store_->log_entries_ext(last_log_idx + 1, end_idx,
-                                                  p.get_next_batch_size_hint_in_bytes());
+                                                  batch_size_hint);
         if (log_entries == nullptr) {
             p_wn("failed to retrieve log entries: %" PRIu64 " - %" PRIu64,
                  last_log_idx + 1, end_idx);

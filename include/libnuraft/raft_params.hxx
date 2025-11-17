@@ -77,6 +77,7 @@ struct raft_params {
         , snapshot_sync_ctx_timeout_(0)
         , enable_randomized_snapshot_creation_(false)
         , max_append_size_(100)
+        , max_append_size_bytes_(0)
         , reserved_log_items_(100000)
         , client_req_timeout_(3000)
         , fresh_log_gap_(200)
@@ -155,6 +156,18 @@ struct raft_params {
      */
     raft_params& with_max_append_size(int32 size) {
         max_append_size_ = size;
+        return *this;
+    }
+
+    /**
+     * The maximum bytes of log entries that could be attached to an appendEntries call.
+     * If set to 0, only max_append_size_ will be used.
+     *
+     * @param size_bytes
+     * @return self
+     */
+    raft_params& with_max_append_size_bytes(int64 size_bytes) {
+        max_append_size_bytes_ = size_bytes;
         return *this;
     }
 
@@ -439,6 +452,13 @@ public:
      * for append entry request.
      */
     int32 max_append_size_;
+
+    /**
+     * Max bytes of logs that can be packed in a RPC
+     * for append entry request.
+     * If set to 0, only max_append_size_ will be used.
+     */
+    int64 max_append_size_bytes_;
 
     /**
      * Minimum number of logs that will be preserved
