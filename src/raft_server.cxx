@@ -1475,13 +1475,6 @@ bool raft_server::request_leadership(int successor_id) {
     }
     ptr<peer> pp = entry->second;
 
-    auto successor_entry = peers_.find(successor_id);
-    if (successor_entry == peers_.end()) {
-        p_er("cannot request leadership: cannot find peer for "
-             "successor id %d", successor_id);
-        return false;
-    }
-
     // Send resignation message to the follower.
     ptr<req_msg> req = cs_new<req_msg>
                        ( state_->get_term(),
