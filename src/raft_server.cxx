@@ -1419,11 +1419,6 @@ void raft_server::yield_leadership(bool immediate_yield,
 }
 
 bool raft_server::request_leadership(int successor_id) {
-    // If this server is already a leader, do nothing.
-    if (id_ == leader_ || is_leader()) {
-        p_er("cannot request leadership: this server is already a leader");
-        return false;
-    }
     // Forward the request to the successor if specified.
     if (successor_id != -1 && successor_id != id_) {
         p_in("cannot request leadership: will forward to another server %d, ", successor_id);
@@ -1459,6 +1454,12 @@ bool raft_server::request_leadership(int successor_id) {
 
         p_in("sent leadership request to peer %d", successor_id);
         return true;
+    }
+
+    // If this server is already a leader, do nothing.
+    if (id_ == leader_ || is_leader()) {
+        p_er("cannot request leadership: this server is already a leader");
+        return false;
     }
 
     if (leader_ == -1) {
