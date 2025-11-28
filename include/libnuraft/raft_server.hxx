@@ -428,10 +428,13 @@ public:
      * Send a request to the current leader to yield its leadership,
      * and become the next leader.
      *
+     * @param successor_id The server ID of the successor. If it's -1 server will ask for himself, otherwise
+     *                     it will forward the request to the designated successor.
+     *
      * @return `true` on success. But it does not guarantee to become
      *         the next leader due to various failures.
      */
-    bool request_leadership();
+    bool request_leadership(int successor_id = -1);
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -1150,6 +1153,10 @@ protected:
                                              ptr<resp_msg> resp);
 
     ptr<resp_msg> handle_resignation_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    ptr<resp_msg> handle_request_leadership_request(req_msg& req,
                                              ptr<custom_notification_msg> msg,
                                              ptr<resp_msg> resp);
 
