@@ -386,6 +386,10 @@ public:
                                    const int new_priority,
                                    bool broadcast_when_leader_exists = false);
 
+
+    bool set_priority_v2(const int srv_id,
+                         const int new_priority);
+
     /**
      * Broadcast the priority change of given server to all peers.
      * This function should be used only when there is no live leader
@@ -1035,6 +1039,7 @@ protected:
     ptr<resp_msg> handle_join_cluster_req(req_msg& req);
     ptr<resp_msg> handle_leave_cluster_req(req_msg& req);
     ptr<resp_msg> handle_priority_change_req(req_msg& req);
+    ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
     ptr<resp_msg> handle_leader_status_req(req_msg& req);

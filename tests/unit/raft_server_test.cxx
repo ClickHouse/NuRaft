@@ -893,6 +893,94 @@ int priority_broadcast_test() {
     return 0;
 }
 
+int priority_v2_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Set the priority of S2 to 100.
+    CHK_TRUE( s1.raftServer->set_priority_v2(2, 100) );
+    // Send priority change reqs.
+    s1.fNet->execReqResp();
+    // Send reqs again for commit.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Set the priority of S3 to 50.
+    CHK_TRUE( s1.raftServer->set_priority_v2(3, 50) );
+    // Send priority change reqs.
+    s1.fNet->execReqResp();
+    // Send reqs again for commit.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Trigger election timer of S2.
+    s2.dbgLog(" --- invoke election timer of S2 ---");
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    // Send pre-vote requests, and probably rejected by S1 and S3.
+    s2.fNet->execReqResp();
+
+    // Trigger election timer of S3.
+    s3.dbgLog(" --- invoke election timer of S3 ---");
+    // It will not initiate vote due to priority.
+    s3.fTimer->invoke( timer_task_type::election_timer );
+
+    // Trigger election timer of S3 again.
+    s3.dbgLog(" --- invoke election timer of S3 ---");
+    // Now it will initiate vote by help of priority decay.
+    s3.fTimer->invoke( timer_task_type::election_timer );
+
+    // Send pre-vote requests, it will be rejected by S1, accepted by S2.
+    // As a part of resp handling, it will initiate vote request.
+    s3.fNet->execReqResp();
+    // Send vote requests, S2 will deny due to priority.
+    s3.fNet->execReqResp();
+
+    // S1 should be still leader.
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+
+    CHK_TRUE( s1.raftServer->is_leader_alive() );
+    CHK_FALSE( s2.raftServer->is_leader_alive() );
+    CHK_FALSE( s3.raftServer->is_leader_alive() );
+
+    // Follower to leader broadcast
+    CHK_TRUE( s2.raftServer->set_priority_v2(1, 101) );
+    s2.fNet->execReqResp();
+    CHK_Z( check_priorities(pkgs, {101, 100, 50}) );
+
+    CHK_TRUE( s3.raftServer->set_priority_v2(2, 102) );
+    s3.fNet->execReqResp();
+    CHK_Z( check_priorities(pkgs, {101, 102, 50}) );
+
+    // Follower to self broadcast
+    CHK_TRUE( s3.raftServer->set_priority_v2(3, 103) );
+    s3.fNet->execReqResp();
+    CHK_Z( check_priorities(pkgs, {101, 102, 103}) );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int priority_broadcast_with_live_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();

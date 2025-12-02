@@ -809,6 +809,8 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
 
     } else if (req.get_type() == msg_type::priority_change_request) {
         resp = handle_priority_change_req(req);
+    } else if (req.get_type() == msg_type::priority_change_request_v2) {
+        resp = handle_priority_change_req_v2(req);
     } else {
         // extended requests
         resp = handle_ext_msg(req, guard);
@@ -1450,7 +1452,8 @@ bool raft_server::request_leadership(int successor_id) {
             cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
         req->log_entries().push_back(custom_noti_le);
-        peer->send_req(peer, req, resp_handler_);
+        if (peer->make_busy())
+            peer->send_req(peer, req, resp_handler_);
 
         p_in("sent leadership request to peer %d", successor_id);
         return true;
