@@ -62,11 +62,12 @@ enum msg_type {
     custom_notification_response    = 29,
     leader_status_request           = 30,
     leader_status_response          = 31,
+    priority_change_request_v2      = 32,
 };
 
 inline bool ATTR_UNUSED is_valid_msg(msg_type type) {
     if ( type >= request_vote_request &&
-         type <= custom_notification_response ) {
+         type <= priority_change_request_v2 ) {
         return true;
     }
     return false;
@@ -106,6 +107,7 @@ inline std::string ATTR_UNUSED msg_type_to_string(msg_type type) {
     case custom_notification_response:  return "custom_notification_response";
     case leader_status_request:   return "leader_status_request";
     case leader_status_response:  return "leader_status_response";
+    case priority_change_request_v2:    return "priority_change_request_v2";
     default:
         return "unknown (" + std::to_string(static_cast<int>(type)) + ")";
     }
