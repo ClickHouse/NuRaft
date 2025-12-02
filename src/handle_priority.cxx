@@ -38,6 +38,9 @@ bool raft_server::set_priority_v2(const int srv_id,
 {
     recur_lock(lock_);
 
+    p_in("set_priority_v2 called for server %d to new priority %d",
+         srv_id, new_priority);
+
     if (id_ != leader_) {
         p_in("Got set_priority request but I'm not a leader: my ID %d, leader %d",
              id_, leader_.load());
@@ -82,15 +85,8 @@ bool raft_server::set_priority_v2(const int srv_id,
         std::vector< ptr<log_entry> >& v = req->log_entries();
         v.push_back(le);
 
-        if (peer->make_busy()) {
-            peer->send_req(peer, req, resp_handler_);
-            p_in("forwarded priority change request to leader %d", leader_.load());
-            return true;
-        } else {
-            p_er("leader peer %d is currently busy, cannot forward request",
-                 peer->get_id());
-            return false;
-        }
+        auto result = send_msg_to_leader(req);
+        return result->get_result_code() == cmd_result_code::OK;
     }
     else {
         p_in("I am the leader, will set priority directly");
@@ -354,6 +350,9 @@ ptr<resp_msg> raft_server::handle_priority_change_req_v2(req_msg& req) {
 
     int32 t_id = buf.get_int();
     int32 t_priority = buf.get_int();
+
+    p_in("processing priority change request: server %d -> %d",
+         t_id, t_priority);
 
     if (t_id == id_ && t_priority == 0) {
         p_wn("cannot set my own priority to 0 as a leader");

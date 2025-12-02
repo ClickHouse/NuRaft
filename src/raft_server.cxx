@@ -1452,11 +1452,18 @@ bool raft_server::request_leadership(int successor_id) {
             cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
         req->log_entries().push_back(custom_noti_le);
-        if (peer->make_busy())
-            peer->send_req(peer, req, resp_handler_);
 
-        p_in("sent leadership request to peer %d", successor_id);
-        return true;
+        if (peer->make_busy())
+        {
+            peer->send_req(peer, req, resp_handler_);
+            p_in("sent leadership request to peer %d", successor_id);
+            return true;
+        }
+        else
+        {
+            p_in("peer %d request is busy, cannot send request", successor_id);
+            return false;
+        }
     }
 
     // If this server is already a leader, do nothing.
