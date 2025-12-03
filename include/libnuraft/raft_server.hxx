@@ -387,6 +387,13 @@ public:
                                    bool broadcast_when_leader_exists = false);
 
 
+    /**
+     * A simplified version of `set_priority` with more clear logic and limited use cases.
+     * What are the differences from `set_priority`:
+     * - If we're not a leader and a leader exists and auto_forwarding is on -- forward request to the leader.
+     * - Doesn't allow to set leader priority to 0, if you want to do it you can do request_leadership first.
+     * - Don't broadcast priority change in any case.
+     */
     bool set_priority_v2(const int srv_id,
                          const int new_priority);
 
@@ -432,7 +439,7 @@ public:
      * Send a request to the current leader to yield its leadership,
      * and become the next leader.
      *
-     * @param successor_id The server ID of the successor. If it's -1 server will ask for himself, otherwise
+     * @param successor_id The server ID of the successor. If it's -1 server will ask for itself, otherwise
      *                     it will forward the request to the designated successor.
      *
      * @return `true` on success. But it does not guarantee to become
