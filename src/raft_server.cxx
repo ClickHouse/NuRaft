@@ -1421,53 +1421,11 @@ void raft_server::yield_leadership(bool immediate_yield,
 }
 
 bool raft_server::request_leadership(int successor_id) {
-    // Forward the request to the successor if specified.
-    if (successor_id != -1 && successor_id != id_) {
-        p_in("cannot request leadership: will forward to another server %d, ", successor_id);
-
-        recur_lock(lock_);
-        auto entry = peers_.find(successor_id);
-        if (entry == peers_.end()) {
-            p_er("cannot request leadership for %d: cannot find peer", successor_id);
-            return false;
-        }
-
-        ptr<peer> peer = entry->second;
-        // Send resignation message to the follower.
-        ptr<req_msg> req = cs_new<req_msg>
-                           ( state_->get_term(),
-                             msg_type::custom_notification_request,
-                             id_, successor_id,
-                             term_for_log(log_store_->next_slot() - 1),
-                             log_store_->next_slot() - 1,
-                             quick_commit_index_.load() );
-
-        // Create a notification.
-        ptr<custom_notification_msg> custom_noti =
-            cs_new<custom_notification_msg>
-            ( custom_notification_msg::request_leadership );
-
-        // Wrap it using log_entry.
-        ptr<log_entry> custom_noti_le =
-            cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
-
-        req->log_entries().push_back(custom_noti_le);
-
-        if (peer->make_busy())
-        {
-            peer->send_req(peer, req, resp_handler_);
-            p_in("sent leadership request to peer %d", successor_id);
-            return true;
-        }
-        else
-        {
-            p_in("peer %d request is busy, cannot send request", successor_id);
-            return false;
-        }
-    }
+    if (successor_id == -1)
+        successor_id = id_;
 
     // If this server is already a leader, do nothing.
-    if (id_ == leader_ || is_leader()) {
+    if (successor_id == leader_) {
         p_er("cannot request leadership: this server is already a leader");
         return false;
     }
@@ -1490,7 +1448,7 @@ bool raft_server::request_leadership(int successor_id) {
     ptr<req_msg> req = cs_new<req_msg>
                        ( state_->get_term(),
                          msg_type::custom_notification_request,
-                         id_, leader_,
+                         successor_id, leader_,
                          term_for_log(log_store_->next_slot() - 1),
                          log_store_->next_slot() - 1,
                          quick_commit_index_.load() );
@@ -1505,9 +1463,14 @@ bool raft_server::request_leadership(int successor_id) {
         cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
     req->log_entries().push_back(custom_noti_le);
-    pp->send_req(pp, req, resp_handler_);
-    p_in("sent leadership request to leader %d", leader_.load());
-    return true;
+    if (pp->make_busy()) {
+        p_in("requesting leadership from leader %d", leader_.load());
+        pp->send_req(pp, req, resp_handler_);
+        return true;
+    } else {
+        p_in("cannot request leadership, leader is busy");
+        return false;
+    }
 }
 
 void raft_server::become_follower() {
