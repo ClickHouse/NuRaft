@@ -1426,7 +1426,7 @@ bool raft_server::request_leadership(int successor_id) {
 
     // If this server is already a leader, do nothing.
     if (successor_id == leader_) {
-        p_er("cannot request leadership: this server is already a leader");
+        p_in("cannot request leadership: this server is already a leader");
         return false;
     }
 
@@ -1434,15 +1434,6 @@ bool raft_server::request_leadership(int successor_id) {
         p_er("cannot request leadership: cannot find leader");
         return false;
     }
-
-    recur_lock(lock_);
-    auto entry = peers_.find(leader_);
-    if (entry == peers_.end()) {
-        p_er("cannot request leadership: cannot find peer for "
-             "leader id %d", leader_.load());
-        return false;
-    }
-    ptr<peer> pp = entry->second;
 
     // Send resignation message to the follower.
     ptr<req_msg> req = cs_new<req_msg>
@@ -1463,13 +1454,27 @@ bool raft_server::request_leadership(int successor_id) {
         cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
     req->log_entries().push_back(custom_noti_le);
-    if (pp->make_busy()) {
-        p_in("requesting leadership from leader %d", leader_.load());
-        pp->send_req(pp, req, resp_handler_);
-        return true;
+
+    if (leader_ == id_) {
+        auto resp = process_req(*req, req_ext_params());
+        return resp->get_result_code() == cmd_result_code::OK;
     } else {
-        p_in("cannot request leadership, leader is busy");
-        return false;
+        recur_lock(lock_);
+        auto entry = peers_.find(leader_);
+        if (entry == peers_.end()) {
+            p_er("cannot request leadership: cannot find peer for "
+                 "leader id %d", leader_.load());
+            return false;
+        }
+        ptr<peer> pp = entry->second;
+        if (pp->make_busy()) {
+            p_in("requesting leadership from leader %d", leader_.load());
+            pp->send_req(pp, req, resp_handler_);
+            return true;
+        } else {
+            p_in("cannot request leadership, leader is busy");
+            return false;
+        }
     }
 }
 
