@@ -322,18 +322,13 @@ void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
 
     // Cut off all shared pointers related to ASIO and Raft server.
     scheduler_ = ctx.scheduler_;
-    // {   // To guarantee atomic reset
-    //     // (race between send_req()).
-    //     std::lock_guard<std::mutex> l(rpc_protector_);
-    //     recreate_rpc(config_, ctx);
-    // }
     hb_task_ = cs_new< timer_task<int32>,
                             timer_task<int32>::executor&,
                             int32 >
                           ( hb_exec, config_->get_id(),
                             timer_task_type::heartbeat_timer ) ;
     is_shutdown_ = false;
-    p_db("call peer %d reopen successed", get_id());
+    p_tr("call peer %d reopen successed", get_id());
 }
 
 } // namespace nuraft;
