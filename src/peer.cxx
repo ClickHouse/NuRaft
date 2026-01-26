@@ -299,7 +299,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
 }
 
 void peer::shutdown() {
-    p_db("call peer %d shutdown", get_id());
+    p_tr("call peer %d shutdown", get_id());
     // Should set the flag to block all incoming requests.
     abandoned_ = true;
 
@@ -316,7 +316,7 @@ void peer::shutdown() {
 
 
 void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
-    p_db("call peer %d reopen", get_id());
+    p_tr("call peer %d reopen", get_id());
     // Should set the flag to block all incoming requests.
     abandoned_ = false;
 
