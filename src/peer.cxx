@@ -311,24 +311,20 @@ void peer::shutdown() {
         rpc_.reset();
     }
     hb_task_.reset();
-    is_shutdown_ = true;
 }
 
 
 void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
     p_tr("peer %d reopen", get_id());
-    // Should set the flag to block all incoming requests.
     abandoned_ = false;
 
-    // Cut off all shared pointers related to ASIO and Raft server.
     scheduler_ = ctx.scheduler_;
     hb_task_ = cs_new< timer_task<int32>,
                             timer_task<int32>::executor&,
                             int32 >
                           ( hb_exec, config_->get_id(),
                             timer_task_type::heartbeat_timer ) ;
-    is_shutdown_ = false;
-    p_tr("call peer %d reopen successed", get_id());
+    p_tr("call peer %d reopen succeeded", get_id());
 }
 
 } // namespace nuraft;

@@ -34,7 +34,7 @@ namespace nuraft {
 void raft_server::enable_hb_for_peer(peer& p) {
     p.enable_hb(true);
     p.resume_hb_speed();
-    if (p.is_shutdown()) {
+    if (p.is_abandoned()) {
         timer_task<int32>::executor exec =
         (timer_task<int32>::executor)
         std::bind( &raft_server::handle_hb_timeout,
@@ -351,7 +351,7 @@ void raft_server::cancel_schedulers() {
             cancel_task(p->get_hb_task());
         }
         // Shutdown peer to cut off smart pointers.
-        p_tr("cancel_schedulers shuntdown peer: %d", p->get_id());
+        p_tr("cancel_schedulers shutdown peer: %d", p->get_id());
         p->shutdown();
 
         // Free user context of snapshot if exists.

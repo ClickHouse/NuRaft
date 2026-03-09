@@ -239,7 +239,7 @@ public:
 
     void reopen(context& ctx, timer_task<int32>::executor& hb_exec);
 
-    bool is_shutdown() const { return is_shutdown_; }
+    bool is_abandoned() const { return abandoned_; }
 
     // Time that sent the last request.
     void reset_ls_timer()       { last_sent_timer_.reset(); }
@@ -623,7 +623,6 @@ private:
      */
     std::atomic<bool> self_mark_down_;
 
-    std::atomic<bool> is_shutdown_{false};
 
     /**
      * Logger instance.
