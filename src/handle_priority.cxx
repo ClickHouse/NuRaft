@@ -32,6 +32,116 @@ limitations under the License.
 
 namespace nuraft {
 
+
+bool raft_server::set_priority_v2(const int srv_id,
+                                  const int new_priority)
+{
+    recur_lock(lock_);
+
+    p_in("set_priority_v2 called for server %d to new priority %d",
+         srv_id, new_priority);
+
+    if (id_ != leader_) {
+        p_in("Got set_priority request but I'm not a leader: my ID %d, leader %d",
+             id_, leader_.load());
+
+        if (!is_leader_alive()) {
+            p_in("No live leader now, will ignore priority change");
+            return false;
+        }
+
+        if (!ctx_->get_params()->auto_forwarding_)
+        {
+            p_in("Auto forwarding is disabled, will ignore priority change");
+            return false;
+        }
+
+        p_in("Leader is present, will forward priority change to leader");
+        auto entry = peers_.find(leader_.load());
+        if (entry == peers_.end()) {
+            p_er("cannot forward priority change for %d: cannot find leader peer", leader_.load());
+            return false;
+        }
+
+        ptr<peer> peer = entry->second;
+        ptr<req_msg> req( cs_new<req_msg>
+                          ( state_->get_term(),
+                            msg_type::priority_change_request_v2,
+                            id_,
+                            peer->get_id(),
+                            term_for_log(log_store_->next_slot() - 1),
+                            log_store_->next_slot() - 1,
+                            quick_commit_index_.load() ) );
+
+        // ID + priority
+        ptr<buffer> buf = buffer::alloc(sz_int * 2);
+        buffer_serializer ss(buf);
+        ss.put_i32(srv_id);
+        ss.put_i32(new_priority);
+        ptr<log_entry> le = cs_new<log_entry>( state_->get_term(),
+                                               buf,
+                                               log_val_type::custom );
+
+        std::vector< ptr<log_entry> >& v = req->log_entries();
+        v.push_back(le);
+
+        auto result = send_msg_to_leader(req);
+        return result->get_result_code() == cmd_result_code::OK;
+    }
+    else {
+        p_in("I am the leader, will set priority directly");
+        if (id_ == srv_id && new_priority == 0) {
+            p_in("Cannot set my own priority to 0 as a leader, ignore the request, If you really want to do it, step down first and then set priority to 0");
+            return false;
+        }
+
+        // Clone current cluster config.
+        ptr<cluster_config> cur_config = get_config();
+
+        // NOTE: Need to honor uncommitted config,
+        //       refer to comment in `sync_log_to_new_srv()`
+        if (uncommitted_config_) {
+            p_in("uncommitted config exists at log %" PRIu64 ", prev log %" PRIu64,
+                 uncommitted_config_->get_log_idx(),
+                 uncommitted_config_->get_prev_log_idx());
+            cur_config = uncommitted_config_;
+        }
+
+        ptr<buffer> enc_conf = cur_config->serialize();
+        ptr<cluster_config> cloned_config = cluster_config::deserialize(*enc_conf);
+
+        std::list<ptr<srv_config>>& s_confs = cloned_config->get_servers();
+
+        for (auto& entry: s_confs) {
+            srv_config* s_conf = entry.get();
+            if (s_conf->get_id() == srv_id) {
+                p_in("Change server %d priority %d -> %d",
+                     srv_id, s_conf->get_priority(), new_priority);
+                s_conf->set_priority(new_priority);
+            }
+        }
+
+        // Create a log for new configuration, it should be replicated.
+        cloned_config->set_log_idx(log_store_->next_slot());
+        ptr<buffer> new_conf_buf(cloned_config->serialize());
+        ptr<log_entry> entry( cs_new<log_entry>
+                              ( state_->get_term(),
+                                new_conf_buf,
+                                log_val_type::conf,
+                                timer_helper::get_timeofday_us() ) );
+
+        config_changing_ = true;
+        uncommitted_config_ = cloned_config;
+
+        store_log_entry(entry);
+        request_append_entries();
+
+        return true;
+    }
+
+
+}
+
 raft_server::PrioritySetResult
 raft_server::set_priority(const int srv_id,
                           const int new_priority,
@@ -151,7 +261,7 @@ void raft_server::broadcast_priority_change(const int srv_id,
         if (pp->make_busy()) {
             pp->send_req(pp, req, resp_handler_);
         } else {
-            p_er("peer %d is currently busy, cannot send request",
+            p_er("leader %d is currently busy, cannot send request",
                  pp->get_id());
         }
     }
@@ -204,6 +314,95 @@ ptr<resp_msg> raft_server::handle_priority_change_req(req_msg& req) {
     p_wn("cannot find peer %d", t_id);
 
     return resp;
+}
+
+
+ptr<resp_msg> raft_server::handle_priority_change_req_v2(req_msg& req) {
+    // NOTE: now this function is protected by lock.
+    ptr<resp_msg> resp
+        ( cs_new<resp_msg>
+          ( req.get_term(),
+            msg_type::priority_change_response,
+            id_,
+            req.get_src() ) );
+
+    if (id_ != leader_) {
+        p_wn("not a leader, cannot handle priority change request");
+        return resp;
+    }
+
+    std::vector< ptr<log_entry> >& v = req.log_entries();
+    if (!v.size()) {
+        p_wn("no log entry");
+        return resp;
+    }
+    if (v[0]->is_buf_null()) {
+        p_wn("empty buffer");
+        return resp;
+    }
+
+    buffer& buf = v[0]->get_buf();
+    buf.pos(0);
+    if (buf.size() < sz_int * 2) {
+        p_wn("wrong buffer size: %zu", buf.size());
+        return resp;
+    }
+
+    int32 t_id = buf.get_int();
+    int32 t_priority = buf.get_int();
+
+    p_in("processing priority change request: server %d -> %d",
+         t_id, t_priority);
+
+    if (t_id == id_ && t_priority == 0) {
+        p_wn("cannot set my own priority to 0 as a leader");
+        return resp;
+    }
+
+    // Clone current cluster config.
+    ptr<cluster_config> cur_config = get_config();
+
+    // NOTE: Need to honor uncommitted config,
+    //       refer to comment in `sync_log_to_new_srv()`
+    if (uncommitted_config_) {
+        p_in("uncommitted config exists at log %" PRIu64 ", prev log %" PRIu64,
+             uncommitted_config_->get_log_idx(),
+             uncommitted_config_->get_prev_log_idx());
+        cur_config = uncommitted_config_;
+    }
+
+    ptr<buffer> enc_conf = cur_config->serialize();
+    ptr<cluster_config> cloned_config = cluster_config::deserialize(*enc_conf);
+
+    std::list<ptr<srv_config>>& s_confs = cloned_config->get_servers();
+
+    for (auto& entry: s_confs) {
+        srv_config* s_conf = entry.get();
+        if (s_conf->get_id() == t_id) {
+            p_in("Change server %d priority %d -> %d",
+                 t_id, s_conf->get_priority(), t_priority);
+            s_conf->set_priority(t_priority);
+            resp->accept(log_store_->next_slot());
+        }
+    }
+
+    // Create a log for new configuration, it should be replicated.
+    cloned_config->set_log_idx(log_store_->next_slot());
+    ptr<buffer> new_conf_buf(cloned_config->serialize());
+    ptr<log_entry> entry( cs_new<log_entry>
+                          ( state_->get_term(),
+                            new_conf_buf,
+                            log_val_type::conf,
+                            timer_helper::get_timeofday_us() ) );
+
+    config_changing_ = true;
+    uncommitted_config_ = cloned_config;
+
+    store_log_entry(entry);
+    request_append_entries();
+
+    return resp;
+
 }
 
 void raft_server::handle_priority_change_resp(resp_msg& resp) {

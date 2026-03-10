@@ -386,6 +386,17 @@ public:
                                    const int new_priority,
                                    bool broadcast_when_leader_exists = false);
 
+
+    /**
+     * A simplified version of `set_priority` with more clear logic and limited use cases.
+     * What are the differences from `set_priority`:
+     * - If we're not a leader and a leader exists and auto_forwarding is on -- forward request to the leader.
+     * - Doesn't allow to set leader priority to 0, if you want to do it you can do request_leadership first.
+     * - Don't broadcast priority change in any case.
+     */
+    bool set_priority_v2(const int srv_id,
+                         const int new_priority);
+
     /**
      * Broadcast the priority change of given server to all peers.
      * This function should be used only when there is no live leader
@@ -428,10 +439,13 @@ public:
      * Send a request to the current leader to yield its leadership,
      * and become the next leader.
      *
+     * @param successor_id The server ID of the successor. If it's -1 server will ask for itself, otherwise
+     *                     it will forward the request to the designated successor.
+     *
      * @return `true` on success. But it does not guarantee to become
      *         the next leader due to various failures.
      */
-    bool request_leadership();
+    bool request_leadership(int successor_id = -1);
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -1032,6 +1046,7 @@ protected:
     ptr<resp_msg> handle_join_cluster_req(req_msg& req);
     ptr<resp_msg> handle_leave_cluster_req(req_msg& req);
     ptr<resp_msg> handle_priority_change_req(req_msg& req);
+    ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
     ptr<resp_msg> handle_leader_status_req(req_msg& req);
@@ -1150,6 +1165,10 @@ protected:
                                              ptr<resp_msg> resp);
 
     ptr<resp_msg> handle_resignation_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    ptr<resp_msg> handle_request_leadership_request(req_msg& req,
                                              ptr<custom_notification_msg> msg,
                                              ptr<resp_msg> resp);
 

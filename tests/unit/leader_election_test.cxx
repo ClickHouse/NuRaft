@@ -667,7 +667,32 @@ int leadership_takeover_by_request_test() {
     CHK_FALSE( s2.raftServer->is_leader() );
     CHK_TRUE( s3.raftServer->is_leader() );
 
+    s1.dbgLog(" --- request leadership forwarding ---");
+    CHK_TRUE( s1.raftServer->request_leadership(2) );
+    s1.fNet->execReqResp();
+
+    s2.fNet->execReqResp();
+
+    s3.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s3.fNet->execReqResp();
+    s3.fNet->execReqResp();
+
+    s2.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Send new config as a new leader.
+    s2.fNet->execReqResp();
+    // Follow-up: commit.
+    s2.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+
     print_stats(pkgs);
+
 
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
