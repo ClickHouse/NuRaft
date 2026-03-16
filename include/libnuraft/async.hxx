@@ -287,20 +287,12 @@ public:
      */
     T& get() {
         std::unique_lock<std::mutex> lock(lock_);
-        if (has_result_) {
-            if (err_ == nullptr) {
-                return result_;
-            }
-            // Return empty result rather than throw exception.
-            // Caller should handle it properly.
-            return empty_result_;
-        }
-
-        cv_.wait(lock);
+        cv_.wait(lock, [&] { return has_result_; });
         if (err_ == nullptr) {
             return result_;
         }
-
+        // Return empty result rather than throw exception.
+        // Caller should handle it properly.
         return empty_result_;
     }
 
