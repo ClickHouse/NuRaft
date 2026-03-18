@@ -48,6 +48,20 @@ protected:
     static std::unordered_map<int32, ptr<peer>>& get_peers(raft_server* srv) {
         return srv->peers_;
     }
+
+    /**
+     * Check if the server believes it is out of log range (for testing).
+     */
+    static bool is_out_of_log_range(raft_server* srv) {
+        return srv->out_of_log_range_;
+    }
+
+    /**
+     * Get the last snapshot from a raft_server (for testing).
+     */
+    static ptr<snapshot> get_last_snapshot(raft_server* srv) {
+        return srv->get_last_snapshot();
+    }
 };
 
 }

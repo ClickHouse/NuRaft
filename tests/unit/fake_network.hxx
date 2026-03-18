@@ -120,6 +120,33 @@ public:
         return false;
     }
 
+    bool isServerOutOfLogRange(raft_server* srv) {
+        return is_out_of_log_range(srv);
+    }
+
+    bool hasPeerSnapshotSyncCtx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_snapshot_sync_ctx() != nullptr;
+        }
+        return false;
+    }
+
+    void setPeerSnapshotInSync(raft_server* srv,
+                               int32 peer_id,
+                               ptr<snapshot> snp) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_snapshot_in_sync(snp);
+        }
+    }
+
+    ptr<snapshot> getLastSnapshot(raft_server* srv) {
+        return get_last_snapshot(srv);
+    }
+
 private:
     std::string myEndpoint;
     ptr<FakeNetworkBase> base;
