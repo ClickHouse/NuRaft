@@ -120,6 +120,10 @@ public:
         return false;
     }
 
+    void clearLastSnapshot(raft_server* srv) {
+        clear_last_snapshot(srv);
+    }
+
 private:
     std::string myEndpoint;
     ptr<FakeNetworkBase> base;

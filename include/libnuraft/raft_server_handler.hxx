@@ -48,6 +48,13 @@ protected:
     static std::unordered_map<int32, ptr<peer>>& get_peers(raft_server* srv) {
         return srv->peers_;
     }
+
+    /**
+     * Clear the last snapshot pointer in a raft_server (for testing).
+     */
+    static void clear_last_snapshot(raft_server* srv) {
+        srv->set_last_snapshot(nullptr);
+    }
 };
 
 }
