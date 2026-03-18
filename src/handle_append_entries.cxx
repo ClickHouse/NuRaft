@@ -543,18 +543,31 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              ( pp->is_snapshot_sync_needed() ||
                ( last_log_idx < starting_idx &&
                 last_log_idx < snp_local->get_last_log_idx() ) ) ) {
-            p_db( "send snapshot peer %d, peer log idx: %" PRIu64
-                  ", my starting idx: %" PRIu64 ", "
-                  "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
-                  ", snapshot sync needed: %d",
-                  p.get_id(),
-                  last_log_idx, starting_idx, cur_nxt_idx,
-                  snp_local->get_last_log_idx(),
-                  pp->is_snapshot_sync_needed() );
+            // If peer has advanced past our snapshot, it doesn't need
+            // snapshot sync anymore — clear the flag and fall through
+            // to normal log replication or out-of-log-range handling.
+            if ( last_log_idx >= snp_local->get_last_log_idx() &&
+                 pp->is_snapshot_sync_needed() ) {
+                p_in( "peer %d log idx %" PRIu64 " has caught up past "
+                      "snapshot %" PRIu64 ", clearing snapshot sync flag",
+                      p.get_id(), last_log_idx,
+                      snp_local->get_last_log_idx() );
+                pp->set_snapshot_sync_is_needed(false);
+                // Fall through to log-based replication or OOL handling.
+            } else {
+                p_db( "send snapshot peer %d, peer log idx: %" PRIu64
+                      ", my starting idx: %" PRIu64 ", "
+                      "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
+                      ", snapshot sync needed: %d",
+                      p.get_id(),
+                      last_log_idx, starting_idx, cur_nxt_idx,
+                      snp_local->get_last_log_idx(),
+                      pp->is_snapshot_sync_needed() );
 
-            bool succeeded_out = false;
-            return create_sync_snapshot_req( pp, last_log_idx, term,
-                                             commit_idx, succeeded_out );
+                bool succeeded_out = false;
+                return create_sync_snapshot_req( pp, last_log_idx, term,
+                                                 commit_idx, succeeded_out );
+            }
         }
 
         // Cannot recover using snapshot. Return here to protect the leader.

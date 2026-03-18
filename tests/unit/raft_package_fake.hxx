@@ -175,7 +175,7 @@ static std::atomic<bool> commit_done(false);
 static std::list<int> removed_servers;
 static std::vector<RaftPkg*> pkgs_to_watch;
 static std::mutex pkgs_to_watch_lock;
-static EventAwaiter ea_wait_for_commit;
+static nuraft::EventAwaiter ea_wait_for_commit;
 
 static bool ATTR_UNUSED check_pkgs() {
     // Check if all current committed logs are executed in

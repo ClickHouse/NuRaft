@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "nuraft.hxx"
 
+#include "peer.hxx"
 #include "raft_server_handler.hxx"
 
 #include <map>
@@ -98,6 +99,26 @@ public:
     void stop();
 
     void shutdown();
+
+    void setPeerSnapshotSyncNeeded(raft_server* srv,
+                                   int32 peer_id,
+                                   bool val) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_snapshot_sync_is_needed(val);
+        }
+    }
+
+    bool getPeerSnapshotSyncNeeded(raft_server* srv,
+                                   int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->is_snapshot_sync_needed();
+        }
+        return false;
+    }
 
 private:
     std::string myEndpoint;

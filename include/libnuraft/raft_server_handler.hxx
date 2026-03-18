@@ -41,6 +41,13 @@ protected:
                                          raft_server::req_ext_params()) {
         return srv->process_req(req, ext_params);
     }
+
+    /**
+     * Get the peers map from a raft_server (for testing).
+     */
+    static std::unordered_map<int32, ptr<peer>>& get_peers(raft_server* srv) {
+        return srv->peers_;
+    }
 };
 
 }
