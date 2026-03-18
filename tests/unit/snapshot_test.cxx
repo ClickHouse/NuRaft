@@ -936,7 +936,7 @@ int snapshot_stale_sync_flag_test() {
     // Snapshot sync context must also be cleaned up alongside the flag,
     // so that late install_snapshot_response messages cannot rewind
     // next_log_idx/matched_idx to a stale snapshot point.
-    // (The response handler at handle_snapshot_sync.cxx:342 drops
+    // (The response handler in handle_install_snapshot_resp drops
     // responses when sync_ctx is null, so clearing it here is sufficient.)
     CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(
                    s1.raftServer.get(), 3) );

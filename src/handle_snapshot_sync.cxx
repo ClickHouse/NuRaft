@@ -113,7 +113,10 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     if ( !snp || sync_ctx->get_offset() == 0 ) {
         snp = get_last_snapshot();
         if ( snp == nilptr ) {
-            p_wn( "snapshot is not available for peer %d, will retry",
+            static timer_helper msg_timer(5000000);
+            int log_lv = msg_timer.timeout_and_reset() ? L_WARN : L_TRACE;
+            p_lv( log_lv,
+                  "snapshot is not available for peer %d, will retry",
                   p.get_id() );
             clear_snapshot_sync_ctx(p);
             return ptr<req_msg>();
