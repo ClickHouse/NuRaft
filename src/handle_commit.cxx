@@ -722,7 +722,8 @@ void raft_server::on_snapshot_completed
         ptr<snapshot> new_snp = state_machine_->last_snapshot();
         set_last_snapshot(new_snp);
         ptr<raft_params> params = ctx_->get_params();
-        if ( new_snp->get_last_log_idx() >
+        if ( new_snp &&
+             new_snp->get_last_log_idx() >
                  (ulong)params->reserved_log_items_ ) {
             ulong compact_upto = new_snp->get_last_log_idx() -
                                      (ulong)params->reserved_log_items_;

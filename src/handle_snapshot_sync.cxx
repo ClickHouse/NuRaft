@@ -117,9 +117,9 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
             // LCOV_EXCL_START
             p_er( "system is running into fatal errors, failed to find a "
                   "snapshot for peer %d (snapshot null: %d, snapshot "
-                  "doesn't contais lastLogIndex: %d)",
+                  "doesn't contain lastLogIndex: %d)",
                   p.get_id(), snp == nilptr ? 1 : 0,
-                  last_log_idx > snp->get_last_log_idx() ? 1 : 0 );
+                  (snp != nilptr && last_log_idx > snp->get_last_log_idx()) ? 1 : 0 );
             if (snp) {
                 p_er("last log idx %" PRIu64 ", snp last log idx %" PRIu64,
                      last_log_idx, snp->get_last_log_idx());
