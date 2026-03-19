@@ -892,6 +892,14 @@ int snapshot_stale_sync_flag_test() {
 
     uint64_t s3_log_idx = s3.raftServer->get_last_log_idx();
 
+    // Leader must have a snapshot (snapshot_distance_=5, 10 entries appended).
+    // This ensures we exercise the "peer caught up past snapshot" path,
+    // not the "no snapshot exists" fallback.
+    ptr<snapshot> leader_snp =
+        s1.fNet->getLastSnapshot(s1.raftServer.get());
+    CHK_NONNULL( leader_snp.get() );
+    CHK_GTEQ( s3_log_idx, leader_snp->get_last_log_idx() );
+
     // --- Simulate the TOCTOU race condition ---
     // Force-set is_snapshot_sync_needed on the leader's peer for S3.
     // In production, this flag gets set via RECEIVING_SNAPSHOT response,
@@ -901,18 +909,41 @@ int snapshot_stale_sync_flag_test() {
     CHK_TRUE( s1.fNet->getPeerSnapshotSyncNeeded(
                   s1.raftServer.get(), 3) );
 
-    // Trigger heartbeat. With the old code, create_append_entries_req would
-    // enter create_sync_snapshot_req and call system_exit (abort) because
-    // peer's last_log_idx >= snapshot's last_log_idx.
-    // With the fix (Fix 2), the flag is cleared and the function falls
-    // through to normal replication or OOL handling.
+    // Also create a snapshot sync context on the peer, simulating a
+    // partial snapshot transfer that was interrupted. Without this,
+    // the hasPeerSnapshotSyncCtx assertion below would be vacuous
+    // (checking nullptr == nullptr).
+    s1.fNet->setPeerSnapshotInSync(
+        s1.raftServer.get(), 3, leader_snp);
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(
+                  s1.raftServer.get(), 3) );
+
+    // Trigger heartbeat. With the old code, create_append_entries_req
+    // would enter create_sync_snapshot_req and call system_exit (abort)
+    // because peer's last_log_idx >= snapshot's last_log_idx.
+    // With the fix, the early check at the top of create_append_entries_req
+    // detects that entries_valid is true and the peer has caught up past
+    // the snapshot, clears both the flag and context, and proceeds with
+    // normal log replication.
     s1.fTimer->invoke( timer_task_type::heartbeat_timer );
     s1.fNet->execReqResp();
     s1.fNet->execReqResp();
 
-    // The flag should now be cleared by Fix 2.
+    // The flag should now be cleared.
     CHK_FALSE( s1.fNet->getPeerSnapshotSyncNeeded(
                    s1.raftServer.get(), 3) );
+
+    // Snapshot sync context must also be cleaned up alongside the flag,
+    // so that late install_snapshot_response messages cannot rewind
+    // next_log_idx/matched_idx to a stale snapshot point.
+    // (The response handler in handle_install_snapshot_resp drops
+    // responses when sync_ctx is null, so clearing it here is sufficient.)
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(
+                   s1.raftServer.get(), 3) );
+
+    // S3 must NOT have received an out_of_log_range warning — it was
+    // in range the whole time; only the stale snapshot_sync flag was wrong.
+    CHK_FALSE( s3.fNet->isServerOutOfLogRange(s3.raftServer.get()) );
 
     // S3's log index should be unchanged (no rollback).
     CHK_EQ( s3_log_idx, s3.raftServer->get_last_log_idx() );
