@@ -50,6 +50,13 @@ protected:
     }
 
     /**
+     * Clear the last snapshot pointer in a raft_server (for testing).
+     */
+    static void clear_last_snapshot(raft_server* srv) {
+        srv->set_last_snapshot(nullptr);
+    }
+
+    /**
      * Check if the server believes it is out of log range (for testing).
      */
     static bool is_out_of_log_range(raft_server* srv) {

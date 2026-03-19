@@ -985,6 +985,150 @@ int snapshot_stale_sync_flag_test() {
     return 0;
 }
 
+// Test for Fix 1: create_sync_snapshot_req handles null snapshot
+// gracefully instead of calling system_exit/abort.
+//
+// Exercises the path via handle_join_leave -> sync_log_to_new_srv
+// -> create_sync_snapshot_req, where get_last_snapshot() returns
+// nullptr. The fix returns an empty request and sets the retry
+// flag instead of aborting.
+int snapshot_null_snapshot_join_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Append a message using separate thread.
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        param.reserved_log_items_ = 0;
+        pp->raftServer->update_params(param);
+    }
+
+    const size_t NUM = 10;
+
+    // Append messages.
+    std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
+    for (size_t ii = 0; ii < NUM; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+        handlers.push_back(ret);
+    }
+
+    // Replicate and commit — triggers snapshot + log compaction.
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // Verify snapshot was created and logs compacted.
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    // Null out the leader's last_snapshot_ to simulate the race
+    // condition where the snapshot becomes unavailable.
+    s1.fNet->clearLastSnapshot(s1.raftServer.get());
+
+    // Add a brand-new server S3. Its start_idx is 0, which is
+    // < log_store_->start_index() (logs are compacted), so
+    // sync_log_to_new_srv calls create_sync_snapshot_req.
+    // With last_snapshot_ == nullptr, get_last_snapshot() returns null.
+    //
+    // Old behavior: system_exit -> abort.
+    // New behavior (Fix 1): log warning, set retry flag, return.
+    std::string s3_addr = "S3";
+    RaftPkg s3(f_base, 3, s3_addr);
+    CHK_Z( launch_servers( {&s3} ) );
+    pkgs.push_back(&s3);
+
+    s1.raftServer->add_srv( *(s3.getTestMgr()->get_srv_config()) );
+
+    // Drive the join request/response. This calls sync_log_to_new_srv
+    // which enters create_sync_snapshot_req with a null snapshot.
+    // The server must NOT abort.
+    s1.fNet->execReqResp();
+
+    // Leader should still be alive.
+    CHK_TRUE( s1.raftServer->is_leader() );
+
+    // Restore the snapshot by appending more entries to trigger
+    // a new snapshot creation cycle.
+    for (size_t ii = NUM; ii < NUM + 5; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+        handlers.push_back(ret);
+    }
+
+    // Replicate and commit — creates a new snapshot, restoring
+    // last_snapshot_ to a valid pointer.
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // Retry the join: trigger heartbeats and drive the protocol
+    // until S3 finishes receiving the snapshot and catches up.
+    for (int ii = 0; ii < 10; ++ii) {
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        if (!s3.raftServer->is_receiving_snapshot()) break;
+    }
+
+    // A few more rounds to finalize log replication and commit.
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // State machines should match.
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    // No open snapshot contexts should remain.
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+
+    f_base->destroy();
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -1022,6 +1166,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot stale sync flag test",
                snapshot_stale_sync_flag_test );
+
+    ts.doTest( "snapshot null snapshot join test",
+               snapshot_null_snapshot_join_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");

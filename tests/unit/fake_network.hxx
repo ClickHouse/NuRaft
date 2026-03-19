@@ -120,6 +120,10 @@ public:
         return false;
     }
 
+    void clearLastSnapshot(raft_server* srv) {
+        clear_last_snapshot(srv);
+    }
+
     bool isServerOutOfLogRange(raft_server* srv) {
         return is_out_of_log_range(srv);
     }
