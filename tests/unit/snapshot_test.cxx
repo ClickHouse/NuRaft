@@ -823,6 +823,168 @@ int snapshot_leader_switch_test() {
     return 0;
 }
 
+// Regression test for incident #1479: stale snapshot_sync_is_needed flag
+// when peer has advanced past the leader's snapshot.
+//
+// Production scenario: TOCTOU race between KeeperStateMachine's
+// latest_snapshot_meta and NuRaft's last_snapshot_ causes
+// is_snapshot_sync_needed to remain true while the peer's log
+// has advanced past the snapshot. The old code called system_exit
+// (abort); the fix clears the flag and falls through to normal
+// replication or OOL handling.
+//
+// This test uses the raft_server_handler test helper to directly
+// set the flag, since the TOCTOU race cannot be reproduced
+// deterministically in the fake network framework.
+int snapshot_stale_sync_flag_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Append a message using separate thread.
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        pp->raftServer->update_params(param);
+    }
+
+    const size_t NUM = 10;
+
+    // Append messages asynchronously.
+    std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
+    for (size_t ii = 0; ii < NUM; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+
+        CHK_TRUE( ret->get_accepted() );
+        handlers.push_back(ret);
+    }
+
+    // Replicate to both S2 and S3.
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // All servers should be in sync now with snapshot at ~index 10.
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    uint64_t s3_log_idx = s3.raftServer->get_last_log_idx();
+
+    // Leader must have a snapshot (snapshot_distance_=5, 10 entries appended).
+    // This ensures we exercise the "peer caught up past snapshot" path,
+    // not the "no snapshot exists" fallback.
+    ptr<snapshot> leader_snp =
+        s1.fNet->getLastSnapshot(s1.raftServer.get());
+    CHK_NONNULL( leader_snp.get() );
+    CHK_GTEQ( s3_log_idx, leader_snp->get_last_log_idx() );
+
+    // --- Simulate the TOCTOU race condition ---
+    // Force-set is_snapshot_sync_needed on the leader's peer for S3.
+    // In production, this flag gets set via RECEIVING_SNAPSHOT response,
+    // and becomes stale when the peer advances past the snapshot due to
+    // election churn or concurrent snapshot installs.
+    s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
+    CHK_TRUE( s1.fNet->getPeerSnapshotSyncNeeded(
+                  s1.raftServer.get(), 3) );
+
+    // Also create a snapshot sync context on the peer, simulating a
+    // partial snapshot transfer that was interrupted. Without this,
+    // the hasPeerSnapshotSyncCtx assertion below would be vacuous
+    // (checking nullptr == nullptr).
+    s1.fNet->setPeerSnapshotInSync(
+        s1.raftServer.get(), 3, leader_snp);
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(
+                  s1.raftServer.get(), 3) );
+
+    // Trigger heartbeat. With the old code, create_append_entries_req
+    // would enter create_sync_snapshot_req and call system_exit (abort)
+    // because peer's last_log_idx >= snapshot's last_log_idx.
+    // With the fix, the early check at the top of create_append_entries_req
+    // detects that entries_valid is true and the peer has caught up past
+    // the snapshot, clears both the flag and context, and proceeds with
+    // normal log replication.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+
+    // The flag should now be cleared.
+    CHK_FALSE( s1.fNet->getPeerSnapshotSyncNeeded(
+                   s1.raftServer.get(), 3) );
+
+    // Snapshot sync context must also be cleaned up alongside the flag,
+    // so that late install_snapshot_response messages cannot rewind
+    // next_log_idx/matched_idx to a stale snapshot point.
+    // (The response handler in handle_install_snapshot_resp drops
+    // responses when sync_ctx is null, so clearing it here is sufficient.)
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(
+                   s1.raftServer.get(), 3) );
+
+    // S3 must NOT have received an out_of_log_range warning — it was
+    // in range the whole time; only the stale snapshot_sync flag was wrong.
+    CHK_FALSE( s3.fNet->isServerOutOfLogRange(s3.raftServer.get()) );
+
+    // S3's log index should be unchanged (no rollback).
+    CHK_EQ( s3_log_idx, s3.raftServer->get_last_log_idx() );
+
+    // Append one more log and verify normal replication works.
+    for (size_t ii = NUM; ii < NUM + 1; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+
+        CHK_TRUE( ret->get_accepted() );
+        handlers.push_back(ret);
+    }
+    s1.fNet->execReqResp(); // replication.
+    s1.fNet->execReqResp(); // commit.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // State machines should be identical after normal replication.
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    // There shouldn't be any open snapshot ctx.
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+
+    f_base->destroy();
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -857,6 +1019,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot leader switch test",
                snapshot_leader_switch_test );
+
+    ts.doTest( "snapshot stale sync flag test",
+               snapshot_stale_sync_flag_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
