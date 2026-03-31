@@ -1469,6 +1469,10 @@ public:
             flags |= MARK_DOWN;
         }
 
+        if (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST) {
+            flags |= STREAM_FORWARDING;
+        }
+
         for (auto& entry: req->log_entries()) {
             ptr<log_entry>& le = entry;
             auto& le_buf = le->get_buf();
