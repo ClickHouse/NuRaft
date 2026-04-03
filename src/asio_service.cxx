@@ -147,6 +147,47 @@ limitations under the License.
 //     the follower is marked down by itself.
 #define MARK_DOWN (0x40)
 
+// If set on a client_request, enables connection-scoped term binding
+// for ordered request forwarding.
+///
+// Use case: sending multiple dependent writes to the leader in a streaming fashion,
+// i.e. with guaranteed ordering but without waiting for commit after each request.
+// For client_request messages with this flag, sent into one TCP connection, the server provides
+// the following guarantees (if configured correctly, see below):
+//  1. Entries are applied/committed in the order they arrived.
+//  2. If some entry is committed, all previous entries from the same connection were
+//     also committed. I.e. some prefix of the request sequence is applied, no gaps.
+//
+// FIFO ordering of a TCP stream guarantees that requests arrive in the same order they were sent.
+// To prevent gaps across leader elections, the session captures
+// the leader's term on the first request and sets expected_term_ on
+// every subsequent one. If a request is rejected for any reason
+// (e.g. the term changes or the server is no longer leader), the session is closed immediately,
+// and the client must reconnect (and discover the new leader);
+// in current implementation, no response is sent in this case (for simplicity).
+//
+// Care needs to be taken to use this correctly. Intended usage:
+//  * Entries are forwarded to the leader from another node.
+//    (For entries originating on the leader node, use req_ext_params::expected_term_
+//     to achieve the same result.)
+//  * NuRaft's own auto_forwarding feature is not used as it doesn't provide sufficient control over
+//    connection management. Instead, you directly use rpc_client_factory to connect to the leader
+//    node. Form client_request messages manually and send them through one rpc_client in the
+//    correct order.
+//  * Enable async_replication in cluster_config and streaming_mode_ in asio_service_options
+//    for performance.
+//  * Commit callback is used to determine when entries were successfully applied,
+//    e.g. to report success to the user.
+//    The responses to client_request messages are probably ignored
+//    (async replication makes them unreliable).
+//  * If the connection is closed, you probably want to report error for all in-flight
+//    uncommitted requests and close their corresponding upstream user sessions.
+//    For that, you probably want to maintain the set (or queue) of in-flight requests:
+//    add entry to the set before sending to the leader, remove in commit callback.
+//  * Use backoff when reconnecting. E.g. during recovery the leader will be rejecting
+//    all requests, so every STREAM_FORWARDING connection will be closed quickly on first request.
+#define STREAM_FORWARDING (0x80)
+
 // =======================
 
 namespace nuraft {
@@ -284,6 +325,7 @@ public:
         , cached_port_(0)
         , crc_header_(0)
         , crc_from_msg_(0)
+        , bound_term_(0)
     {
         p_tr("asio rpc session created: %p", this);
     }
@@ -741,10 +783,45 @@ private:
             }
         }
 
+        raft_server::req_ext_params ext_params;
+        if (flags_ & STREAM_FORWARDING) {
+            if (req->get_type() != msg_type::client_request) {
+                p_er( "unexpected STREAM_FORWARDING flag in message of type %s",
+                      msg_type_to_string(req->get_type()).c_str() );
+                this->stop();
+                return;
+            }
+
+            if (bound_term_ == 0) {
+                ulong current_term = handler_->get_term();
+                if (current_term == 0) {
+                    this->stop();
+                    return;
+                }
+                bound_term_ = current_term;
+            }
+            ext_params.expected_term_ = bound_term_;
+        }
+
         // === RAFT server processes the request here. ===
-        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req);
+        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req, ext_params);
         if (!resp) {
             p_wn("no response is returned from raft message handler");
+            this->stop();
+            return;
+        }
+
+        if ((flags_ & STREAM_FORWARDING) && !resp->get_accepted()) {
+            // Close stream on error to avoid reordering.
+            //
+            // We only check get_accepted() here without doing call_cb()/call_async_cb() first.
+            // This is sufficient because non-immediate errors (i.e. failing
+            // to replicate/commit the entry) do not cause reordering or gaps.
+            // Also, STREAM_FORWARDING is normally used with async replication enabled,
+            // so there shouldn't be any cb or async_cb.
+            //
+            // Currently we don't send the response in this case because the current user of
+            // STREAM_FORWARDING (clickhouse) doesn't care about responses.
             this->stop();
             return;
         }
@@ -938,6 +1015,11 @@ private:
      * CRC number from the request header.
      */
     uint32_t crc_from_msg_;
+
+    /**
+     * Term captured on first client_request with STREAM_FORWARDING flag. 0 = not yet bound.
+     */
+    ulong bound_term_;
 };
 
 // rpc listener implementation
@@ -1117,6 +1199,7 @@ public:
         , socket_(io_svc)
         , ssl_socket_(socket_, ssl_ctx)
         , attempting_conn_(false)
+        , conn_attempts_(0)
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
@@ -1303,7 +1386,19 @@ public:
                 // Already opened, skip async_connect.
                 p_wn("race: socket to %s:%s is already opened, escape",
                      host_.c_str(), port_.c_str());
+                bool exp2 = true;
+                attempting_conn_.compare_exchange_strong(exp2, false);
                 break;
+            }
+
+            size_t prev_conn_attempts = conn_attempts_.fetch_add(1);
+            if ( prev_conn_attempts > 0 &&
+                 (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST)) {
+                abandoned_ = true;
+                std::string err_msg =
+                    "connection lost, not reconnecting because of STREAM_FORWARDING_REQUEST flag";
+                handle_error(req, err_msg, when_done);
+                return;
             }
 
             if (impl_->get_options().custom_resolver_) {
@@ -1385,6 +1480,10 @@ public:
         if (req->get_extra_flags() & req_msg::EXCLUDED_FROM_THE_QUORUM) {
             // If the request is excluded from the quorum, set the flag.
             flags |= MARK_DOWN;
+        }
+
+        if (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST) {
+            flags |= STREAM_FORWARDING;
         }
 
         for (auto& entry: req->log_entries()) {
@@ -2035,6 +2134,7 @@ private:
     // `true` if attempting connection is in progress.
     // Other threads should not do anything.
     std::atomic<bool> attempting_conn_;
+    std::atomic<size_t> conn_attempts_;
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
