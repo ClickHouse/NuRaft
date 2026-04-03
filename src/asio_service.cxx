@@ -170,16 +170,16 @@ limitations under the License.
 //  * Entries are forwarded to the leader from another node.
 //    (For entries originating on the leader node, use req_ext_params::expected_term_
 //     to achieve the same result.)
-//  * NuRaft's own auto_forwarding feature must be disabled as it doesn't provide
-//    sufficient control over connection management. Instead, you directly
-//    use rpc_client_factory to connect to the leader node. Form client_request
-//    messages manually and send them through one rpc_client in the correct order.
-//  * Async replication should be enabled (cluster_config::set_async_replication).
-//    (The flag works without it, but there wouldn't be much performance gain since the server
-//     won't start receiving the next client request until the previous one is committed.)
+//  * NuRaft's own auto_forwarding feature is not used as it doesn't provide sufficient control over
+//    connection management. Instead, you directly use rpc_client_factory to connect to the leader
+//    node. Form client_request messages manually and send them through one rpc_client in the
+//    correct order.
+//  * Enable async_replication in cluster_config and streaming_mode_ in asio_service_options
+//    for performance.
 //  * Commit callback is used to determine when entries were successfully applied,
 //    e.g. to report success to the user.
-//    The responses to client_request messages are probably ignored.
+//    The responses to client_request messages are probably ignored
+//    (async replication makes them unreliable).
 //  * If the connection is closed, you probably want to report error for all in-flight
 //    uncommitted requests and close their corresponding upstream user sessions.
 //    For that, you probably want to maintain the set (or queue) of in-flight requests:
@@ -1199,6 +1199,7 @@ public:
         , socket_(io_svc)
         , ssl_socket_(socket_, ssl_ctx)
         , attempting_conn_(false)
+        , conn_attempts_(0)
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
@@ -1385,7 +1386,19 @@ public:
                 // Already opened, skip async_connect.
                 p_wn("race: socket to %s:%s is already opened, escape",
                      host_.c_str(), port_.c_str());
+                bool exp2 = true;
+                attempting_conn_.compare_exchange_strong(exp2, false);
                 break;
+            }
+
+            size_t prev_conn_attempts = conn_attempts_.fetch_add(1);
+            if ( prev_conn_attempts > 0 &&
+                 (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST)) {
+                abandoned_ = true;
+                std::string err_msg =
+                    "connection lost, not reconnecting because of STREAM_FORWARDING_REQUEST flag";
+                handle_error(req, err_msg, when_done);
+                return;
             }
 
             if (impl_->get_options().custom_resolver_) {
@@ -2121,6 +2134,7 @@ private:
     // `true` if attempting connection is in progress.
     // Other threads should not do anything.
     std::atomic<bool> attempting_conn_;
+    std::atomic<size_t> conn_attempts_;
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
