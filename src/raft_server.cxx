@@ -1459,22 +1459,8 @@ bool raft_server::request_leadership(int successor_id) {
         auto resp = process_req(*req, req_ext_params());
         return resp->get_result_code() == cmd_result_code::OK;
     } else {
-        recur_lock(lock_);
-        auto entry = peers_.find(leader_);
-        if (entry == peers_.end()) {
-            p_er("cannot request leadership: cannot find peer for "
-                 "leader id %d", leader_.load());
-            return false;
-        }
-        ptr<peer> pp = entry->second;
-        if (pp->make_busy()) {
-            p_in("requesting leadership from leader %d", leader_.load());
-            pp->send_req(pp, req, resp_handler_);
-            return true;
-        } else {
-            p_in("cannot request leadership, leader is busy");
-            return false;
-        }
+        auto result = send_msg_to_leader(req);
+        return result->get_result_code() == cmd_result_code::OK;
     }
 }
 
