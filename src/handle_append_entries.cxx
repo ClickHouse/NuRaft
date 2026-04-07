@@ -484,7 +484,32 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     // Verify log index range.
     bool entries_valid = (last_log_idx + 1 >= starting_idx);
     if (entries_valid && pp->is_snapshot_sync_needed()) {
-        entries_valid = false;
+        // Check if the peer has already caught up past the snapshot.
+        // If so, clear the stale flag and proceed with normal log
+        // replication instead of incorrectly forcing entries_valid
+        // to false (which would send an erroneous out_of_log_range
+        // warning to the follower, blocking its election timer).
+        ptr<snapshot> snp_local = get_last_snapshot();
+        if (!snp_local || last_log_idx >= snp_local->get_last_log_idx()) {
+            // Either no snapshot exists (flag is stale — nothing to sync)
+            // or the peer has caught up past the snapshot. In both cases,
+            // clear the flag and proceed with normal log replication.
+            if (snp_local) {
+                p_in("peer %d log idx %" PRIu64 " has caught up past "
+                     "snapshot %" PRIu64 ", clearing stale snapshot sync "
+                     "flag before log replication",
+                     p.get_id(), last_log_idx,
+                     snp_local->get_last_log_idx());
+            } else {
+                p_in("peer %d log idx %" PRIu64 ", no snapshot exists, "
+                     "clearing stale snapshot sync flag",
+                     p.get_id(), last_log_idx);
+            }
+            clear_snapshot_sync_ctx(p);
+            pp->set_snapshot_sync_is_needed(false);
+        } else {
+            entries_valid = false;
+        }
     }
 
     // Read log entries. The underlying log store may have removed some log entries
@@ -543,18 +568,32 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              ( pp->is_snapshot_sync_needed() ||
                ( last_log_idx < starting_idx &&
                 last_log_idx < snp_local->get_last_log_idx() ) ) ) {
-            p_db( "send snapshot peer %d, peer log idx: %" PRIu64
-                  ", my starting idx: %" PRIu64 ", "
-                  "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
-                  ", snapshot sync needed: %d",
-                  p.get_id(),
-                  last_log_idx, starting_idx, cur_nxt_idx,
-                  snp_local->get_last_log_idx(),
-                  pp->is_snapshot_sync_needed() );
+            // If peer has advanced past our snapshot, it doesn't need
+            // snapshot sync anymore — clear the flag and fall through
+            // to normal log replication or out-of-log-range handling.
+            if ( last_log_idx >= snp_local->get_last_log_idx() &&
+                 pp->is_snapshot_sync_needed() ) {
+                p_in( "peer %d log idx %" PRIu64 " has caught up past "
+                      "snapshot %" PRIu64 ", clearing snapshot sync flag",
+                      p.get_id(), last_log_idx,
+                      snp_local->get_last_log_idx() );
+                clear_snapshot_sync_ctx(p);
+                pp->set_snapshot_sync_is_needed(false);
+                // Fall through to log-based replication or OOL handling.
+            } else {
+                p_db( "send snapshot peer %d, peer log idx: %" PRIu64
+                      ", my starting idx: %" PRIu64 ", "
+                      "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
+                      ", snapshot sync needed: %d",
+                      p.get_id(),
+                      last_log_idx, starting_idx, cur_nxt_idx,
+                      snp_local->get_last_log_idx(),
+                      pp->is_snapshot_sync_needed() );
 
-            bool succeeded_out = false;
-            return create_sync_snapshot_req( pp, last_log_idx, term,
-                                             commit_idx, succeeded_out );
+                bool succeeded_out = false;
+                return create_sync_snapshot_req( pp, last_log_idx, term,
+                                                 commit_idx, succeeded_out );
+            }
         }
 
         // Cannot recover using snapshot. Return here to protect the leader.

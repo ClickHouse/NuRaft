@@ -24,7 +24,7 @@ struct ExecArgs : TestSuite::ThreadArgs {
     std::atomic<bool> stopSignal;
     ptr<buffer> msgToWrite;
     std::mutex msgToWriteLock;
-    EventAwaiter eaExecuter;
+    nuraft::EventAwaiter eaExecuter;
 };
 
 static constexpr size_t EXECUTOR_WAIT_MS = 100;
