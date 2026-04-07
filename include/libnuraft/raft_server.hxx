@@ -1126,7 +1126,7 @@ protected:
     virtual void commit_in_bg();
     bool commit_in_bg_exec(size_t timeout_ms = 0, bool initial_commit_exec = false);
 
-    void append_entries_in_bg();
+    virtual void append_entries_in_bg();
     void append_entries_in_bg_exec();
 
     void commit_app_log(ulong idx_to_commit,
