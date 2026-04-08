@@ -268,6 +268,11 @@ public:
     bool recreate_rpc(ptr<srv_config>& config,
                       context& ctx);
 
+    void reset_rpc() {
+        std::lock_guard<std::mutex> l(rpc_protector_);
+        rpc_.reset();
+    }
+
     void reset_rpc_errs()   { rpc_errs_ = 0; }
     void inc_rpc_errs()     { rpc_errs_.fetch_add(1); }
     int32 get_rpc_errs()    { return rpc_errs_; }

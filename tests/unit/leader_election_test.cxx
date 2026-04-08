@@ -687,9 +687,36 @@ int leadership_takeover_by_request_test() {
     // Wait for bg commit for configuration change.
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
 
-    CHK_FALSE( s1.raftServer->is_leader() );
-    CHK_TRUE( s2.raftServer->is_leader() );
-    CHK_FALSE( s3.raftServer->is_leader() );
+    CHK_EQ( 2, s1.raftServer->get_leader() );
+    CHK_EQ( 2, s2.raftServer->get_leader() );
+    CHK_EQ( 2, s3.raftServer->get_leader() );
+
+    // Drop S3's RPC connection to leader S2 to test reconnection
+    // in request_leadership.
+    s3.dbgLog(" --- request leadership forwarding with dropped connection ---");
+    s3.dropPeerConnection(2);
+    CHK_TRUE( s3.raftServer->request_leadership(1) );
+    s3.fNet->execReqResp();
+
+    s1.fNet->execReqResp();
+
+    s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s2.fNet->execReqResp();
+    s2.fNet->execReqResp();
+
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Send new config as a new leader.
+    s1.fNet->execReqResp();
+    // Follow-up: commit.
+    s1.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_EQ( 1, s1.raftServer->get_leader() );
+    CHK_EQ( 1, s2.raftServer->get_leader() );
+    CHK_EQ( 1, s3.raftServer->get_leader() );
 
     print_stats(pkgs);
 

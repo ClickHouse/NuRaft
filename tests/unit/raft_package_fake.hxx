@@ -152,6 +152,10 @@ public:
         _s_info(ll) << msg;
     }
 
+    void dropPeerConnection(int peer_id) {
+        fNet->dropPeerConnection(raftServer.get(), peer_id);
+    }
+
     int myId;
     std::string myEndpoint;
     ptr<FakeNetworkBase> fBase;
