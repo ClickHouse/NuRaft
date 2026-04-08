@@ -909,6 +909,15 @@ int priority_v2_test() {
     CHK_Z( launch_servers( pkgs ) );
     CHK_Z( make_group( pkgs ) );
 
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    CHK_Z( check_priorities(pkgs, {50, 50, 50}) );
+
     // Set the priority of S2 to 100.
     CHK_TRUE( s1.raftServer->set_priority_v2(2, 100) );
     // Send priority change reqs.
@@ -916,59 +925,49 @@ int priority_v2_test() {
     // Send reqs again for commit.
     s1.fNet->execReqResp();
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_Z( check_priorities(pkgs, {50, 100, 50}) );
 
     // Set the priority of S3 to 50.
-    CHK_TRUE( s1.raftServer->set_priority_v2(3, 50) );
+    CHK_TRUE( s1.raftServer->set_priority_v2(3, 42) );
     // Send priority change reqs.
     s1.fNet->execReqResp();
     // Send reqs again for commit.
     s1.fNet->execReqResp();
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_Z( check_priorities(pkgs, {50, 100, 42}) );
 
-    // Trigger election timer of S2.
-    s2.dbgLog(" --- invoke election timer of S2 ---");
-    s2.fTimer->invoke( timer_task_type::election_timer );
-    // Send pre-vote requests, and probably rejected by S1 and S3.
-    s2.fNet->execReqResp();
+    // Send HeartBeat to force is_leader_alive on all peers
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
 
-    // Trigger election timer of S3.
-    s3.dbgLog(" --- invoke election timer of S3 ---");
-    // It will not initiate vote due to priority.
-    s3.fTimer->invoke( timer_task_type::election_timer );
-
-    // Trigger election timer of S3 again.
-    s3.dbgLog(" --- invoke election timer of S3 ---");
-    // Now it will initiate vote by help of priority decay.
-    s3.fTimer->invoke( timer_task_type::election_timer );
-
-    // Send pre-vote requests, it will be rejected by S1, accepted by S2.
-    // As a part of resp handling, it will initiate vote request.
-    s3.fNet->execReqResp();
-    // Send vote requests, S2 will deny due to priority.
-    s3.fNet->execReqResp();
-
-    // S1 should be still leader.
     CHK_TRUE( s1.raftServer->is_leader() );
     CHK_FALSE( s2.raftServer->is_leader() );
     CHK_FALSE( s3.raftServer->is_leader() );
-
     CHK_TRUE( s1.raftServer->is_leader_alive() );
-    CHK_FALSE( s2.raftServer->is_leader_alive() );
-    CHK_FALSE( s3.raftServer->is_leader_alive() );
+    CHK_TRUE( s2.raftServer->is_leader_alive() );
+    CHK_TRUE( s3.raftServer->is_leader_alive() );
 
     // Follower to leader broadcast
-    CHK_TRUE( s2.raftServer->set_priority_v2(1, 101) );
+    CHK_FALSE( s2.raftServer->set_priority_v2(1, 101) );
+    // Forward set priority change request
     s2.fNet->execReqResp();
-    CHK_Z( check_priorities(pkgs, {101, 100, 50}) );
-
-    CHK_TRUE( s3.raftServer->set_priority_v2(2, 102) );
-    s3.fNet->execReqResp();
-    CHK_Z( check_priorities(pkgs, {101, 102, 50}) );
+    // Send priority change reqs.
+    s1.fNet->execReqResp();
+    // Send reqs again for commit.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_Z( check_priorities(pkgs, {101, 100, 42}) );
 
     // Follower to self broadcast
-    CHK_TRUE( s3.raftServer->set_priority_v2(3, 103) );
+    CHK_FALSE( s3.raftServer->set_priority_v2(3, 103) );
+    // Forward set priority change request
     s3.fNet->execReqResp();
-    CHK_Z( check_priorities(pkgs, {101, 102, 103}) );
+    // Send priority change reqs.
+    s1.fNet->execReqResp();
+    // Send reqs again for commit.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_Z( check_priorities(pkgs, {101, 100, 103}) );
 
     print_stats(pkgs);
 
@@ -2126,6 +2125,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "extended append_entries API test",
                extended_append_entries_api_test );
+
+    ts.doTest( "priority v2 test",
+               priority_v2_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
