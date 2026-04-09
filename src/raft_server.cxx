@@ -1466,7 +1466,22 @@ bool raft_server::request_leadership(int successor_id) {
                  "leader id %d", leader_.load());
             return false;
         }
+
         ptr<peer> pp = entry->second;
+        if (pp->need_to_reconnect()) {
+            p_in("need to reconnect to peer %d", leader_.load());
+            ptr<srv_config> s_conf = get_config()->get_server(leader_);
+            if (!s_conf) {
+                p_wn("can't reconnect to peer %d: config not found",
+                     leader_.load());
+                return false;
+            }
+            if (!pp->recreate_rpc(s_conf, *ctx_)) {
+                p_wn("reconnection to peer %d failed", leader_.load());
+                return false;
+            }
+        }
+
         if (pp->make_busy()) {
             p_in("requesting leadership from leader %d", leader_.load());
             pp->send_req(pp, req, resp_handler_);

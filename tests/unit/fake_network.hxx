@@ -94,6 +94,14 @@ public:
 
     void goesOnline() { online =  true; }
 
+    void dropPeerConnection(raft_server* srv, int peer_id) {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        if (entry != peers.end()) {
+            entry->second->reset_rpc();
+        }
+    }
+
     bool isOnline() const { return online; }
 
     void stop();
