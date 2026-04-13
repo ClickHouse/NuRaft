@@ -147,6 +147,45 @@ limitations under the License.
 //     the follower is marked down by itself.
 #define MARK_DOWN (0x40)
 
+// Can be used for sending multiple dependent writes to the leader in a streaming fashion,
+// i.e. with guaranteed ordering but without waiting for commit after each request.
+// Somewhat difficult to use correctly. Tailored to a particular usage in clickhouse.
+//
+// We'd like to pass appends through chain: rpc_client -> (TCP) -> rpc_session -> raft_server,
+// with no reordering or gaps at any step. Same guarantees as TCP: if an append succeeds
+// (i.e. eventually ends up committed, whether or not acked to the original writer),
+// all previous appends must've succeeded too, in the original order.
+// I.e. some prefix of the request sequence is applied, no gaps. On any error,
+// the stream becomes permanently "closed", and the client has to establish a new stream.
+//
+// Recipe for such streaming:
+//  * The client side is any raft node, the server side is the leader raft node.
+//  * On client side, get current leader's term using raft_server::get_term()
+//    and remember it for the duration of the stream.
+//  * NuRaft's own auto_forwarding feature should not be used as it doesn't provide
+//    sufficient control over connection management. Instead, use rpc_client_factory
+//    directly to connect to the leader node. Form msg_type::client_request messages manually
+//    and send them through one rpc_client in the correct order.
+//  * In the client_request messages, set the STREAM_FORWARDING_REQUEST flag and
+//    set `term` field to the stream's term.
+//    This flag tells rpc_client to avoid reconnecting if TCP connection is closed,
+//    and tells rpc_session to close TCP connection if any append is rejected.
+//  * If the rpc_client reports an error, consider the stream closed.
+//    Periodically re-check raft_server::get_term(); if it changes, consider the stream closed.
+//  * To get any performance gain from streaming, you probably want to enable
+//    async_replication in cluster_config and streaming_mode_ in asio_service_options.
+//    With async_replication, responses to client_request messages don't mean much,
+//    so you probably want to ignore them (but still check for errors, to detect when TCP
+//    connection is closed) and use commit callback as confirmation of durability.
+//  * If the connection is closed, you probably want to report error for all in-flight
+//    uncommitted requests and close their corresponding upstream user sessions.
+//    For that, you probably want to maintain the set (or queue) of in-flight requests:
+//    add entry to the set before sending to the leader, remove in commit callback.
+//  * You should probably use backoff when reconnecting. E.g. during recovery the leader
+//    will be rejecting all requests, so every STREAM_FORWARDING connection will be closed
+//    quickly on first request.
+#define STREAM_FORWARDING (0x80)
+
 // =======================
 
 namespace nuraft {
@@ -741,10 +780,31 @@ private:
             }
         }
 
+        raft_server::req_ext_params ext_params;
+        if (req->get_term() != 0) {
+            ext_params.expected_term_ = req->get_term();
+        }
+
         // === RAFT server processes the request here. ===
-        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req);
+        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req, ext_params);
         if (!resp) {
             p_wn("no response is returned from raft message handler");
+            this->stop();
+            return;
+        }
+
+        if ((flags_ & STREAM_FORWARDING) && !resp->get_accepted()) {
+            // Close stream on error to avoid reordering.
+            //
+            // We only check get_accepted() here without doing call_cb()/call_async_cb() first.
+            // This is sufficient because non-immediate errors (i.e. failing
+            // to replicate/commit the entry) can only happen on term change and
+            // do not cause reordering or gaps.
+            // Also, STREAM_FORWARDING is normally used with async replication enabled,
+            // so there shouldn't be any cb or async_cb.
+            //
+            // Currently we don't send the response in this case because the current user of
+            // STREAM_FORWARDING (clickhouse) doesn't care about responses.
             this->stop();
             return;
         }
@@ -1117,6 +1177,7 @@ public:
         , socket_(io_svc)
         , ssl_socket_(socket_, ssl_ctx)
         , attempting_conn_(false)
+        , conn_attempts_(0)
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
@@ -1303,7 +1364,19 @@ public:
                 // Already opened, skip async_connect.
                 p_wn("race: socket to %s:%s is already opened, escape",
                      host_.c_str(), port_.c_str());
+                bool exp2 = true;
+                attempting_conn_.compare_exchange_strong(exp2, false);
                 break;
+            }
+
+            size_t prev_conn_attempts = conn_attempts_.fetch_add(1);
+            if ( prev_conn_attempts > 0 &&
+                 (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST)) {
+                abandoned_ = true;
+                std::string err_msg =
+                    "connection lost, not reconnecting because of STREAM_FORWARDING_REQUEST flag";
+                handle_error(req, err_msg, when_done);
+                return;
             }
 
             if (impl_->get_options().custom_resolver_) {
@@ -1385,6 +1458,10 @@ public:
         if (req->get_extra_flags() & req_msg::EXCLUDED_FROM_THE_QUORUM) {
             // If the request is excluded from the quorum, set the flag.
             flags |= MARK_DOWN;
+        }
+
+        if (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST) {
+            flags |= STREAM_FORWARDING;
         }
 
         for (auto& entry: req->log_entries()) {
@@ -2035,6 +2112,7 @@ private:
     // `true` if attempting connection is in progress.
     // Other threads should not do anything.
     std::atomic<bool> attempting_conn_;
+    std::atomic<size_t> conn_attempts_;
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
