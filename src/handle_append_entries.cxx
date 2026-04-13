@@ -916,6 +916,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                   req.log_entries().size(),
                   cnt );
             rollback_in_progress = true;
+
+            // Discard any pending pipelined responses: entries they refer to
+            // are being rolled back, so those responses must not be sent.
+            // We destroy the cmd_result promises without fulfilling them;
+            // the ASIO sessions will clean up when the old leader's
+            // connection closes.
+            if (!pending_follower_resps_.empty()) {
+                p_in( "rollback: discarding %zu pending pipelined responses",
+                      pending_follower_resps_.size() );
+                pending_follower_resps_.clear();
+            }
+
             // If rollback point is smaller than commit index,
             // should rollback commit index as well
             // (should not happen in Raft though).
@@ -1026,21 +1038,42 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         ptr<raft_params> params = ctx_->get_params();
         if (params->parallel_log_appending_) {
             uint64_t last_durable_index = log_store_->last_durable_index();
-            while ( last_durable_index <
-                    req.get_last_log_idx() + req.log_entries().size() ) {
-                if (stopping_) return resp;
+            ulong required_durable =
+                req.get_last_log_idx() + req.log_entries().size();
 
-                // Some logs are not durable yet, wait here and block the thread.
-                p_ts( "durable index %" PRIu64
-                      ", sleep and wait for log appending completion",
-                      last_durable_index );
-                ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
+            if (last_durable_index < required_durable &&
+                params->max_log_gap_in_stream_ > 0) {
+                // Pipelined mode (streaming + parallel log appending):
+                // defer the response until entries become durable.
+                // `notify_log_append_completion` will fulfill the promise.
+                p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                      ", deferring response (pipelined)",
+                      last_durable_index, required_durable );
+                auto promise = cs_new<cmd_result<ptr<buffer>>>();
+                pending_follower_resps_.push_back(
+                    {required_durable, promise});
+                resp->set_async_cb(
+                    [promise]() { return promise; });
 
-                // --- `notify_log_append_completion` API will wake it up. ---
+            } else if (last_durable_index < required_durable) {
+                // Original blocking path (streaming not enabled).
+                while ( last_durable_index < required_durable ) {
+                    if (stopping_) return resp;
 
-                ea_follower_log_append_->reset();
-                last_durable_index = log_store_->last_durable_index();
-                p_tr( "wake up, durable index %" PRIu64, last_durable_index );
+                    p_ts( "durable index %" PRIu64
+                          ", sleep and wait for log appending completion",
+                          last_durable_index );
+                    ea_follower_log_append_->wait_ms(
+                        params->heart_beat_interval_);
+
+                    // --- `notify_log_append_completion` API will wake it up.
+
+                    ea_follower_log_append_->reset();
+                    last_durable_index =
+                        log_store_->last_durable_index();
+                    p_tr( "wake up, durable index %" PRIu64,
+                          last_durable_index );
+                }
             }
         }
     }
@@ -1535,13 +1568,25 @@ ulong raft_server::get_expected_committed_log_idx() {
 }
 
 void raft_server::notify_log_append_completion(bool ok) {
-    if (stopping_) return;
+    if (stopping_) {
+        // Discard pending pipelined responses; ASIO sessions will clean up
+        // when connections close during shutdown.
+        if (!pending_follower_resps_.empty()) {
+            recur_lock(lock_);
+            pending_follower_resps_.clear();
+        }
+        return;
+    }
 
     if (!ok) {
         // If log appending fails for follower, there is no way to proceed it.
         // We should stop the server immediately.
         p_ft("log appending failed, stop this server");
         stopping_ = true;
+        if (!pending_follower_resps_.empty()) {
+            recur_lock(lock_);
+            pending_follower_resps_.clear();
+        }
         ctx_->state_mgr_->system_exit(N21_log_flush_failed);
         return;
     }
@@ -1559,8 +1604,27 @@ void raft_server::notify_log_append_completion(bool ok) {
             request_append_entries_for_all();
         }
     } else {
-
-        // Follower: wake up the waiting thread.
+        // Follower: fulfill pending pipelined responses whose entries
+        // are now durable, then wake up any thread using the blocking path.
+        if (!pending_follower_resps_.empty()) {
+            recur_lock(lock_);
+            uint64_t durable_idx = log_store_->last_durable_index();
+            ptr<buffer> empty_buf;
+            ptr<std::exception> no_err;
+            while ( !pending_follower_resps_.empty() &&
+                    pending_follower_resps_.front()
+                        .required_durable_index <= durable_idx )
+            {
+                p_ts( "fulfilling pipelined response, "
+                      "required %" PRIu64 ", durable %" PRIu64,
+                      pending_follower_resps_.front()
+                          .required_durable_index,
+                      durable_idx );
+                pending_follower_resps_.front()
+                    .promise->set_result(empty_buf, no_err);
+                pending_follower_resps_.pop_front();
+            }
+        }
         ea_follower_log_append_->invoke();
     }
 }

@@ -605,6 +605,122 @@ int snapshot_transmission_in_stream_mode() {
     return 0;
 }
 
+int pipelined_follower_append_test() {
+    // This test verifies that with streaming mode + parallel_log_appending_,
+    // follower appends are fully pipelined: entries reach follower log stores
+    // before becoming durable, but commit is deferred until durability.
+    reset_log_files();
+
+    std::string s1_addr = "tcp://127.0.0.1:20010";
+    std::string s2_addr = "tcp://127.0.0.1:20020";
+    std::string s3_addr = "tcp://127.0.0.1:20030";
+
+    RaftAsioPkg s1(1, s1_addr);
+    RaftAsioPkg s2(2, s2_addr);
+    RaftAsioPkg s3(3, s3_addr);
+    std::vector<RaftAsioPkg*> pkgs = {&s1, &s2, &s3};
+
+    _msg("launching asio-raft servers with streaming mode\n");
+    CHK_Z( launch_asio_servers(pkgs, false) );
+
+    _msg("organizing raft group\n");
+    CHK_Z( make_asio_group(pkgs) );
+
+    // Enable parallel log appending + async handler on all nodes,
+    // and set a large disk delay on followers only (leader has no delay).
+    const size_t FOLLOWER_DISK_DELAY_MS = 2000;
+    for (auto& entry: pkgs) {
+        RaftAsioPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.parallel_log_appending_ = true;
+        pp->raftServer->update_params(param);
+    }
+    s2.getTestMgr()->set_disk_delay(s2.raftServer.get(), FOLLOWER_DISK_DELAY_MS);
+    s3.getTestMgr()->set_disk_delay(s3.raftServer.get(), FOLLOWER_DISK_DELAY_MS);
+
+    // Append messages asynchronously on the leader.
+    const size_t NUM = 10;
+    std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
+    std::list<ulong> idx_list;
+    std::mutex idx_list_lock;
+    for (size_t ii = 0; ii < NUM; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+
+        cmd_result< ptr<buffer> >::handler_type my_handler =
+            std::bind( async_handler,
+                       &idx_list,
+                       &idx_list_lock,
+                       std::placeholders::_1,
+                       std::placeholders::_2 );
+        ret->when_ready( my_handler );
+        handlers.push_back(ret);
+    }
+
+    // Wait long enough for entries to be replicated to followers' log stores
+    // but NOT long enough for the follower disk delay to expire.
+    TestSuite::sleep_ms(500, "wait for replication to log stores");
+
+    ulong s1_last = s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    ulong s2_last = s2.getTestMgr()->load_log_store()->next_slot() - 1;
+    ulong s3_last = s3.getTestMgr()->load_log_store()->next_slot() - 1;
+
+    _msg( "leader log idx: %lu, follower2: %lu, follower3: %lu\n",
+          s1_last, s2_last, s3_last );
+
+    // All servers should have entries in their log stores (pipelining worked:
+    // the follower accepted entries without waiting for durability).
+    CHK_EQ(s1_last, s2_last);
+    CHK_EQ(s1_last, s3_last);
+
+    // Followers' durable index should still lag (disk delay hasn't expired).
+    CHK_SM( s2.getTestMgr()->load_log_store()->last_durable_index(), s2_last );
+    CHK_SM( s3.getTestMgr()->load_log_store()->last_durable_index(), s3_last );
+
+    // Leader should NOT have committed yet because followers haven't
+    // responded (their responses are deferred until durability).
+    ulong committed_early = s1.raftServer->get_committed_log_idx();
+    _msg( "committed index before durability: %lu (last: %lu)\n",
+          committed_early, s1_last );
+    CHK_SM( committed_early, s1_last );
+
+    // Now wait for the follower disk delay to expire.
+    TestSuite::sleep_ms(FOLLOWER_DISK_DELAY_MS + 500,
+                        "wait for follower disk delay");
+
+    // Followers should now be fully durable.
+    CHK_EQ( s2.getTestMgr()->load_log_store()->last_durable_index(), s2_last );
+    CHK_EQ( s3.getTestMgr()->load_log_store()->last_durable_index(), s3_last );
+
+    // Leader should have committed all entries now.
+    ulong committed_final = s1.raftServer->get_committed_log_idx();
+    _msg( "committed index after durability: %lu\n", committed_final );
+    CHK_EQ( committed_final, s1_last );
+
+    // All async handlers should have been invoked.
+    {
+        std::lock_guard<std::mutex> l(idx_list_lock);
+        CHK_EQ(NUM, idx_list.size());
+    }
+
+    // State machines should be identical.
+    TestSuite::sleep_ms(500, "wait for state machine catch-up");
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    TestSuite::sleep_sec(1, "shutting down");
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
 }  // namespace stream_functional_test;
 using namespace stream_functional_test;
 
@@ -635,6 +751,10 @@ int main(int argc, char** argv) {
     // Snapshot transmission in stream mode
     ts.doTest( "snapshot transmission in stream mode",
                snapshot_transmission_in_stream_mode );
+
+    // Pipelined follower append (streaming + parallel_log_appending)
+    ts.doTest( "pipelined follower append test",
+               pipelined_follower_append_test );
 
     return 0;
 }

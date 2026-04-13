@@ -59,6 +59,7 @@ limitations under the License.
 #include <ctime>
 #include <exception>
 #include <ios>
+#include <deque>
 #include <list>
 #include <thread>
 #include <string>
@@ -420,6 +421,15 @@ public:
                       err.value(),
                       err.message().c_str(),
                       self.use_count() );
+                if (pipelined_) {
+                    // Don't stop yet — let pending response writes drain.
+                    std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                    read_failed_ = true;
+                    if (!writing_resp_ && pending_resps_.empty()) {
+                        this->stop();
+                    }
+                    return;
+                }
                 this->stop();
                 return;
             }
@@ -826,10 +836,53 @@ private:
             return;
         }
 
-        if (resp->has_async_cb()) {
-            // Response will be ready later, setup a callback function
-            // (only for auto-forwarding with `client_request` type
-            //  in async handling mode).
+        if (resp->has_async_cb() && impl_->get_options().streaming_mode_) {
+            // Pipelined mode: queue the deferred response and immediately
+            // read the next request. The response will be sent when the
+            // async result (log durability) is ready.
+            pipelined_ = true;
+            auto entry = cs_new<pending_resp_entry>();
+            entry->req = req;
+            entry->resp = resp;
+
+            ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
+            {
+                std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                pending_resps_.push_back(entry);
+            }
+            ret->when_ready(
+                [this, self, entry]
+                ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
+                  ptr<std::exception>& exp ) {
+                    entry->resp->set_ctx(res.get());
+                    entry->ready.store(true, std::memory_order_release);
+                    try_send_pending_resps(self);
+                    res.reset();
+                }
+            );
+            this->start(self);
+
+        } else if (pipelined_) {
+            // Already in pipelined mode; queue this sync response too
+            // to preserve response ordering on the wire.
+            auto entry = cs_new<pending_resp_entry>();
+            entry->req = req;
+            if (resp->has_cb()) {
+                entry->resp = resp->call_cb(resp);
+            } else {
+                entry->resp = resp;
+            }
+            entry->ready.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                pending_resps_.push_back(entry);
+            }
+            try_send_pending_resps(self);
+            this->start(self);
+
+        } else if (resp->has_async_cb()) {
+            // Original non-streaming async path (e.g., auto-forwarding
+            // with `client_request` type in async handling mode).
             ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
 
             // WARNING: `self` should be captured to avoid releasing this `rpc_session`.
@@ -862,10 +915,7 @@ private:
        }
     }
 
-    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
-        ptr<rpc_session> self = this->shared_from_this();
-
-       try {
+    ptr<buffer> serialize_resp(ptr<req_msg>& req, ptr<resp_msg>& resp) {
         ptr<buffer> resp_ctx = resp->get_ctx();
         int32 resp_ctx_size = (resp_ctx) ? resp_ctx->size() : 0;
         int32 result_code_size = sizeof(int32_t);
@@ -877,7 +927,6 @@ private:
             resp_meta_str = impl_->get_options().write_resp_meta_
                             ( req_to_params(req.get(), resp.get()) );
             if (!resp_meta_str.empty()) {
-                // Meta callback for response is given, set the flag.
                 flags |= INCLUDE_META;
                 resp_meta_size = sizeof(int32) + resp_meta_str.size();
             }
@@ -885,14 +934,11 @@ private:
 
         size_t resp_hint_size = 0;
         if (resp->get_next_batch_size_hint_in_bytes()) {
-            // Hint is given, set the flag.
             flags |= INCLUDE_HINT;
-            // For future extension, we will put 2-byte version and 2-byte length.
             resp_hint_size += sizeof(uint16_t) * 2 + sizeof(int64);
         }
 
         if (resp->get_extra_flags() & resp_msg::SELF_MARK_DOWN) {
-            // The follower marks itself down.
             flags |= MARK_DOWN;
         }
 
@@ -919,7 +965,6 @@ private:
         bs.put_u8(resp->get_accepted());
         bs.put_i32(carried_data_size);
 
-        // Calculate CRC32 on header only.
         uint32_t crc_val = crc32_8( resp_buf->data_begin(),
                                     RPC_RESP_HEADER_SIZE - CRC_FLAGS_LEN,
                                     0 );
@@ -927,11 +972,9 @@ private:
         uint64_t flags_crc = ((uint64_t)flags << 32) | crc_val;
         bs.put_u64(flags_crc);
 
-        // Handling meta if the flag is set.
         if (flags & INCLUDE_META) {
             bs.put_str(resp_meta_str);
         }
-        // Put hint if the flag is set.
         if (flags & INCLUDE_HINT) {
             const uint16_t CUR_HINT_VERSION = 0;
             bs.put_u16(CUR_HINT_VERSION);
@@ -944,17 +987,24 @@ private:
             bs.put_buffer(*resp_ctx);
         }
 
-        /* Put result code at the end to avoid breaking backward compatibility */
         if (flags & INCLUDE_RESULT_CODE) {
             bs.put_i32(resp->get_result_code());
         }
+
+        return resp_buf;
+    }
+
+    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
+        ptr<rpc_session> self = this->shared_from_this();
+
+       try {
+        ptr<buffer> resp_buf = serialize_resp(req, resp);
 
         aa::write( ssl_enabled_, ssl_socket_, socket_,
                    asio::buffer(resp_buf->data_begin(), resp_buf->size()),
                    [this, self, resp_buf]
                    (ERROR_CODE err_code, size_t) -> void
         {
-            // To avoid releasing `resp_buf` before the write is done.
             (void)resp_buf;
             if (!err_code) {
                 this->start(self);
@@ -969,6 +1019,66 @@ private:
 
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to process request message "
+              "due to error: %s",
+              this->session_id_,
+              ex.what() );
+        this->stop();
+       }
+    }
+
+    // --- Pipelined response support (streaming mode) ---
+
+    struct pending_resp_entry {
+        ptr<req_msg> req;
+        ptr<resp_msg> resp;
+        std::atomic<bool> ready{false};
+    };
+
+    void try_send_pending_resps(ptr<rpc_session> self) {
+        ptr<pending_resp_entry> entry;
+        {
+            std::lock_guard<std::mutex> guard(pending_resps_lock_);
+            if (writing_resp_) return;
+            if (pending_resps_.empty() ||
+                !pending_resps_.front()->ready.load(
+                    std::memory_order_acquire))
+            {
+                if (read_failed_ && pending_resps_.empty()) {
+                    this->stop();
+                }
+                return;
+            }
+            writing_resp_ = true;
+            entry = pending_resps_.front();
+            pending_resps_.pop_front();
+        }
+
+       try {
+        ptr<buffer> resp_buf = serialize_resp(entry->req, entry->resp);
+
+        aa::write( ssl_enabled_, ssl_socket_, socket_,
+                   asio::buffer(resp_buf->data_begin(), resp_buf->size()),
+                   [this, self, resp_buf]
+                   (ERROR_CODE err_code, size_t) -> void
+        {
+            (void)resp_buf;
+            if (!err_code) {
+                {
+                    std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                    writing_resp_ = false;
+                }
+                try_send_pending_resps(self);
+            } else {
+                p_er( "session %" PRIu64 " failed to send pipelined response "
+                      "to peer due to error %d",
+                      session_id_,
+                      err_code.value() );
+                this->stop();
+            }
+        } );
+
+       } catch (std::exception& ex) {
+        p_er( "session %" PRIu64 " failed to send pipelined response "
               "due to error: %s",
               this->session_id_,
               ex.what() );
@@ -1020,6 +1130,37 @@ private:
      * Term captured on first client_request with STREAM_FORWARDING flag. 0 = not yet bound.
      */
     ulong bound_term_;
+
+    // --- Pipelined response state (streaming mode) ---
+
+    /**
+     * Queue of pending responses waiting to be sent.
+     * In pipelined mode, responses are sent in FIFO order;
+     * async responses wait until their result is ready.
+     */
+    std::deque<ptr<pending_resp_entry>> pending_resps_;
+
+    /**
+     * Lock protecting `pending_resps_`, `writing_resp_`, and `read_failed_`.
+     */
+    std::mutex pending_resps_lock_;
+
+    /**
+     * True while an async write of a pipelined response is in progress.
+     */
+    bool writing_resp_{false};
+
+    /**
+     * True once we have entered pipelined mode on this session
+     * (first async_cb response seen in streaming mode).
+     */
+    bool pipelined_{false};
+
+    /**
+     * True if the read side of this session has failed (EOF / error).
+     * We defer `stop()` until all pending writes have drained.
+     */
+    bool read_failed_{false};
 };
 
 // rpc listener implementation

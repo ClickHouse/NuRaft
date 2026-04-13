@@ -1698,6 +1698,20 @@ protected:
     EventAwaiter* ea_follower_log_append_;
 
     /**
+     * Used when `raft_params::parallel_log_appending_` and streaming mode
+     * are both enabled. Instead of blocking in `handle_append_entries` waiting
+     * for log durability, the follower defers the response and queues a promise
+     * here. `notify_log_append_completion` fulfills promises once entries
+     * become durable, which triggers the ASIO layer to send the response.
+     */
+    struct pending_follower_resp
+    {
+        ulong required_durable_index;
+        ptr<cmd_result<ptr<buffer>>> promise;
+    };
+    std::list<pending_follower_resp> pending_follower_resps_;
+
+    /**
      * If `true`, test mode is enabled.
      */
     std::atomic<bool> test_mode_flag_;
