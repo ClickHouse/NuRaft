@@ -868,6 +868,9 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     // Reset timer.
     last_rcvd_append_entries_req_.reset();
 
+    ptr<raft_params> params = ctx_->get_params();
+    bool async_log_appending = params->parallel_log_appending_ && params->max_log_gap_in_stream_ > 0;
+
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
 
@@ -1037,14 +1040,13 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         log_store_->end_of_append_batch( req.get_last_log_idx() + 1,
                                          req.log_entries().size() );
 
-        ptr<raft_params> params = ctx_->get_params();
         if (params->parallel_log_appending_) {
             uint64_t last_durable_index = log_store_->last_durable_index();
             ulong required_durable =
                 req.get_last_log_idx() + req.log_entries().size();
 
             if (last_durable_index < required_durable) {
-                if (params->max_log_gap_in_stream_ > 0) {
+                if (async_log_appending) {
                     // Pipelined mode (streaming + parallel log appending):
                     // defer the response until entries become durable.
                     // Unblock this thread to allow processing more appends
@@ -1076,6 +1078,24 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     }
                 }
             }
+        }
+    } else if (async_log_appending) {
+        // Previous handle_append_entries calls may have appended some
+        // log entries without waiting for durability.
+        // We should wait for those entries to become durable before
+        // sending response with `next_log_idx = target_precommit_index + 1`,
+        // even if this request had no new entries.
+        uint64_t last_durable_index = log_store_->last_durable_index();
+        ulong required_durable =
+            req.get_last_log_idx() + req.log_entries().size();
+        if (last_durable_index < required_durable) {
+            p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                    ", deferring response (pipelined)",
+                    last_durable_index, required_durable );
+            auto promise = cs_new<cmd_result<ptr<buffer>>>();
+            pending_follower_resps_.push_back(
+                {required_durable, /*last_entry_term=*/ 0, promise});
+            resp->set_async_cb([promise]() { return promise; });
         }
     }
 
@@ -1624,7 +1644,7 @@ void raft_server::notify_log_append_completion(bool ok) {
 
                     // Redundant check that the entries that became durable are the ones we wrote.
                     ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);
-                    if (term_in_log_store == entry.last_entry_term) {
+                    if (entry.last_entry_term == 0 || term_in_log_store == entry.last_entry_term) {
                         entry.promise->set_result(empty_buf, no_err, cmd_result_code::OK);
                     } else {
                         // This should be impossible because we clear pending_follower_resps_
