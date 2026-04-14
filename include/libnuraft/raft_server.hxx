@@ -34,6 +34,7 @@ limitations under the License.
 #include "thread.hxx"
 
 #include <list>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -1696,6 +1697,21 @@ protected:
      *          awaiter at a time, by the help of `lock_`.
      */
     EventAwaiter* ea_follower_log_append_;
+
+    /**
+     * Used when `raft_params::parallel_log_appending_` and streaming mode
+     * are both enabled. Instead of blocking in `handle_append_entries` waiting
+     * for log durability, the follower defers the response and queues a promise
+     * here. `notify_log_append_completion` fulfills promises once entries
+     * become durable, which triggers the ASIO layer to send the response.
+     */
+    struct pending_follower_resp
+    {
+        ulong last_entry_idx;
+        ulong last_entry_term;
+        ptr<cmd_result<ptr<buffer>>> promise;
+    };
+    std::deque<pending_follower_resp> pending_follower_resps_;
 
     /**
      * If `true`, test mode is enabled.
