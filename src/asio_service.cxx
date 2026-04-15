@@ -1177,7 +1177,6 @@ public:
         , socket_(io_svc)
         , ssl_socket_(socket_, ssl_ctx)
         , attempting_conn_(false)
-        , conn_attempts_(0)
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
@@ -1364,19 +1363,7 @@ public:
                 // Already opened, skip async_connect.
                 p_wn("race: socket to %s:%s is already opened, escape",
                      host_.c_str(), port_.c_str());
-                bool exp2 = true;
-                attempting_conn_.compare_exchange_strong(exp2, false);
                 break;
-            }
-
-            size_t prev_conn_attempts = conn_attempts_.fetch_add(1);
-            if ( prev_conn_attempts > 0 &&
-                 (req->get_extra_flags() & req_msg::STREAM_FORWARDING_REQUEST)) {
-                abandoned_ = true;
-                std::string err_msg =
-                    "connection lost, not reconnecting because of STREAM_FORWARDING_REQUEST flag";
-                handle_error(req, err_msg, when_done);
-                return;
             }
 
             if (impl_->get_options().custom_resolver_) {
@@ -2109,10 +2096,10 @@ private:
     asio::ip::tcp::resolver resolver_;
     asio::ip::tcp::socket socket_;
     ssl_socket ssl_socket_;
-    // `true` if attempting connection is in progress.
-    // Other threads should not do anything.
+    // `false` if we never tried connecting yet.
+    // We don't have connection retries, so this changes from false
+    // to true at most once and stays true.
     std::atomic<bool> attempting_conn_;
-    std::atomic<size_t> conn_attempts_;
     std::string host_;
     std::string port_;
     bool ssl_enabled_;

@@ -34,8 +34,7 @@ public:
     // This flag is used only when full consensus mode is enabled.
     static constexpr uint64_t EXCLUDED_FROM_THE_QUORUM = 0x1;
 
-    // If set, the STREAM_FORWARDING wire flag is included in the
-    // request header, and client reconnect is disabled.
+    // If set, the STREAM_FORWARDING wire flag is included in the request header.
     // See the comment on STREAM_FORWARDING in asio_service.cxx for details.
     static constexpr uint64_t STREAM_FORWARDING_REQUEST = 0x2;
 
