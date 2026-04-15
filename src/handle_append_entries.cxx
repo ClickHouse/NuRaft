@@ -262,6 +262,7 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  p->get_id(), p_next_log_idx, p->get_matched_idx());
             p->set_next_log_idx(0);
             p->set_matched_idx(0);
+            p->set_next_log_idx_floor(0);
         }
         p->clear_reconnection();
     }
@@ -1262,7 +1263,14 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         ulong prev_next_log = p->get_next_log_idx();
         if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
             // fast move for the peer to catch up
-            p->set_next_log_idx(resp.get_next_idx());
+            ulong floor = p->get_next_log_idx_floor();
+            ulong target = std::max(resp.get_next_idx(), floor);
+            if (target != resp.get_next_idx()) {
+                p_wn("fast-move clamped to snapshot floor: "
+                     "resp next_idx %" PRIu64 ", floor %" PRIu64,
+                     resp.get_next_idx(), floor);
+            }
+            p->set_next_log_idx(target);
         } else {
             bool do_log_rewind = true;
             // If not, check an extra order exists.
@@ -1284,7 +1292,15 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             // if not, move one log backward.
             // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
             if (do_log_rewind && prev_next_log) {
-                p->set_next_log_idx(prev_next_log - 1);
+                ulong floor = p->get_next_log_idx_floor();
+                if (prev_next_log - 1 >= floor) {
+                    p->set_next_log_idx(prev_next_log - 1);
+                } else {
+                    p_wn("skip log rewind: next_log_idx %" PRIu64
+                         " would go below snapshot floor %" PRIu64
+                         ", resp next_idx %" PRIu64,
+                         prev_next_log - 1, floor, resp.get_next_idx());
+                }
             }
         }
         bool suppress = p->need_to_suppress_error();

@@ -1129,6 +1129,176 @@ int snapshot_null_snapshot_join_test() {
     return 0;
 }
 
+// Regression test for stale-RPC-after-snapshot backward probing bug.
+//
+// Production scenario: after snapshot sync completes, a force-reconnect
+// resets next_log_idx to 0. The stale install_snapshot_response arrives
+// and correctly sets next_log_idx = S+1. Then a stale append_entries
+// denial arrives with NextIndex = S+1 (== next_log_idx). The strict `>`
+// in the fast-move check fails, and the decrement path walks backward
+// through the entire log (~15 minutes in production).
+//
+// This test verifies that next_log_idx_floor_, set during snapshot
+// completion, prevents the backward spiral.
+int snapshot_rewind_floor_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        pp->raftServer->update_params(param);
+    }
+
+    // Append 5 entries, replicate to S2 only (S3 lags behind).
+    for (size_t ii = 0; ii < 5; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        exec_args.setMsg(msg);
+        exec_args.eaExecuter.invoke();
+        TestSuite::sleep_ms(EXECUTOR_WAIT_MS);
+        CHK_NULL( exec_args.getMsg().get() );
+
+        s1.fNet->execReqResp("S2");
+        s1.fNet->execReqResp("S2");
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // S3 is lagging behind. Make requests to S3 fail to force snapshot path.
+    s1.fNet->makeReqFail("S3");
+
+    // Trigger heartbeat to S3 — initiates snapshot transmission.
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+
+    // Send the entire snapshot.
+    do {
+        s1.fNet->execReqResp();
+    } while (s3.raftServer->is_receiving_snapshot());
+
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // All servers should be in sync.
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+
+    // --- Verify floor was set after snapshot sync ---
+    ulong floor = s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3);
+    ulong next_idx = s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3);
+    CHK_GT( floor, 0 );
+    CHK_SMEQ( floor, next_idx );
+
+    // Record the snapshot boundary.
+    ulong snapshot_floor = floor;
+    ulong current_term = s1.raftServer->get_term();
+
+    // --- Phase 1: Test decrement-path clamping (exact production scenario) ---
+    // Set up the post-race state: next_log_idx == floor == snapshot boundary.
+    // A denial with NextIndex == next_log_idx makes the strict `>` check fail,
+    // falling to the decrement path. The floor must prevent the decrement.
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, snapshot_floor);
+    s1.fNet->setPeerMatchedIdx(s1.raftServer.get(), 3, 0);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, snapshot_floor);
+
+    // Trigger heartbeat → creates append_entries request to S3.
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    // Deliver request to S3, getting a real response into the pending queue.
+    s1.fNet->delieverReqTo("S3");
+    // Replace the real (accepted) response with a crafted denial.
+    // NextIndex = snapshot_floor: same as next_log_idx, so `>` fails.
+    {
+        ptr<resp_msg> denial = cs_new<resp_msg>(
+            current_term,
+            msg_type::append_entries_response,
+            3,   // src = S3
+            1,   // dst = S1
+            snapshot_floor,  // next_idx == next_log_idx
+            false);          // accepted = false
+        s1.fNet->replaceLastPendingResp("S3", denial);
+    }
+    // Deliver the crafted denial to S1's response handler.
+    s1.fNet->handleRespFrom("S3");
+
+    // Verify: next_log_idx must NOT have decremented below the floor.
+    ulong after_phase1 =
+        s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3);
+    CHK_GTEQ( after_phase1, snapshot_floor );
+
+    // --- Phase 2: Test fast-move clamping ---
+    // Set next_log_idx above the floor. A denial with NextIndex below the
+    // floor triggers the fast-move path, but the floor must clamp it.
+    s1.fNet->setPeerNextLogIdx(
+        s1.raftServer.get(), 3, snapshot_floor + 5);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->delieverReqTo("S3");
+    {
+        // NextIndex = 1: far below the floor, fast-move would jump there.
+        ptr<resp_msg> denial = cs_new<resp_msg>(
+            current_term,
+            msg_type::append_entries_response,
+            3,   // src = S3
+            1,   // dst = S1
+            1,   // next_idx far below floor
+            false);
+        s1.fNet->replaceLastPendingResp("S3", denial);
+    }
+    s1.fNet->handleRespFrom("S3");
+
+    // Verify: fast-move was clamped to the floor, not to 1.
+    ulong after_phase2 =
+        s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3);
+    CHK_GTEQ( after_phase2, snapshot_floor );
+
+    // --- Phase 3: Verify recovery after floor is exercised ---
+    // Restore proper state and confirm normal replication still works.
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, snapshot_floor);
+    s1.fNet->setPeerMatchedIdx(
+        s1.raftServer.get(), 3, snapshot_floor - 1);
+    for (int ii = 0; ii < 5; ++ii) {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+    }
+
+    ulong final_next_idx =
+        s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3);
+    CHK_GTEQ( final_next_idx, snapshot_floor );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+
+    f_base->destroy();
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -1169,6 +1339,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot null snapshot join test",
                snapshot_null_snapshot_join_test );
+
+    ts.doTest( "snapshot rewind floor test",
+               snapshot_rewind_floor_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
