@@ -153,8 +153,6 @@ limitations under the License.
 namespace nuraft {
 
 static const size_t SSL_GRACE_PERIOD_MS = 500;
-static const size_t SEND_RETRY_MS       = 500;
-static const size_t SEND_RETRY_MAX      = 6;
 
 asio_service::meta_cb_params req_to_params(req_msg* req, resp_msg* resp) {
     return asio_service::meta_cb_params
@@ -174,7 +172,7 @@ asio_service::meta_cb_params req_to_params(req_msg* req, resp_msg* resp) {
 struct pending_req_pkg {
     pending_req_pkg(ptr<req_msg>& req,
                     rpc_handler& when_done,
-                    uint64_t timeout_ms = 0)
+                    uint64_t timeout_ms)
         : req_(req)
         , when_done_(when_done)
         , timeout_ms_(timeout_ms)
@@ -1326,16 +1324,12 @@ public:
         , resolver_(io_svc)
         , socket_(io_svc)
         , ssl_socket_(socket_, ssl_ctx)
-        , attempting_conn_(false)
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
-        , ssl_ready_(false)
-        , num_send_fails_(0)
-        , abandoned_(false)
-        , socket_busy_(false)
-        , operation_timer_(io_svc)
         , l_(l)
+        , send_timer_(io_svc)
+        , receive_timer_(io_svc)
     {
         client_id_ = impl_->assign_client_id();
         if (ssl_enabled_) {
@@ -1397,30 +1391,6 @@ public:
         return ssl_socket_.lowest_layer();
     }
 
-    void send_retry( ptr<asio_rpc_client> self,
-                     ptr<asio::steady_timer> timer,
-                     ptr<req_msg>& req,
-                     rpc_handler& when_done,
-                     uint64_t send_timeout_ms,
-                     const ERROR_CODE& err )
-    {
-        if ( err || num_send_fails_ >= SEND_RETRY_MAX ) {
-            if (err) {
-                p_er("error happened during async wait: %d", err.value());
-            } else {
-                p_er( "connection to %s:%s timeout (SSL %s)",
-                      host_.c_str(), port_.c_str(),
-                      ( ssl_enabled_ ? "enabled" : "disabled" ) );
-            }
-            abandoned_= true;
-            std::string err_msg =
-                lstrfmt("timeout while connecting to %s").fmt(host_.c_str());
-            handle_error(req, err_msg, when_done);
-            return;
-        }
-        register_req_send(req, when_done, send_timeout_ms);
-    }
-
     virtual void send(ptr<req_msg>& req,
                       rpc_handler& when_done,
                       uint64_t send_timeout_ms = 0) __override__
@@ -1432,27 +1402,19 @@ public:
         }
     }
 
-    void handle_error(ptr<req_msg> req,
-                      std::string& err_msg,
-                      rpc_handler when_done) {
-        close_socket(err_msg);
-
-        // In streaming mode, all `when_done` will be invoked in `close_socket()`.
-        // Otherwise, `close_socket()` will do nothing, hence `when_done`
-        // should directly be invoked here.
-        if (!impl_->get_options().streaming_mode_) {
-            ptr<resp_msg> resp;
-            ptr<rpc_exception> except(cs_new<rpc_exception>(err_msg, req));
-            when_done(resp, except);
-        }
-    }
-
     void pre_send(ptr<req_msg>& req,
                   rpc_handler& when_done,
                   uint64_t send_timeout_ms) {
         bool immediate_action_needed = false;
         {
             auto_lock(pending_write_reqs_lock_);
+
+            // (In close_socket we rely on consecutive request pointers being different,
+            //  so let's assert that the user is not being weird and sending
+            //  the same request multiple times concurrently.)
+            if (!pending_write_reqs_.empty())
+                assert(pending_write_reqs_.back()->req_ != req);
+
             pending_write_reqs_.push_back(
                 cs_new<pending_req_pkg>(req, when_done, send_timeout_ms));
             immediate_action_needed = (pending_write_reqs_.size() == 1);
@@ -1467,120 +1429,7 @@ public:
         }
     }
 
-    void register_req_send(ptr<req_msg>& req,
-                           rpc_handler& when_done,
-                           uint64_t send_timeout_ms) {
-        if (abandoned_) {
-            p_er( "client %p to %s:%s is already stale (SSL %s)",
-                  this, host_.c_str(), port_.c_str(),
-                  ( ssl_enabled_ ? "enabled" : "disabled" ) );
-            std::string err_msg = lstrfmt("abandoned client to %s").fmt(host_.c_str());
-            handle_error(req, err_msg, when_done);
-            return;
-        }
-
-        ptr<asio_rpc_client> self = this->shared_from_this();
-        while (!socket().is_open()) { // Dummy one-time loop
-            p_ts( "socket %p to %s:%s is not opened yet",
-                  this, host_.c_str(), port_.c_str() );
-
-            // WARNING:
-            //   Only one thread can establish connection at a time.
-            //   Since we don't re-use RPC client upon connection failure,
-            //   this flag will never be cleared.
-            bool exp = false;
-            bool desired = true;
-            if (!attempting_conn_.compare_exchange_strong(exp, desired)) {
-                // Other thread is attempting connection, just wait.
-                p_wn( "cannot send req as other thread is racing on opening "
-                      "connection to (%s:%s), count %zu",
-                      host_.c_str(), port_.c_str(), num_send_fails_.load() );
-                num_send_fails_.fetch_add(1);
-
-                ptr<asio::steady_timer> timer =
-                    cs_new<asio::steady_timer>(impl_->get_io_svc());
-                timer->expires_after
-                       ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                         ( std::chrono::milliseconds( SEND_RETRY_MS ) ) );
-                timer->async_wait( std::bind( &asio_rpc_client::send_retry,
-                                              this,
-                                              self,
-                                              timer,
-                                              req,
-                                              when_done,
-                                              send_timeout_ms,
-                                              std::placeholders::_1 ) );
-                return;
-            }
-
-            if (socket().is_open()) {
-                // Already opened, skip async_connect.
-                p_wn("race: socket to %s:%s is already opened, escape",
-                     host_.c_str(), port_.c_str());
-                break;
-            }
-
-            if (impl_->get_options().custom_resolver_) {
-                impl_->get_options().custom_resolver_(
-                    host_,
-                    port_,
-                    [this, self, req, when_done, send_timeout_ms]
-                    ( const std::string& resolved_host,
-                      const std::string& resolved_port,
-                      std::error_code err ) {
-                        if (!err) {
-                            p_in( "custom resolver: %s:%s to %s:%s",
-                                  host_.c_str(), port_.c_str(),
-                                  resolved_host.c_str(), resolved_port.c_str() );
-                            execute_resolver(self, req, resolved_host, resolved_port,
-                                             when_done, send_timeout_ms);
-                        } else {
-                            std::string err_msg = lstrfmt("failed to resolve "
-                                                          "host %s by given "
-                                                          "custom resolver "
-                                                          "due to error %d, %s")
-                                                          .fmt( host_.c_str(),
-                                                                err.value(),
-                                                                err.message().c_str() );
-                            handle_error(req, err_msg, when_done);
-                        }
-                    } );
-            } else {
-                execute_resolver(self, req, host_, port_, when_done, send_timeout_ms);
-            }
-            return;
-        }
-
-        if (ssl_enabled_ && !ssl_ready_) {
-            // TCP socket is opened, but SSL handshake is not done yet.
-            // Since other thread is doing it, this thread should just wait.
-            p_wn( "cannot send req as SSL is not ready yet (%s:%s), count %zu",
-                  host_.c_str(), port_.c_str(), num_send_fails_.load() );
-            num_send_fails_.fetch_add(1);
-
-            ptr<asio::steady_timer> timer =
-                cs_new<asio::steady_timer>(impl_->get_io_svc());
-            timer->expires_after
-                   ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                     ( std::chrono::milliseconds( SEND_RETRY_MS ) ) );
-            timer->async_wait( std::bind( &asio_rpc_client::send_retry,
-                                          this,
-                                          self,
-                                          timer,
-                                          req,
-                                          when_done,
-                                          send_timeout_ms,
-                                          std::placeholders::_1 ) );
-            return;
-        }
-
-        // Socket should be idle now. If not, it should be a bug.
-        set_busy_flag(true);
-
-        // If we reach here, that means connection is valid.
-        // Reset the counter.
-        num_send_fails_ = 0;
-
+    ptr<buffer> serialize_req(ptr<req_msg>& req) {
         // serialize req, send and read response
         std::vector<ptr<buffer>> log_entry_bufs;
         int32 log_data_size(0);
@@ -1709,16 +1558,71 @@ public:
             req_buf_bs.put_u64(flags_and_crc);
         }
 
-        if (send_timeout_ms != 0)
-        {
-            operation_timer_.expires_after
-                   ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                     ( std::chrono::milliseconds( send_timeout_ms ) ) );
-            operation_timer_.async_wait( std::bind( &asio_rpc_client::cancel_socket,
-                                                    this,
-                                                    std::placeholders::_1 ) );
+        return req_buf;
+    }
+
+    void register_req_send(ptr<req_msg>& req,
+                           rpc_handler& when_done,
+                           uint64_t send_timeout_ms) {
+        if (abandoned_) {
+            p_er( "client %p to %s:%s is already stale (SSL %s)",
+                  this, host_.c_str(), port_.c_str(),
+                  ( ssl_enabled_ ? "enabled" : "disabled" ) );
+            std::string err_msg = lstrfmt("abandoned client to %s").fmt(host_.c_str());
+            handle_error(req, err_msg, when_done);
+            return;
         }
 
+        // Socket should be idle now. If not, it should be a bug.
+        set_busy_flag(/*receive=*/ false, true);
+
+        ptr<asio_rpc_client> self = this->shared_from_this();
+        if (!socket().is_open()) {
+            p_ts( "socket %p to %s:%s is not opened yet",
+                  this, host_.c_str(), port_.c_str() );
+
+            if (impl_->get_options().custom_resolver_) {
+                impl_->get_options().custom_resolver_(
+                    host_,
+                    port_,
+                    [this, self, req, when_done, send_timeout_ms]
+                    ( const std::string& resolved_host,
+                      const std::string& resolved_port,
+                      std::error_code err ) {
+                        if (!err) {
+                            p_in( "custom resolver: %s:%s to %s:%s",
+                                  host_.c_str(), port_.c_str(),
+                                  resolved_host.c_str(), resolved_port.c_str() );
+                            execute_resolver(self, req, resolved_host, resolved_port,
+                                             when_done, send_timeout_ms);
+                        } else {
+                            std::string err_msg = lstrfmt("failed to resolve "
+                                                          "host %s by given "
+                                                          "custom resolver "
+                                                          "due to error %d, %s")
+                                                          .fmt( host_.c_str(),
+                                                                err.value(),
+                                                                err.message().c_str() );
+                            handle_error(req, err_msg, when_done);
+                        }
+                    } );
+            } else {
+                execute_resolver(self, req, host_, port_, when_done, send_timeout_ms);
+            }
+            return;
+        }
+
+        ptr<buffer> req_buf = serialize_req(req);
+
+        if (send_timeout_ms != 0)
+        {
+            send_timer_.expires_after
+                   ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                     ( std::chrono::milliseconds( send_timeout_ms ) ) );
+            send_timer_.async_wait( std::bind( &asio_rpc_client::cancel_socket,
+                                               this,
+                                               std::placeholders::_1 ) );
+        }
 
         // Note: without passing `req_buf` to callback function, it will be
         //       unreachable before the write is done so that it is freed
@@ -1730,6 +1634,7 @@ public:
                               req,
                               req_buf,
                               when_done,
+                              send_timeout_ms,
                               std::placeholders::_1,
                               std::placeholders::_2 ) );
     }
@@ -1752,10 +1657,10 @@ private:
         {
             if (!err) {
                 if (send_timeout_ms != 0) {
-                    operation_timer_.expires_after
+                    send_timer_.expires_after
                     ( std::chrono::duration_cast<std::chrono::nanoseconds>
                       ( std::chrono::milliseconds( send_timeout_ms ) ) );
-                    operation_timer_.async_wait(
+                    send_timer_.async_wait(
                         std::bind( &asio_rpc_client::cancel_socket,
                                    this,
                                    std::placeholders::_1 ) );
@@ -1781,28 +1686,43 @@ private:
         } );
     }
 
-    void set_busy_flag(bool to) {
-        if (impl_->get_options().streaming_mode_) {
-            return;
+    void set_busy_flag(bool receive, bool to) {
+        bool& flag = receive ? receive_busy_ : send_busy_;
+        if (flag == to) {
+            p_ft("socket %p %s side is already %s, race "
+                 "happened on connection to %s:%s",
+                 this, receive ? "receive" : "send",
+                 to ? "in use" : "idle", host_.c_str(), port_.c_str());
+            assert(0);
         }
+        flag = to;
+    }
 
-        if (to == true) {
-            bool exp = false;
-            if (!socket_busy_.compare_exchange_strong(exp, true)) {
-                p_ft("socket %p is already in use, race happened on connection to %s:%s",
-                     this, host_.c_str(), port_.c_str());
-                assert(0);
-            }
-        } else {
-            bool exp = true;
-            if (!socket_busy_.compare_exchange_strong(exp, false)) {
-                p_ft("socket %p is already idle, race happened on connection to %s:%s",
-                     this, host_.c_str(), port_.c_str());
-                assert(0);
-            }
+    void handle_error(ptr<req_msg> req,
+                      std::string& err_msg,
+                      rpc_handler when_done) {
+        // On any error, we mark the client as abandoned to reject
+        // all future requests. We could make error handling more fine-grained
+        // and allow new requests after noncritical errors, at least
+        // in non-streaming mode. But this doesn't seem very useful,
+        // at least for clickhouse.
+
+        // Have to call close_socket even if abandoned_ was already true,
+        // to cancel potential new pending_write_reqs_ elements added since the previous call.
+        abandoned_ = true;
+        close_socket(err_msg);
+
+        // In streaming mode, all `when_done` will be invoked in `close_socket()`.
+        // Otherwise, `close_socket()` will do nothing, hence `when_done`
+        // should directly be invoked here.
+        if (!impl_->get_options().streaming_mode_) {
+            ptr<resp_msg> resp;
+            ptr<rpc_exception> except(cs_new<rpc_exception>(err_msg, req));
+            when_done(resp, except);
         }
     }
 
+    /// May be called multiple times. May be called in parallel.
     void close_socket(std::string err_msg = std::string()) {
         // Do nothing,
         // early closing socket before destroying this instance
@@ -1826,22 +1746,31 @@ private:
         // In streaming mode, it should invoke all `when_done` callbacks,
         // in chronological order.
 
-        // clear write queue and read queue here
-        // from oldest to latest, read queue first
-        cancel_pending_requests(pending_read_reqs_, pending_read_reqs_lock_, err_msg);
-        cancel_pending_requests(pending_write_reqs_, pending_write_reqs_lock_, err_msg);
+        // Clear write queue and read queue here
+        // from oldest to latest, read queue first.
+        //
+        // The two queues may have an overlap of one element,
+        // if post_send added the request to pending_read_reqs_
+        // but didn't remove it from pending_write_reqs_lock_ yet.
+        // Detect that with last_cancelled_read_req.
+        ptr<req_msg> last_cancelled_read_req = cancel_pending_requests(pending_read_reqs_, pending_read_reqs_lock_, err_msg, nullptr);
+        cancel_pending_requests(pending_write_reqs_, pending_write_reqs_lock_, err_msg, last_cancelled_read_req);
     }
 
-    void cancel_pending_requests(std::list<ptr<pending_req_pkg>>& reqs_list,
+    ptr<req_msg> cancel_pending_requests(std::list<ptr<pending_req_pkg>>& reqs_list,
                                  std::mutex& lock,
-                                 std::string& err_msg) {
+                                 std::string& err_msg,
+                                 ptr<req_msg> skip_first_req) {
         std::list<ptr<pending_req_pkg>> reqs_to_cancel;
         {
             auto_lock(lock);
             reqs_to_cancel = std::move(reqs_list);
         }
 
-        for (auto& pkg: reqs_to_cancel) {
+        for (auto it = reqs_to_cancel.begin(); it != reqs_to_cancel.end(); ++it) {
+            auto& pkg = *it;
+            if (it == reqs_to_cancel.begin() && pkg->req_ == skip_first_req)
+                continue;
             ptr<resp_msg> rsp;
             if (err_msg.empty()) {
                 err_msg = lstrfmt("socket to host %s is closed").fmt( host_.c_str() );
@@ -1849,7 +1778,14 @@ private:
             ptr<rpc_exception> except( cs_new<rpc_exception>( err_msg, pkg->req_) );
             pkg->when_done_(rsp, except);
         }
+
+        ptr<req_msg> last_req;
+        if (!reqs_to_cancel.empty())
+            last_req = reqs_to_cancel.back()->req_;
+
         reqs_to_cancel.clear();
+
+        return last_req;
     }
 
     void cancel_socket(const ERROR_CODE& err) {
@@ -1860,7 +1796,8 @@ private:
         if (socket().is_open()) {
             p_wn("cancelling operations due to socket (%s:%s) timeout",
                 host_.c_str(), port_.c_str());
-            abandoned_ = true;
+            // This should make all current socket operations to quickly
+            // complete with an error.
             socket_.cancel();
         }
     }
@@ -1871,7 +1808,6 @@ private:
                    const std::error_code& err,
                    const asio::ip::tcp::endpoint&)
     {
-        operation_timer_.cancel();
         if (!err) {
             asio::ip::tcp::no_delay option(true);
             socket().set_option(option);
@@ -1891,11 +1827,12 @@ private:
                                  std::placeholders::_1 ) );
 #endif
             } else {
+                send_timer_.cancel();
+                set_busy_flag(/*receive=*/ false, false);
                 this->register_req_send(req, when_done, send_timeout_ms);
             }
 
         } else {
-            abandoned_ = true;
             std::string err_msg = sstrfmt("failed to connect to "
                                           "peer %d, %s:%s, error %d, %s")
                                           .fmt( req->get_dst(), host_.c_str(),
@@ -1910,16 +1847,16 @@ private:
                           uint64_t send_timeout_ms,
                           const ERROR_CODE& err)
     {
+        send_timer_.cancel();
         ptr<asio_rpc_client> self = this->shared_from_this();
 
         if (!err) {
             p_in( "handshake with %s:%s succeeded (as a client)",
                   host_.c_str(), port_.c_str() );
-            ssl_ready_ = true;
+            set_busy_flag(/*receive=*/ false, false);
             this->register_req_send(req, when_done, send_timeout_ms);
 
         } else {
-            abandoned_ = true;
             p_er( "failed SSL handshake with peer %d, %s:%s, error %d, %s",
                   req->get_dst(), host_.c_str(), port_.c_str(), err.value(),
                   err.message().c_str() );
@@ -1937,20 +1874,22 @@ private:
     void sent( ptr<req_msg>& req,
                ptr<buffer>& buf,
                rpc_handler& when_done,
+               uint64_t send_timeout_ms,
                std::error_code err,
                size_t bytes_transferred )
     {
         // Now we can safely free the `req_buf`.
         (void)buf;
+        send_timer_.cancel();
         if (!err) {
+            set_busy_flag(/*receive=*/ false, false);
+            uint64_t receive_timeout_ms = send_timeout_ms;
             if (impl_->get_options().streaming_mode_) {
-                post_send(req, when_done);
+                post_send(req, when_done, receive_timeout_ms);
             } else {
-                register_response_read(req, when_done);
+                register_response_read(req, when_done, receive_timeout_ms);
             }
         } else {
-            operation_timer_.cancel();
-            abandoned_ = true;
             std::string err_msg = sstrfmt( "failed to send request to peer %d, %s:%s, "
                                            "error %d, %s" )
                                            .fmt( req->get_dst(), host_.c_str(),
@@ -1958,6 +1897,78 @@ private:
                                                  err.message().c_str() );
             handle_error(req, err_msg, when_done);
         }
+    }
+
+    void post_send(ptr<req_msg>& req, rpc_handler& when_done, uint64_t receive_timeout_ms) {
+        // first process read
+        bool immediate_action_needed = false;
+        {
+            auto_lock(pending_read_reqs_lock_);
+            if (abandoned_)
+                return; // close_socket already drained pending_read_reqs_, don't add to it
+            pending_read_reqs_.push_back(cs_new<pending_req_pkg>(req, when_done, receive_timeout_ms));
+            immediate_action_needed = (pending_read_reqs_.size() == 1);
+            p_db("msg to peer %d has been write down, start_log_idx: %" PRIu64 ", "
+                 "size: %" PRIu64 ", pending read reqs: %" PRIu64 "", req->get_dst(),
+                 req->get_last_log_idx(),
+                 req->log_entries().size(), pending_read_reqs_.size());
+        }
+
+        if (immediate_action_needed) {
+            register_response_read(req, when_done, receive_timeout_ms);
+        }
+
+        // next process write
+        ptr<pending_req_pkg> next_req_pkg{nullptr};
+        {
+            auto_lock(pending_write_reqs_lock_);
+            // NOTE:
+            //   The queue can be empty even though there was no `pop_front`,
+            //   due to `close_socket()` when connection is suddenly closed.
+            if (pending_write_reqs_.size()) {
+                pending_write_reqs_.pop_front();
+            }
+            if (pending_write_reqs_.size() > 0) {
+                next_req_pkg = *pending_write_reqs_.begin();
+                p_db("trigger next write, start_log_idx: %" PRIu64 ", "
+                     "pending write reqs: %" PRIu64 "",
+                     next_req_pkg->req_->get_last_log_idx(),
+                     pending_write_reqs_.size());
+            }
+        }
+
+        if (next_req_pkg) {
+            register_req_send(next_req_pkg->req_,
+                              next_req_pkg->when_done_,
+                              next_req_pkg->timeout_ms_);
+        }
+    }
+
+    void register_response_read( ptr<req_msg>& req,
+                              rpc_handler& when_done,
+                              uint64_t receive_timeout_ms )
+    {
+        ptr<asio_rpc_client> self(this->shared_from_this());
+        set_busy_flag(/*receive=*/ true, true);
+        if (receive_timeout_ms != 0) {
+            receive_timer_.expires_after
+            ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                ( std::chrono::milliseconds( receive_timeout_ms ) ) );
+            receive_timer_.async_wait(
+                std::bind( &asio_rpc_client::cancel_socket,
+                            this,
+                            std::placeholders::_1 ) );
+        }
+        ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
+        aa::read( ssl_enabled_, ssl_socket_, socket_,
+                  asio::buffer(resp_buf->data(), resp_buf->size()),
+                  std::bind( &asio_rpc_client::response_read,
+                             self,
+                             req,
+                             when_done,
+                             resp_buf,
+                             std::placeholders::_1,
+                             std::placeholders::_2 ) );
     }
 
     void response_read(ptr<req_msg>& req,
@@ -1968,7 +1979,7 @@ private:
     {
         ptr<asio_rpc_client> self(this->shared_from_this());
         if (err) {
-            abandoned_ = true;
+            receive_timer_.cancel();
             std::string err_msg = sstrfmt( "failed to read response to peer %d, %s:%s, "
                                            "error %d, %s" )
                                            .fmt( req->get_dst(), host_.c_str(),
@@ -1988,6 +1999,7 @@ private:
         uint32_t flags = (flags_and_crc >> 32);
 
         if (crc_local != crc_buf) {
+            receive_timer_.cancel();
             std::string err_msg = sstrfmt( "CRC mismatch in response from "
                                            "peer %d, %s:%s, "
                                            "local calculation %x, from buffer %x")
@@ -2039,11 +2051,7 @@ private:
                                  std::placeholders::_1,
                                  std::placeholders::_2 ) );
         } else {
-            operation_timer_.cancel();
-            set_busy_flag(false);
-            ptr<rpc_exception> except;
-            when_done(rsp, except);
-            post_read();
+            post_read(req, rsp, when_done);
         }
     }
 
@@ -2063,11 +2071,7 @@ private:
             ctx_buf->pos(0);
             rsp->set_ctx(ctx_buf);
 
-            operation_timer_.cancel();
-            set_busy_flag(false);
-            ptr<rpc_exception> except;
-            when_done(rsp, except);
-            post_read();
+            post_read(req, rsp, when_done);
             return;
         }
 
@@ -2126,11 +2130,7 @@ private:
             rsp->set_result_code(res);
         }
 
-        operation_timer_.cancel();
-        set_busy_flag(false);
-        ptr<rpc_exception> except;
-        when_done(rsp, except);
-        post_read();
+        post_read(req, rsp, when_done);
     }
 
     bool handle_custom_resp_meta(ptr<req_msg>& req,
@@ -2153,91 +2153,50 @@ private:
         return true;
     }
 
-    void register_response_read( ptr<req_msg>& req,
-                              rpc_handler& when_done )
-    {
-        ptr<asio_rpc_client> self(this->shared_from_this());
-        ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
-        aa::read( ssl_enabled_, ssl_socket_, socket_,
-                  asio::buffer(resp_buf->data(), resp_buf->size()),
-                  std::bind( &asio_rpc_client::response_read,
-                             self,
-                             req,
-                             when_done,
-                             resp_buf,
-                             std::placeholders::_1,
-                             std::placeholders::_2 ) );
-    }
+    void post_read([[maybe_unused]] ptr<req_msg>& req, ptr<resp_msg>& rsp, rpc_handler& when_done) {
+        receive_timer_.cancel();
+        set_busy_flag(/*receive=*/ true, false);
 
-    void post_send(ptr<req_msg>& req, rpc_handler& when_done) {
-        // first process read
-        bool immediate_action_needed = false;
-        {
-            auto_lock(pending_read_reqs_lock_);
-            pending_read_reqs_.push_back(cs_new<pending_req_pkg>(req, when_done));
-            immediate_action_needed = (pending_read_reqs_.size() == 1);
-            p_db("msg to peer %d has been write down, start_log_idx: %" PRIu64 ", "
-                 "size: %" PRIu64 ", pending read reqs: %" PRIu64 "", req->get_dst(),
-                 req->get_last_log_idx(),
-                 req->log_entries().size(), pending_read_reqs_.size());
-        }
-
-        if (immediate_action_needed) {
-            register_response_read(req, when_done);
-        }
-
-        // next process write
-        ptr<pending_req_pkg> next_req_pkg{nullptr};
-        {
-            auto_lock(pending_write_reqs_lock_);
-            // NOTE:
-            //   The queue can be empty even though there was no `pop_front`,
-            //   due to `close_socket()` when connection is suddenly closed.
-            if (pending_write_reqs_.size()) {
-                pending_write_reqs_.pop_front();
-            }
-            if (pending_write_reqs_.size() > 0) {
-                next_req_pkg = *pending_write_reqs_.begin();
-                p_db("trigger next write, start_log_idx: %" PRIu64 ", "
-                     "pending write reqs: %" PRIu64 "",
-                     next_req_pkg->req_->get_last_log_idx(),
-                     pending_write_reqs_.size());
-            }
-        }
-
-        if (next_req_pkg) {
-            register_req_send(next_req_pkg->req_,
-                              next_req_pkg->when_done_,
-                              next_req_pkg->timeout_ms_);
-        }
-    }
-
-    void post_read() {
         if (!impl_->get_options().streaming_mode_) {
+            ptr<rpc_exception> except;
+            when_done(rsp, except);
             return;
         }
 
         // trigger next read
         ptr<pending_req_pkg> next_req_pkg{nullptr};
+        bool popped = false;
         {
             auto_lock(pending_read_reqs_lock_);
             // NOTE:
-            //   The queue can be empty even though there was no `pop_front`,
-            //   due to `close_socket()` when connection is suddenly closed.
+            //   The queue can be empty due to `close_socket()`
+            //   when connection is suddenly closed.
             if (pending_read_reqs_.size()) {
+                assert(pending_read_reqs_.front()->req_ == req);
                 pending_read_reqs_.pop_front();
-            }
-            if (pending_read_reqs_.size() > 0) {
-                next_req_pkg = *pending_read_reqs_.begin();
-                p_db("trigger next read, start_log_idx: %" PRIu64 ", "
-                     "pending read reqs: %" PRIu64 "",
-                     next_req_pkg->req_->get_last_log_idx(),
-                     pending_read_reqs_.size());
+                popped = true;
+
+                if (pending_read_reqs_.size() > 0) {
+                    next_req_pkg = *pending_read_reqs_.begin();
+                    p_db("trigger next read, start_log_idx: %" PRIu64 ", "
+                        "pending read reqs: %" PRIu64 "",
+                        next_req_pkg->req_->get_last_log_idx(),
+                        pending_read_reqs_.size());
+                }
             }
         }
 
+        if (popped) {
+            // Call the callback only if we found this request in pending_read_reqs_.
+            // Otherwise the callback was already called by close_socket.
+            ptr<rpc_exception> except;
+            when_done(rsp, except);
+        }
+
         if (next_req_pkg) {
-            register_response_read(next_req_pkg->req_, next_req_pkg->when_done_);
+            register_response_read(next_req_pkg->req_,
+                                   next_req_pkg->when_done_,
+                                   next_req_pkg->timeout_ms_);
         }
     }
 
@@ -2246,39 +2205,50 @@ private:
     asio::ip::tcp::resolver resolver_;
     asio::ip::tcp::socket socket_;
     ssl_socket ssl_socket_;
-    // `true` if attempting connection is in progress.
-    // Other threads should not do anything.
-    std::atomic<bool> attempting_conn_;
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
-    std::atomic<bool> ssl_ready_;
-    std::atomic<size_t> num_send_fails_;
-    std::atomic<bool> abandoned_;
-    std::atomic<bool> socket_busy_;
     uint64_t client_id_;
-    asio::steady_timer operation_timer_;
     ptr<logger> l_;
+
+    // asio_rpc_client consists of two "threads" of work: send side and receive side.
+    // Each "thread" is a chain of boost asio calls and their callbacks,
+    // executed sequentially.
+    // In streaming mode, the two chains can run in parallel, and we should
+    // be careful to avoid data races.
+    // Send side covers connection, SSL handshake, and sending requests.
+    // Receive side covers receiving responses.
+
+    // For simplicity, we don't apply an end-to-end operation timeout.
+    // Instead, there are separate timeouts: connect+handshake, send, receive.
+    // So an operation may take up to 3x the configured timeout in total.
+    // In streaming mode, request latency can, in principle, get very high
+    // without tripping our timeout because each response read gets its own
+    // timeout timer, and there can be arbitrarily many responses in queue.
+
+    // Send side.
+    bool send_busy_ = false;
+    asio::steady_timer send_timer_;
+
+    // Receive side.
+    bool receive_busy_ = false;
+    asio::steady_timer receive_timer_;
+
+    // True if handle_error/close_socket was called at least once,
+    // and we should stop all activity and reject any future requests.
+    std::atomic<bool> abandoned_ {false};
 
     /**
      * Queue of request which is pending for reading.
      */
-    std::list<ptr<pending_req_pkg>> pending_read_reqs_;
-
-    /**
-     * Lock for `pending_read_reqs_`.
-     */
     std::mutex pending_read_reqs_lock_;
+    std::list<ptr<pending_req_pkg>> pending_read_reqs_;
 
     /**
      * Queue of request which is pending for writing.
      */
-    std::list<ptr<pending_req_pkg>> pending_write_reqs_;
-
-    /**
-     * Lock for `pending_write_reqs_`.
-     */
     std::mutex pending_write_reqs_lock_;
+    std::list<ptr<pending_req_pkg>> pending_write_reqs_;
 };
 
 } // namespace nuraft

@@ -40,6 +40,12 @@ class rpc_client {
     __interface_body__(rpc_client);
 
 public:
+    // When streaming mode is disabled, the caller must ensure that
+    // at most one request is in flight. I.e. second send() call is
+    // only allowed after the first call's when_done callback is called.
+    // When streaming mode is enabled, no such requirement exists, and
+    // requests can be pipelined, and their `when_done` callbacks are
+    // called in the same order as the corresponding send() calls.
     virtual void send(ptr<req_msg>& req,
                       rpc_handler& when_done,
                       uint64_t send_timeout_ms = 0) = 0;
