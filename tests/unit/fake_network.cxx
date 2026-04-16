@@ -269,6 +269,15 @@ void FakeNetwork::handleAllFrom(const std::string& endpoint) {
     while (handleRespFrom(endpoint));
 }
 
+bool FakeNetwork::replaceLastPendingResp(const std::string& endpoint,
+                                         ptr<resp_msg> new_resp) {
+    ptr<FakeClient> conn = findClient(endpoint);
+    if (!conn || conn->pendingResps.empty()) return false;
+    auto& last = conn->pendingResps.back();
+    last.resp = new_resp;
+    return true;
+}
+
 size_t FakeNetwork::getNumPendingReqs(const std::string& endpoint) {
     ptr<FakeClient> conn = findClient(endpoint);
     if (!conn) return 0;

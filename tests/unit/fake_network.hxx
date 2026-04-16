@@ -145,6 +145,51 @@ public:
         return false;
     }
 
+    ulong getPeerNextLogIdxFloor(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_next_log_idx_floor();
+        }
+        return 0;
+    }
+
+    void setPeerNextLogIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_next_log_idx(idx);
+        }
+    }
+
+    void setPeerMatchedIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_matched_idx(idx);
+        }
+    }
+
+    void setPeerNextLogIdxFloor(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_next_log_idx_floor(idx);
+        }
+    }
+
+    ulong getPeerNextLogIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_next_log_idx();
+        }
+        return 0;
+    }
+
+    bool replaceLastPendingResp(const std::string& endpoint,
+                                ptr<resp_msg> new_resp);
+
     void setPeerSnapshotInSync(raft_server* srv,
                                int32 peer_id,
                                ptr<snapshot> snp) {

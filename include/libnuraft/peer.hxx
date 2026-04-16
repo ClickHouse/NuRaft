@@ -52,6 +52,7 @@ public:
         , last_accepted_log_idx_(0)
         , next_batch_size_hint_in_bytes_(0)
         , matched_idx_(0)
+        , next_log_idx_floor_(0)
         , busy_flag_(false)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
@@ -166,6 +167,14 @@ public:
 
     void set_next_log_idx(ulong idx) {
         next_log_idx_ = idx;
+    }
+
+    ulong get_next_log_idx_floor() const {
+        return next_log_idx_floor_;
+    }
+
+    void set_next_log_idx_floor(ulong idx) {
+        next_log_idx_floor_ = idx;
     }
 
     uint64_t get_last_accepted_log_idx() const {
@@ -456,6 +465,13 @@ private:
      * The last log index whose term matches up with the leader.
      */
     ulong matched_idx_;
+
+    /**
+     * Floor for `next_log_idx_`, set after successful snapshot sync.
+     * Prevents stale RPC responses from rewinding `next_log_idx_`
+     * below the snapshot-established position.
+     */
+    ulong next_log_idx_floor_;
 
     /**
      * `true` if we sent message to this server and waiting for

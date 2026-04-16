@@ -1114,6 +1114,7 @@ void raft_server::become_leader() {
             // reconnect_client(*pp);
 
             pp->set_next_log_idx(log_store_->next_slot());
+            pp->set_next_log_idx_floor(0);
             pp->reset_stream();
             enable_hb_for_peer(*pp);
             pp->set_recovered();

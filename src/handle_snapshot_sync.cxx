@@ -365,6 +365,8 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
                 p_db("snapshot sync is done (raw type)");
                 p->set_next_log_idx(sync_ctx->get_snapshot()->get_last_log_idx() + 1);
                 p->set_matched_idx(sync_ctx->get_snapshot()->get_last_log_idx());
+                p->set_next_log_idx_floor(
+                    sync_ctx->get_snapshot()->get_last_log_idx() + 1);
                 clear_snapshot_sync_ctx(*p);
 
                 if (p->is_snapshot_sync_needed()) {
@@ -389,6 +391,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
               "log_store_->next_slot(): %" PRIu64,
               p->get_id(), p->get_next_log_idx(), log_store_->next_slot() );
         p->set_next_log_idx(resp.get_next_idx());
+        p->set_next_log_idx_floor(0);
 
         // Added by Jung-Sang Ahn (Oct 11 2017)
         // Declining snapshot implies that the peer already has the up-to-date snapshot.
