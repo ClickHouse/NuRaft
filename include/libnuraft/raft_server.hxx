@@ -44,6 +44,7 @@ namespace nuraft {
 
 using CbReturnCode = cb_func::ReturnCode;
 
+class client_req_stream;
 class cluster_config;
 class custom_notification_msg;
 class delayed_task_scheduler;
@@ -359,6 +360,20 @@ public:
     ptr< cmd_result< ptr<buffer> > >
         append_entries_ext(const std::vector< ptr<buffer> >& logs,
                            const req_ext_params& ext_params);
+
+    /**
+     * Open a pipelined-forwarding stream bound to the current leader and
+     * term. See `client_req_stream.hxx` and `docs/stream_forwarding.md`.
+     *
+     * On failure returns nullptr and (if non-null) sets `*out_err`:
+     *   CANCELLED  — async_replication disabled on the cluster config
+     *   NOT_LEADER — no current leader or term==0
+     *   FAILED     — leader not in cluster config, rpc_client creation
+     *                failed, or transport does not support pipelining
+     */
+    ptr<client_req_stream> open_client_req_stream(
+        uint64_t send_timeout_ms = 0,
+        cmd_result_code* out_err = nullptr);
 
     enum class PrioritySetResult { SET, BROADCAST, IGNORED };
 

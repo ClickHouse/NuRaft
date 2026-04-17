@@ -47,6 +47,14 @@ public:
     virtual uint64_t get_id() const = 0;
 
     virtual bool is_abandoned() const = 0;
+
+    /**
+     * True if the client accepts a second `send` before the previous
+     * send's `when_done` has fired (pipelining). If false, overlapping
+     * sends violate the client's contract (e.g. the asio client asserts
+     * on a busy socket unless streaming_mode_ is enabled).
+     */
+    virtual bool supports_pipelining() const { return false; }
 };
 
 }

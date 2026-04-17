@@ -73,6 +73,23 @@ ptr<resp_msg> raft_server::handle_leader_status_req(req_msg& req) {
     }
 }
 
+namespace {
+
+// Sole source of `accepted=false` responses in handle_cli_req. All rejections
+// must stay in the pre-store phase so STREAM_FORWARDING close-on-reject
+// preserves no-gap semantics (see docs/stream_forwarding.md).
+ptr<resp_msg> reject_cli_req(uint64_t cur_term,
+                             int32 id,
+                             int32 leader,
+                             cmd_result_code code) {
+    ptr<resp_msg> resp = cs_new<resp_msg>(
+        cur_term, msg_type::append_entries_response, id, leader);
+    resp->set_result_code(code);
+    return resp;
+}
+
+} // anonymous namespace
+
 ptr<resp_msg> raft_server::handle_cli_req_prelock(req_msg& req,
                                                   const req_ext_params& ext_params)
 {
@@ -124,29 +141,34 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
                                           const req_ext_params& ext_params,
                                           uint64_t timestamp_us)
 {
-    ptr<resp_msg> resp = nullptr;
+    // Three phases: (1) pre-store validation, (2) append/store,
+    // (3) completion setup. All accepted=false returns must stay in (1)
+    // (routed through reject_cli_req) — STREAM_FORWARDING depends on this.
+
+    // --- Phase 1: pre-store validation ---
+
     ulong last_idx = 0;
     ptr<buffer> ret_value = nullptr;
     ulong resp_idx = 1;
     ulong cur_term = state_->get_term();
     ptr<raft_params> params = ctx_->get_params();
 
-    resp = cs_new<resp_msg>( cur_term,
-                             msg_type::append_entries_response,
-                             id_,
-                             leader_ );
     if (role_ != srv_role::leader || write_paused_) {
-        resp->set_result_code( cmd_result_code::NOT_LEADER );
-        return resp;
+        return reject_cli_req(cur_term, id_, leader_, cmd_result_code::NOT_LEADER);
     }
 
     if (ext_params.expected_term_) {
         // If expected term is given, check the current term.
         if (ext_params.expected_term_ != cur_term) {
-            resp->set_result_code( cmd_result_code::TERM_MISMATCH );
-            return resp;
+            return reject_cli_req(cur_term, id_, leader_,
+                                  cmd_result_code::TERM_MISMATCH);
         }
     }
+
+    ptr<resp_msg> resp = cs_new<resp_msg>(
+        cur_term, msg_type::append_entries_response, id_, leader_);
+
+    // --- Phase 2: append/store ---
 
     std::vector< ptr<log_entry> >& entries = req.log_entries();
 
@@ -221,6 +243,8 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         timer_helper::sleep_us(sleep_us);
     }
 
+    // --- Phase 3: completion setup (resp is always accepted from here) ---
+
     if (!get_config()->is_async_replication()) {
         // Sync replication:
         //   Set callback function for `last_idx`.
@@ -270,6 +294,12 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
     }
 
     resp->accept(resp_idx);
+    // Structural invariant: accepted=false only comes from reject_cli_req
+    // above the store loop (see STREAM_FORWARDING no-gap).
+    if (!resp->get_accepted()) {
+        p_ft("handle_cli_req: phase-3 response not accepted; no-gap violated");
+        assert(false);
+    }
     return resp;
 }
 

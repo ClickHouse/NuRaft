@@ -147,43 +147,10 @@ limitations under the License.
 //     the follower is marked down by itself.
 #define MARK_DOWN (0x40)
 
-// Can be used for sending multiple dependent writes to the leader in a streaming fashion,
-// i.e. with guaranteed ordering but without waiting for commit after each request.
-// Somewhat difficult to use correctly. Tailored to a particular usage in clickhouse.
-//
-// We'd like to pass appends through chain: rpc_client -> (TCP) -> rpc_session -> raft_server,
-// with no reordering or gaps at any step. Same guarantees as TCP: if an append succeeds
-// (i.e. eventually ends up committed, whether or not acked to the original writer),
-// all previous appends must've succeeded too, in the original order.
-// I.e. some prefix of the request sequence is applied, no gaps. On any error,
-// the stream becomes permanently "closed", and the client has to establish a new stream.
-//
-// Recipe for such streaming:
-//  * The client side is any raft node, the server side is the leader raft node.
-//  * On client side, get current leader's term using raft_server::get_term()
-//    and remember it for the duration of the stream.
-//  * NuRaft's own auto_forwarding feature should not be used as it doesn't provide
-//    sufficient control over connection management. Instead, use rpc_client_factory
-//    directly to connect to the leader node. Form msg_type::client_request messages manually
-//    and send them through one rpc_client in the correct order.
-//  * In the client_request messages, set the STREAM_FORWARDING_REQUEST flag and
-//    set `term` field to the stream's term.
-//    This flag tells rpc_client to avoid reconnecting if TCP connection is closed,
-//    and tells rpc_session to close TCP connection if any append is rejected.
-//  * If the rpc_client reports an error, consider the stream closed.
-//    Periodically re-check raft_server::get_term(); if it changes, consider the stream closed.
-//  * To get any performance gain from streaming, you probably want to enable
-//    async_replication in cluster_config and streaming_mode_ in asio_service_options.
-//    With async_replication, responses to client_request messages don't mean much,
-//    so you probably want to ignore them (but still check for errors, to detect when TCP
-//    connection is closed) and use commit callback as confirmation of durability.
-//  * If the connection is closed, you probably want to report error for all in-flight
-//    uncommitted requests and close their corresponding upstream user sessions.
-//    For that, you probably want to maintain the set (or queue) of in-flight requests:
-//    add entry to the set before sending to the leader, remove in commit callback.
-//  * You should probably use backoff when reconnecting. E.g. during recovery the leader
-//    will be rejecting all requests, so every STREAM_FORWARDING connection will be closed
-//    quickly on first request.
+// Wire flag for `client_req_stream` forwarding (see client_req_stream.hxx
+// and docs/stream_forwarding.md). When set, rpc_session treats req_msg.term
+// as expected_term_ for fencing, and tears down the session on rejection
+// instead of writing a response.
 #define STREAM_FORWARDING (0x80)
 
 // =======================
@@ -781,7 +748,8 @@ private:
         }
 
         raft_server::req_ext_params ext_params;
-        if (req->get_term() != 0) {
+        // Only STREAM_FORWARDING client_requests use term for fencing.
+        if ((flags_ & STREAM_FORWARDING) && req->get_term() != 0) {
             ext_params.expected_term_ = req->get_term();
         }
 
@@ -789,22 +757,6 @@ private:
         ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req, ext_params);
         if (!resp) {
             p_wn("no response is returned from raft message handler");
-            this->stop();
-            return;
-        }
-
-        if ((flags_ & STREAM_FORWARDING) && !resp->get_accepted()) {
-            // Close stream on error to avoid reordering.
-            //
-            // We only check get_accepted() here without doing call_cb()/call_async_cb() first.
-            // This is sufficient because non-immediate errors (i.e. failing
-            // to replicate/commit the entry) can only happen on term change and
-            // do not cause reordering or gaps.
-            // Also, STREAM_FORWARDING is normally used with async replication enabled,
-            // so there shouldn't be any cb or async_cb.
-            //
-            // Currently we don't send the response in this case because the current user of
-            // STREAM_FORWARDING (clickhouse) doesn't care about responses.
             this->stop();
             return;
         }
@@ -847,6 +799,11 @@ private:
 
     void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
         ptr<rpc_session> self = this->shared_from_this();
+
+        enum class post_write_action {
+            cont,   // wait for the next request on this session
+            stop,   // tear the session down after the write flushes
+        };
 
        try {
         ptr<buffer> resp_ctx = resp->get_ctx();
@@ -932,21 +889,31 @@ private:
             bs.put_i32(resp->get_result_code());
         }
 
+        // Teardown decision for STREAM_FORWARDING. Computed here, after
+        // write_resp_meta_ may have mutated resp, so it reflects the
+        // final resp the write will emit.
+        const post_write_action post =
+            ((flags_ & STREAM_FORWARDING) && !resp->get_accepted())
+                ? post_write_action::stop
+                : post_write_action::cont;
+
         aa::write( ssl_enabled_, ssl_socket_, socket_,
                    asio::buffer(resp_buf->data_begin(), resp_buf->size()),
-                   [this, self, resp_buf]
+                   [this, self, resp_buf, post]
                    (ERROR_CODE err_code, size_t) -> void
         {
             // To avoid releasing `resp_buf` before the write is done.
             (void)resp_buf;
-            if (!err_code) {
-                this->start(self);
-            } else {
+            if (err_code) {
                 p_er( "session %" PRIu64 " failed to send response to peer due "
                       "to error %d",
                       session_id_,
                       err_code.value() );
                 this->stop();
+            } else if (post == post_write_action::stop) {
+                this->stop();
+            } else {
+                this->start(self);
             }
         } );
 
@@ -1220,6 +1187,10 @@ public:
 
     bool is_abandoned() const override {
         return abandoned_;
+    }
+
+    bool supports_pipelining() const override {
+        return impl_->get_options().streaming_mode_;
     }
 
 #ifndef SSL_LIBRARY_NOT_FOUND

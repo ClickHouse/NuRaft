@@ -52,6 +52,13 @@ unit_test(NAME learner_new_joiner_test
     ${EXAMPLES_SRC}/logger.cc
     ${EXAMPLES_SRC}/in_memory_log_store.cxx)
 
+unit_test(NAME client_req_stream_test
+    SOURCES
+    unit/client_req_stream_test.cxx
+    unit/fake_network.cxx
+    ${EXAMPLES_SRC}/logger.cc
+    ${EXAMPLES_SRC}/in_memory_log_store.cxx)
+
 # === Failure recovery & conflict resolution test ===
 unit_test(NAME failure_test
     SOURCES

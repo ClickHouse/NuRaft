@@ -34,8 +34,13 @@ public:
     // This flag is used only when full consensus mode is enabled.
     static constexpr uint64_t EXCLUDED_FROM_THE_QUORUM = 0x1;
 
-    // If set, the STREAM_FORWARDING wire flag is included in the request header.
-    // See the comment on STREAM_FORWARDING in asio_service.cxx for details.
+    // On an outgoing client_request: emits the STREAM_FORWARDING wire
+    // flag and repurposes `term_` as the stream's fenced term (see
+    // docs/stream_forwarding.md).
+    //
+    // WARNING: this flag overloads `term_` on client_request. Readers of
+    // `term_` on a client_request must check this flag first. New flags
+    // should use a dedicated field rather than another `term_` overload.
     static constexpr uint64_t STREAM_FORWARDING_REQUEST = 0x2;
 
     req_msg(ulong term,
