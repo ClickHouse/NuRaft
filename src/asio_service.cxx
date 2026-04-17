@@ -497,7 +497,7 @@ public:
     }
 
     void stop() {
-        std::lock_guard lock(stop_mutex_);
+        std::lock_guard<std::mutex> lock(stop_mutex_);
         if (!handler_) // already stopped
             return;
 
@@ -516,7 +516,7 @@ public:
         }
 
         {
-            std::lock_guard lock(handler_mutex_);
+            std::lock_guard<std::mutex> lock(handler_mutex_);
             handler_.reset();
         }
     }
@@ -647,7 +647,7 @@ private:
 
         ptr<msg_handler> handler;
         {
-            std::lock_guard lock(handler_mutex_);
+            std::lock_guard<std::mutex> lock(handler_mutex_);
             handler = handler_;
         }
         if (!handler)
@@ -1600,10 +1600,10 @@ public:
 
         for (auto& entry: req->log_entries()) {
             ptr<log_entry>& le = entry;
-            auto& le_buf = le->get_buf();
             ptr<buffer> entry_buf = buffer::alloc
                                     ( LOG_ENTRY_SIZE + le->get_buf().size() );
 #if 0
+            auto& le_buf = le->get_buf();
             entry_buf->put( le->get_term() );
             entry_buf->put( (byte)le->get_val_type() );
             entry_buf->put( (int32)le_buf.size() );
