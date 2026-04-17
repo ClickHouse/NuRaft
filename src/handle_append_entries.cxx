@@ -678,6 +678,16 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     return req;
 }
 
+// Whether handle_append_entries should return a future that later
+// gets notified by notify_log_append_completion when log entries become durable.
+// This allows the leader to send multiple append_entries messages without waiting
+// for responses.
+// Only makes sense when parallel_log_appending_ and max_log_gap_in_stream_ are both enabled;
+// otherwise either the log store or the asio handler would wait for durability anyway.
+static bool should_use_async_log_appending(const raft_params& params) {
+    return params.parallel_log_appending_ && params.max_log_gap_in_stream_ > 0;
+}
+
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     bool supp_exp_warning = false;
@@ -870,7 +880,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     last_rcvd_append_entries_req_.reset();
 
     ptr<raft_params> params = ctx_->get_params();
-    bool async_log_appending = params->parallel_log_appending_ && params->max_log_gap_in_stream_ > 0;
+    bool async_log_appending = should_use_async_log_appending(*params);
 
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
@@ -1644,7 +1654,7 @@ void raft_server::notify_log_append_completion(bool ok) {
         }
     } else {
         ptr<raft_params> params = ctx_->get_params();
-        if (params->parallel_log_appending_ && params->max_log_gap_in_stream_ > 0) {
+        if (should_use_async_log_appending(*params)) {
             // Follower: send responses for async append_entries
             // requests whose entries became durable.
             recur_lock(lock_);
