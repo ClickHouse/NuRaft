@@ -59,6 +59,7 @@ limitations under the License.
 #include <ctime>
 #include <exception>
 #include <ios>
+#include <deque>
 #include <list>
 #include <thread>
 #include <string>
@@ -357,7 +358,7 @@ public:
                          err.value(),
                          err.message().c_str());
                 }
-                this->stop();
+                this->request_stop();
             });
         }
     }
@@ -378,7 +379,7 @@ public:
                       err.value(),
                       err.message().c_str(),
                       self.use_count() );
-                this->stop();
+                this->request_stop();
                 return;
             }
 
@@ -418,7 +419,7 @@ public:
                     impl_->get_options().corrupted_msg_handler_(header_, nullptr);
                 }
 
-                this->stop();
+                this->request_stop();
                 return;
             }
 
@@ -434,7 +435,7 @@ public:
                     impl_->get_options().corrupted_msg_handler_(header_, nullptr);
                 }
 
-                this->stop();
+                this->request_stop();
                 return;
             }
 
@@ -446,7 +447,7 @@ public:
                     impl_->get_options().corrupted_msg_handler_(header_, nullptr);
                 }
 
-                this->stop();
+                this->request_stop();
                 return;
             }
 
@@ -464,7 +465,7 @@ public:
                     impl_->get_options().corrupted_msg_handler_(header_, nullptr);
                 }
 
-                this->stop();
+                this->request_stop();
                 return;
             }
             // Warning for 1GB+
@@ -491,22 +492,56 @@ public:
         } );
     }
 
-    void stop() {
-        invoke_connection_callback(false);
-        close_socket();
-        if (callback_) {
-            callback_(this->shared_from_this());
-        }
-        handler_.reset();
-    }
-
     ssl_socket::lowest_layer_type& socket() {
         return ssl_socket_.lowest_layer();
     }
 
+    void stop() {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        if (!handler_) // already stopped
+            return;
+
+        invoke_connection_callback(false, handler_);
+
+        // Cancel the socket to interrupt async operations in hopes of making shutdown faster.
+        // But maybe this would cause the mysterious MONSTOR-9378
+        // problem that close_socket() alludes to?
+        if (socket().is_open()) {
+            socket_.cancel();
+        }
+
+        close_socket();
+        if (callback_) {
+            callback_(this->shared_from_this());
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(handler_mutex_);
+            handler_.reset();
+        }
+    }
+
 private:
-    void invoke_connection_callback(bool is_open) {
-        if (is_leader_ && src_id_ != handler_->get_leader()) {
+    // Call only from receive side (otherwise data race on pipelined_).
+    void request_stop() {
+        if (pipelined_) {
+            // Don't stop yet, let pending response writes drain.
+            // (Can't stop right here even if we wanted to: another
+            //  thread may be calling stop() right now after failing to send resp.)
+            std::unique_lock<std::mutex> guard(pending_resps_lock_);
+            stop_after_sending_resps_ = true;
+            if (!writing_resp_ && pending_resps_.empty()) {
+                guard.unlock();
+                this->stop();
+                return;
+            }
+        } else {
+            this->stop();
+        }
+    }
+
+    void invoke_connection_callback(bool is_open, ptr<msg_handler> handler) {
+        if (is_leader_ && src_id_ != handler->get_leader()) {
             // Leader has been changed without closing session.
             is_leader_ = false;
         }
@@ -517,11 +552,11 @@ private:
                   cached_port_,
                   src_id_,
                   is_leader_ );
-        cb_func::Param cb_param( handler_->get_id(),
-                                 handler_->get_leader(),
+        cb_func::Param cb_param( handler->get_id(),
+                                 handler->get_leader(),
                                  -1,
                                  &args );
-        handler_->invoke_callback
+        handler->invoke_callback
             ( is_open ? cb_func::ConnectionOpened : cb_func::ConnectionClosed,
               &cb_param );
     }
@@ -551,7 +586,18 @@ private:
                   session_id_,
                   err.value(),
                   err.message().c_str() );
-            this->stop();
+            this->request_stop();
+        }
+    }
+
+    static void update_resp_with_async_result(resp_msg* resp,
+                                              cmd_result<ptr<buffer>, ptr<std::exception>>& res,
+                                              ptr<std::exception>& ) {
+        resp->set_ctx(res.get());
+        cmd_result_code code = res.get_result_code();
+        if (code != cmd_result_code::OK) {
+            resp->unaccept();
+            resp->set_result_code(code);
         }
     }
 
@@ -596,18 +642,26 @@ private:
                     impl_->get_options().corrupted_msg_handler_(header_, log_ctx);
                 }
 
-                this->stop();
+                this->request_stop();
                 return;
             }
         }
+
+        ptr<msg_handler> handler;
+        {
+            std::lock_guard<std::mutex> lock(handler_mutex_);
+            handler = handler_;
+        }
+        if (!handler)
+            return; // stop() was called
 
         if (src_id_ == -1) {
             // It means this is the first message on this session.
             // Invoke callback function of new connection.
             src_id_ = src;
-            invoke_connection_callback(true);
+            invoke_connection_callback(true, handler);
 
-        } else if (is_leader_ && src_id_ != handler_->get_leader()) {
+        } else if (is_leader_ && src_id_ != handler->get_leader()) {
             // Leader has been changed without closing session.
             is_leader_ = false;
         }
@@ -630,11 +684,11 @@ private:
                           cached_port_,
                           src_id_,
                           is_leader_ );
-                cb_func::Param cb_param( handler_->get_id(),
-                                         handler_->get_leader(),
+                cb_func::Param cb_param( handler->get_id(),
+                                         handler->get_leader(),
                                          -1,
                                          &args );
-                handler_->invoke_callback( cb_func::NewSessionFromLeader,
+                handler->invoke_callback( cb_func::NewSessionFromLeader,
                                            &cb_param );
             }
         }
@@ -678,7 +732,7 @@ private:
                         impl_->get_options().corrupted_msg_handler_(header_, log_ctx);
                     }
 
-                    this->stop();
+                    this->request_stop();
                     return;
                 }
                 ulong term = ss.get_u64();
@@ -698,7 +752,7 @@ private:
                         impl_->get_options().corrupted_msg_handler_(header_, log_ctx);
                     }
 
-                    this->stop();
+                    this->request_stop();
                     return;
                 }
 
@@ -720,7 +774,7 @@ private:
                             impl_->get_options().corrupted_msg_handler_(header_, log_ctx);
                         }
 
-                        this->stop();
+                        this->request_stop();
                         return;
                     }
                 }
@@ -736,20 +790,68 @@ private:
                impl_->get_options().invoke_req_cb_on_empty_meta_ ) ) {
             if ( !impl_->get_options().read_req_meta_
                   ( req_to_params(req.get(), nullptr), meta_str ) ) {
-                this->stop();
+                this->request_stop();
                 return;
             }
         }
 
         // === RAFT server processes the request here. ===
-        ptr<resp_msg> resp = raft_server_handler::process_req(handler_.get(), *req);
+        ptr<resp_msg> resp = raft_server_handler::process_req(handler.get(), *req);
         if (!resp) {
             p_wn("no response is returned from raft message handler");
-            this->stop();
+            this->request_stop();
             return;
         }
 
-        if (resp->has_async_cb()) {
+        if (!pipelined_ && (resp->has_async_cb() && impl_->get_options().streaming_mode_)) {
+            pipelined_ = true;
+        }
+
+        if (pipelined_) {
+            // Pipelined mode: queue the deferred response and immediately
+            // read the next request. The response will be sent when the
+            // async result is ready (e.g. for append_entries request we
+            // send response after log store fsync, which may take a while).
+
+            if (resp->has_cb())
+                resp = resp->call_cb(resp);
+
+            auto entry = cs_new<pending_resp_entry>();
+            entry->req = req;
+            entry->resp = resp;
+
+            {
+                std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                pending_resps_.push_back(entry);
+            }
+
+            if (resp->has_async_cb()) {
+                ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
+                ret->when_ready(
+                    [this, self, entry]
+                    ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
+                      ptr<std::exception>& exp ) {
+                        // Note: the async part of request processing currently has the power
+                        // to fail the request (by setting non-ok result code in `res`),
+                        // but can't change other fields of resp_msg, e.g. `next_idx`.
+                        // This is an unnecessary limitation, but it's ok for
+                        // the current user of this feature (parallel log appending
+                        // on follower).
+                        update_resp_with_async_result(entry->resp.get(), res, exp);
+                        entry->ready.store(true, std::memory_order_release);
+                        try_send_pending_resps(self);
+                        res.reset();
+                    }
+                );
+            } else {
+                entry->ready.store(true, std::memory_order_release);
+                try_send_pending_resps(self);
+            }
+
+            // Receive next message.
+            this->start(self);
+
+        } else if (resp->has_async_cb()) {
             // Response will be ready later, setup a callback function
             // (only for auto-forwarding with `client_request` type
             //  in async handling mode).
@@ -760,7 +862,7 @@ private:
                 [this, self, req, resp]
                 ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
                   ptr<std::exception>& exp ) {
-                    resp->set_ctx(res.get());
+                    update_resp_with_async_result(resp.get(), res, exp);
                     on_resp_ready(req, resp);
                     // This is needed to avoid circular reference.
                     res.reset();
@@ -781,14 +883,11 @@ private:
               "due to error: %s",
               this->session_id_,
               ex.what() );
-        this->stop();
+        this->request_stop();
        }
     }
 
-    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
-        ptr<rpc_session> self = this->shared_from_this();
-
-       try {
+    ptr<buffer> serialize_resp(ptr<req_msg>& req, ptr<resp_msg>& resp) {
         ptr<buffer> resp_ctx = resp->get_ctx();
         int32 resp_ctx_size = (resp_ctx) ? resp_ctx->size() : 0;
         int32 result_code_size = sizeof(int32_t);
@@ -872,6 +971,15 @@ private:
             bs.put_i32(resp->get_result_code());
         }
 
+        return resp_buf;
+    }
+
+    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
+        ptr<rpc_session> self = this->shared_from_this();
+
+       try {
+        ptr<buffer> resp_buf = serialize_resp(req, resp);
+
         aa::write( ssl_enabled_, ssl_socket_, socket_,
                    asio::buffer(resp_buf->data_begin(), resp_buf->size()),
                    [this, self, resp_buf]
@@ -886,12 +994,74 @@ private:
                       "to error %d",
                       session_id_,
                       err_code.value() );
-                this->stop();
+                this->request_stop();
             }
         } );
 
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to process request message "
+              "due to error: %s",
+              this->session_id_,
+              ex.what() );
+        this->request_stop();
+       }
+    }
+
+    // --- Pipelined response support (streaming mode) ---
+
+    struct pending_resp_entry {
+        ptr<req_msg> req;
+        ptr<resp_msg> resp;
+        std::atomic<bool> ready{false};
+    };
+
+    void try_send_pending_resps(ptr<rpc_session> self) {
+        ptr<pending_resp_entry> entry;
+        {
+            std::unique_lock<std::mutex> guard(pending_resps_lock_);
+            if (writing_resp_) return;
+            if (pending_resps_.empty() ||
+                !pending_resps_.front()->ready.load(
+                    std::memory_order_acquire))
+            {
+                if (stop_after_sending_resps_ && pending_resps_.empty()) {
+                    guard.unlock();
+                    this->stop();
+                }
+                return;
+            }
+            writing_resp_ = true;
+            entry = pending_resps_.front();
+            pending_resps_.pop_front();
+        }
+
+       try {
+        ptr<buffer> resp_buf = serialize_resp(entry->req, entry->resp);
+
+        aa::write( ssl_enabled_, ssl_socket_, socket_,
+                   asio::buffer(resp_buf->data_begin(), resp_buf->size()),
+                   [this, self, resp_buf]
+                   (ERROR_CODE err_code, size_t) -> void
+        {
+            (void)resp_buf;
+            if (!err_code) {
+                {
+                    std::lock_guard<std::mutex> guard(pending_resps_lock_);
+                    writing_resp_ = false;
+                }
+                try_send_pending_resps(self);
+            } else {
+                p_er( "session %" PRIu64 " failed to send pipelined response "
+                      "to peer due to error %d",
+                      session_id_,
+                      err_code.value() );
+
+                this->stop();
+            }
+        } );
+
+       } catch (std::exception& ex) {
+        p_er( "session %" PRIu64 " failed to send pipelined response "
               "due to error: %s",
               this->session_id_,
               ex.what() );
@@ -938,6 +1108,46 @@ private:
      * CRC number from the request header.
      */
     uint32_t crc_from_msg_;
+
+    // --- Pipelined response state (streaming mode) ---
+
+    /**
+     * Queue of pending responses waiting to be sent.
+     * In pipelined mode, responses are sent in FIFO order;
+     * async responses wait until their result is ready.
+     */
+    std::deque<ptr<pending_resp_entry>> pending_resps_;
+
+    /**
+     * Lock protecting `pending_resps_`, `writing_resp_`, and `read_failed_`.
+     */
+    std::mutex pending_resps_lock_;
+
+    std::mutex stop_mutex_;
+    std::mutex handler_mutex_;
+
+    /**
+     * True while an async write of a pipelined response is in progress.
+     */
+    bool writing_resp_{false};
+
+    /**
+     * True once we have entered pipelined mode on this session
+     * (first async_cb response seen in streaming mode).
+     * In this state, there are two "threads" operating on this rpc_session:
+     *  * receive side: start <-> read_complete async loop,
+     *  * send side: try_send_pending_resps async loop.
+     * Be careful about thread safety, don't access the same fields
+     * from two sides without synchronization. Most fields belong exclusively
+     * to the send side, and the rest are protected by pending_resps_lock_.
+     * Only the send side can call stop(); receive side should call request_stop() instead.
+     */
+    bool pipelined_{false};
+
+    /**
+     * True if we should close the connection after pending_resps_ is drained.
+     */
+    bool stop_after_sending_resps_{false};
 };
 
 // rpc listener implementation
@@ -1389,10 +1599,10 @@ public:
 
         for (auto& entry: req->log_entries()) {
             ptr<log_entry>& le = entry;
-            auto& le_buf = le->get_buf();
             ptr<buffer> entry_buf = buffer::alloc
                                     ( LOG_ENTRY_SIZE + le->get_buf().size() );
 #if 0
+            auto& le_buf = le->get_buf();
             entry_buf->put( le->get_term() );
             entry_buf->put( (byte)le->get_val_type() );
             entry_buf->put( (int32)le_buf.size() );

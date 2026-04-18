@@ -678,6 +678,21 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     return req;
 }
 
+// Whether handle_append_entries should return a future that later
+// gets notified by notify_log_append_completion when log entries become durable.
+// This allows the leader to send multiple append_entries messages without waiting
+// for responses.
+// Only makes sense when parallel_log_appending_ and max_log_gap_in_stream_ are both enabled;
+// otherwise either the log store or the asio handler would wait for durability anyway.
+static bool should_use_async_log_appending(const raft_params& params) {
+    // Note: the max_log_gap_in_stream_ check is just a heuristic;
+    // we're interested in the max_log_gap_in_stream_ *on the leader node*,
+    // not on this node. But typically parameters are the same on all nodes
+    // in practice, so this is ok.
+    // This function's return value doesn't affect correctness either way.
+    return params.parallel_log_appending_ && params.max_log_gap_in_stream_ > 0;
+}
+
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     bool supp_exp_warning = false;
@@ -869,6 +884,9 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     // Reset timer.
     last_rcvd_append_entries_req_.reset();
 
+    ptr<raft_params> params = ctx_->get_params();
+    bool async_log_appending = should_use_async_log_appending(*params);
+
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
 
@@ -917,6 +935,20 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                   req.log_entries().size(),
                   cnt );
             rollback_in_progress = true;
+
+            // Fail any pending async append_entries requests: and entries they refer to
+            // are likely being rolled back, and leader term has changed.
+            if (!pending_follower_resps_.empty()) {
+                p_in( "rollback: discarding %zu pending pipelined responses",
+                      pending_follower_resps_.size() );
+                for (pending_follower_resp& resp: pending_follower_resps_) {
+                    ptr<buffer> empty_buf;
+                    ptr<std::exception> no_err;
+                    resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                }
+                pending_follower_resps_.clear();
+            }
+
             // If rollback point is smaller than commit index,
             // should rollback commit index as well
             // (should not happen in Raft though).
@@ -1024,25 +1056,62 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         log_store_->end_of_append_batch( req.get_last_log_idx() + 1,
                                          req.log_entries().size() );
 
-        ptr<raft_params> params = ctx_->get_params();
         if (params->parallel_log_appending_) {
             uint64_t last_durable_index = log_store_->last_durable_index();
-            while ( last_durable_index <
-                    req.get_last_log_idx() + req.log_entries().size() ) {
-                if (stopping_) return resp;
+            ulong required_durable =
+                req.get_last_log_idx() + req.log_entries().size();
 
-                // Some logs are not durable yet, wait here and block the thread.
-                p_ts( "durable index %" PRIu64
-                      ", sleep and wait for log appending completion",
-                      last_durable_index );
-                ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
+            if (last_durable_index < required_durable) {
+                if (async_log_appending) {
+                    // Pipelined mode (streaming + parallel log appending):
+                    // defer the response until entries become durable.
+                    // Unblock this thread to allow processing more appends
+                    // while waiting for durability (typically fsync, slow).
+                    // `notify_log_append_completion` will fulfill the promise.
+                    p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                          ", deferring response (pipelined)",
+                          last_durable_index, required_durable );
+                    auto promise = cs_new<cmd_result<ptr<buffer>>>();
+                    pending_follower_resps_.push_back(
+                        {required_durable, req.log_entries().back()->get_term(), promise});
+                    resp->set_async_cb([promise]() { return promise; });
 
-                // --- `notify_log_append_completion` API will wake it up. ---
+                } else {
+                    while ( last_durable_index < required_durable ) {
+                        if (stopping_) return resp;
 
-                ea_follower_log_append_->reset();
-                last_durable_index = log_store_->last_durable_index();
-                p_tr( "wake up, durable index %" PRIu64, last_durable_index );
+                        // Some logs are not durable yet, wait here and block the thread.
+                        p_ts( "durable index %" PRIu64
+                            ", sleep and wait for log appending completion",
+                            last_durable_index );
+                        ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
+
+                        // --- `notify_log_append_completion` API will wake it up. ---
+
+                        ea_follower_log_append_->reset();
+                        last_durable_index = log_store_->last_durable_index();
+                        p_tr( "wake up, durable index %" PRIu64, last_durable_index );
+                    }
+                }
             }
+        }
+    } else if (async_log_appending) {
+        // Previous handle_append_entries calls may have appended some
+        // log entries without waiting for durability.
+        // We should wait for those entries to become durable before
+        // sending response with `next_log_idx = target_precommit_index + 1`,
+        // even if this request had no new entries.
+        uint64_t last_durable_index = log_store_->last_durable_index();
+        ulong required_durable =
+            req.get_last_log_idx() + req.log_entries().size();
+        if (last_durable_index < required_durable) {
+            p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                    ", deferring response (pipelined)",
+                    last_durable_index, required_durable );
+            auto promise = cs_new<cmd_result<ptr<buffer>>>();
+            pending_follower_resps_.push_back(
+                {required_durable, /*last_entry_term=*/ 0, promise});
+            resp->set_async_cb([promise]() { return promise; });
         }
     }
 
@@ -1551,7 +1620,21 @@ ulong raft_server::get_expected_committed_log_idx() {
 }
 
 void raft_server::notify_log_append_completion(bool ok) {
-    if (stopping_) return;
+    if (stopping_) {
+        recur_lock(lock_);
+        // Send errors for pending async append_entries requests.
+        if (!pending_follower_resps_.empty()) {
+            p_in( "discarding %zu pending pipelined responses",
+                  pending_follower_resps_.size() );
+            for (pending_follower_resp& resp: pending_follower_resps_) {
+                ptr<buffer> empty_buf;
+                ptr<std::exception> no_err;
+                resp.promise->set_result(empty_buf, no_err, cmd_result_code::CANCELLED);
+            }
+            pending_follower_resps_.clear();
+        }
+        return;
+    }
 
     if (!ok) {
         // If log appending fails for follower, there is no way to proceed it.
@@ -1575,9 +1658,43 @@ void raft_server::notify_log_append_completion(bool ok) {
             request_append_entries_for_all();
         }
     } else {
+        ptr<raft_params> params = ctx_->get_params();
+        if (should_use_async_log_appending(*params)) {
+            // Follower: send responses for async append_entries
+            // requests whose entries became durable.
+            recur_lock(lock_);
+            if (!pending_follower_resps_.empty()) {
+                uint64_t durable_idx = log_store_->last_durable_index();
+                ptr<buffer> empty_buf;
+                ptr<std::exception> no_err;
+                while ( !pending_follower_resps_.empty() &&
+                        pending_follower_resps_.front().last_entry_idx <= durable_idx ) {
+                    pending_follower_resp& entry = pending_follower_resps_.front();
 
-        // Follower: wake up the waiting thread.
-        ea_follower_log_append_->invoke();
+                    // Redundant check that the entries that became durable are the ones we wrote.
+                    ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);
+                    if (entry.last_entry_term == 0 || term_in_log_store == entry.last_entry_term) {
+                        entry.promise->set_result(empty_buf, no_err, cmd_result_code::OK);
+                    } else {
+                        // This should be impossible because we clear pending_follower_resps_
+                        // when doing log_store_ rollback.
+                        p_er( "term mismatch in async append_entries: "
+                              "appended entry with idx %" PRIu64 " "
+                              "term %" PRIu64 ", durable entry has "
+                              "term %" PRIu64,
+                              entry.last_entry_idx,
+                              entry.last_entry_term,
+                              term_in_log_store);
+                        entry.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                    }
+                    pending_follower_resps_.pop_front();
+                }
+            }
+        } else {
+            assert(pending_follower_resps_.empty());
+            // Follower: wake up the waiting thread.
+            ea_follower_log_append_->invoke();
+        }
     }
 }
 
