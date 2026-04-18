@@ -169,6 +169,7 @@ asio_service::meta_cb_params req_to_params(req_msg* req, resp_msg* resp) {
 
 // === ASIO Abstraction ===
 //     (to switch SSL <-> unsecure on-the-fly)
+
 struct pending_req_pkg {
     pending_req_pkg(ptr<req_msg>& req,
                     rpc_handler& when_done,
@@ -2206,6 +2207,11 @@ private:
         if (popped) {
             // Call the callback only if we found this request in pending_read_reqs_.
             // Otherwise the callback was already called by close_socket.
+            // Note: a concurrent close_socket call may be calling other requests'
+            // when_done callbacks in parallel with this call. Similarly,
+            // multiple close_socket calls may happen in parallel and call
+            // callbacks in parallel. This is not a nice behavior from rpc_client,
+            // but current callers are ok with it.
             ptr<rpc_exception> except;
             when_done(rsp, except);
         }
