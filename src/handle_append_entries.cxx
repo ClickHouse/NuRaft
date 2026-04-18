@@ -684,6 +684,11 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
 // Only makes sense when parallel_log_appending_ and max_log_gap_in_stream_ are both enabled;
 // otherwise either the log store or the asio handler would wait for durability anyway.
 static bool should_use_async_log_appending(const raft_params& params) {
+    // Note: the max_log_gap_in_stream_ check is just a heuristic;
+    // we're interested in the max_log_gap_in_stream_ *on the leader node*,
+    // not on this node. But typically parameters are the same on all nodes
+    // in practice, so this is ok.
+    // This function's return value doesn't affect correctness either way.
     return params.parallel_log_appending_ && params.max_log_gap_in_stream_ > 0;
 }
 
@@ -1646,11 +1651,9 @@ void raft_server::notify_log_append_completion(bool ok) {
                 uint64_t durable_idx = log_store_->last_durable_index();
                 ptr<buffer> empty_buf;
                 ptr<std::exception> no_err;
-                while ( !pending_follower_resps_.empty() ) {
+                while ( !pending_follower_resps_.empty() &&
+                        pending_follower_resps_.front().last_entry_idx <= durable_idx ) {
                     pending_follower_resp& entry = pending_follower_resps_.front();
-                    if (entry.last_entry_idx > durable_idx) {
-                        break;
-                    }
 
                     // Redundant check that the entries that became durable are the ones we wrote.
                     ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);

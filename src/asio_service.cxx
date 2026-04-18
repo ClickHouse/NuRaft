@@ -522,16 +522,18 @@ public:
     }
 
 private:
-    // Call only from send side (otherwise data race on pipelined_).
+    // Call only from receive side (otherwise data race on pipelined_).
     void request_stop() {
         if (pipelined_) {
             // Don't stop yet, let pending response writes drain.
             // (Can't stop right here even if we wanted to: another
             //  thread may be calling stop() right now after failing to send resp.)
-            std::lock_guard<std::mutex> guard(pending_resps_lock_);
+            std::unique_lock<std::mutex> guard(pending_resps_lock_);
             stop_after_sending_resps_ = true;
             if (!writing_resp_ && pending_resps_.empty()) {
+                guard.unlock();
                 this->stop();
+                return;
             }
         } else {
             this->stop();
@@ -1016,13 +1018,14 @@ private:
     void try_send_pending_resps(ptr<rpc_session> self) {
         ptr<pending_resp_entry> entry;
         {
-            std::lock_guard<std::mutex> guard(pending_resps_lock_);
+            std::unique_lock<std::mutex> guard(pending_resps_lock_);
             if (writing_resp_) return;
             if (pending_resps_.empty() ||
                 !pending_resps_.front()->ready.load(
                     std::memory_order_acquire))
             {
                 if (stop_after_sending_resps_ && pending_resps_.empty()) {
+                    guard.unlock();
                     this->stop();
                 }
                 return;
