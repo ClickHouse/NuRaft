@@ -1751,7 +1751,7 @@ private:
         //
         // The two queues may have an overlap of one element,
         // if post_send added the request to pending_read_reqs_
-        // but didn't remove it from pending_write_reqs_lock_ yet.
+        // but didn't remove it from pending_write_reqs_ yet.
         // Detect that with last_cancelled_read_req.
         ptr<req_msg> last_cancelled_read_req = cancel_pending_requests(pending_read_reqs_, pending_read_reqs_lock_, err_msg, nullptr);
         cancel_pending_requests(pending_write_reqs_, pending_write_reqs_lock_, err_msg, last_cancelled_read_req);
@@ -2029,7 +2029,10 @@ private:
             // the "always invoke" flag is set, invoke it.
             bool meta_ok = handle_custom_resp_meta
                            ( req, rsp, when_done, std::string() );
-            if (!meta_ok) return;
+            if (!meta_ok) {
+                receive_timer_.cancel();
+                return;
+            }
         }
 
         if (flags & MARK_DOWN) {
@@ -2063,6 +2066,17 @@ private:
                   std::error_code err,
                   size_t bytes_transferred)
     {
+        if (err) {
+            receive_timer_.cancel();
+            std::string err_msg = sstrfmt( "failed to read response context "
+                                           "from peer %d, %s:%s, error %d, %s" )
+                                           .fmt( req->get_dst(), host_.c_str(),
+                                                 port_.c_str(), err.value(),
+                                                 err.message().c_str() );
+            handle_error(req, err_msg, when_done);
+            return;
+        }
+
         if ( !(flags & INCLUDE_META) &&
              !(flags & INCLUDE_HINT) &&
 	     !(flags & INCLUDE_RESULT_CODE)) {
@@ -2094,7 +2108,10 @@ private:
                                ( req, rsp, when_done,
                                  std::string( (const char*)resp_meta_raw,
                                               resp_meta_len) );
-                if (!meta_ok) return;
+                if (!meta_ok) {
+                    receive_timer_.cancel();
+                    return;
+                }
             }
             remaining_len -= sizeof(int32) + resp_meta_len;
         }
