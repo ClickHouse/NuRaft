@@ -140,9 +140,12 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         return resp;
     }
 
-    if (ext_params.expected_term_) {
+    ulong expected_term = ext_params.expected_term_
+                          ? ext_params.expected_term_
+                          : req.get_term();
+    if (expected_term) {
         // If expected term is given, check the current term.
-        if (ext_params.expected_term_ != cur_term) {
+        if (expected_term != cur_term) {
             resp->set_result_code( cmd_result_code::TERM_MISMATCH );
             return resp;
         }
