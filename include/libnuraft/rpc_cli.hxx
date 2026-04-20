@@ -47,6 +47,11 @@ public:
     virtual uint64_t get_id() const = 0;
 
     virtual bool is_abandoned() const = 0;
+
+    // If true, `send` may be called again before the previous send's
+    // handler has fired. In the main asio implementation, this
+    // corresponds to asio_service_options::streaming_mode_.
+    virtual bool supports_pipelining() const { return false; }
 };
 
 }

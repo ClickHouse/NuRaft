@@ -1162,6 +1162,10 @@ public:
         return abandoned_;
     }
 
+    bool supports_pipelining() const override {
+        return impl_->get_options().streaming_mode_;
+    }
+
 #ifndef SSL_LIBRARY_NOT_FOUND
     bool verify_certificate(bool preverified,
                             asio::ssl::verify_context& ctx)
