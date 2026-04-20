@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "raft_server.hxx"
 
+#include "client_req_stream.hxx"
 #include "cluster_config.hxx"
 #include "context.hxx"
 #include "event_awaiter.hxx"
@@ -95,7 +96,7 @@ ptr< cmd_result< ptr<buffer> > > raft_server::append_entries_ext
     }
 
     ptr<req_msg> req = cs_new<req_msg>
-                       ( (ulong)0, msg_type::client_request, 0, 0,
+                       ( ext_params.expected_term_, msg_type::client_request, 0, 0,
                          (ulong)0, (ulong)0, (ulong)0 ) ;
     for (auto it = logs.begin(); it != logs.end(); ++it) {
         ptr<buffer> buf = *it;
@@ -435,6 +436,40 @@ void raft_server::cleanup_auto_fwd_pkgs() {
         pkg->rpc_client_in_use_.clear();
     }
     auto_fwd_pkgs_.clear();
+}
+
+ptr<client_req_stream> raft_server::open_client_req_stream(
+    uint64_t send_timeout_ms)
+{
+    int32 leader = leader_;
+    if (leader == -1) {
+        p_in("open_client_req_stream: no current leader");
+        return nullptr;
+    }
+
+    ulong term = state_->get_term();
+    if (term == 0) {
+        p_wn("open_client_req_stream: term is 0; cluster not yet "
+             "initialized");
+        return nullptr;
+    }
+
+    ptr<cluster_config> c_conf = get_config();
+    ptr<srv_config> srv_cfg = c_conf->get_server(leader);
+    if (!srv_cfg) {
+        p_wn("open_client_req_stream: leader %d not in cluster config", leader);
+        return nullptr;
+    }
+
+    ptr<rpc_client> rpc =
+        ctx_->rpc_cli_factory_->create_client(srv_cfg->get_endpoint());
+    if (!rpc) {
+        p_wn("open_client_req_stream: rpc_client creation failed for %s",
+             srv_cfg->get_endpoint().c_str());
+        return nullptr;
+    }
+
+    return cs_new<client_req_stream>(*this, term, rpc, send_timeout_ms);
 }
 
 } // namespace nuraft;

@@ -309,6 +309,7 @@ set(RAFT_CORE
     ${ASIO_SERVICE_SRC}
     ${ROOT_SRC}/buffer.cxx
     ${ROOT_SRC}/buffer_serializer.cxx
+    ${ROOT_SRC}/client_req_stream.cxx
     ${ROOT_SRC}/cluster_config.cxx
     ${ROOT_SRC}/crc32.cxx
     ${ROOT_SRC}/error_code.cxx
