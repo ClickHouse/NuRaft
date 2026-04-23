@@ -1260,32 +1260,60 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     } else {
         std::lock_guard<std::mutex> guard(p->get_lock());
         ulong prev_next_log = p->get_next_log_idx();
-        if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
-            // fast move for the peer to catch up
-            p->set_next_log_idx(resp.get_next_idx());
-        } else {
-            bool do_log_rewind = true;
-            // If not, check an extra order exists.
-            if (resp.get_ctx()) {
-                ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
-                if (appendix->extra_order_ == resp_appendix::DO_NOT_REWIND) {
-                    do_log_rewind = false;
-                } else if (appendix->extra_order_ == resp_appendix::RECEIVING_SNAPSHOT) {
-                    p->set_snapshot_sync_is_needed(true);
-                    p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
-                         p->get_id());
-                }
 
-                static timer_helper extra_order_timer(1000 * 1000, true);
-                int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
-                p_lv(log_lv, "received extra order: %s",
-                     resp_appendix::extra_order_msg(appendix->extra_order_));
+        // When the follower rejects, honour its `NextIndex` hint in every
+        // direction (which is the follower's own `log_store_->next_slot()`):
+        //
+        //   * hint < prev_next_log : classic backward fast-jump. This used to
+        //       be the only case handled.
+        //   * hint == prev_next_log : stale probe response that arrived after
+        //       `handle_install_snapshot_resp` had already advanced
+        //       `next_log_idx` to `snap_last_log_idx + 1`. Setting to the
+        //       same value is a no-op, which is what we want: the previous
+        //       strict `>` comparison would fall through to the one-at-a-time
+        //       decrement below, produce a long backward walk into indices
+        //       the follower no longer has (leading to "bad log_idx for
+        //       retrieving the term value" rejections on every probe), and
+        //       only recover when a periodic snapshot-sync retry eventually
+        //       re-aligns the cursor. Observed in production as multi-minute
+        //       stalls on heavy-write clusters whenever a peer rejoins with
+        //       a log gap large enough to require `install_snapshot`.
+        //   * hint > prev_next_log : follower jumped ahead of our tracker
+        //       (for instance after an external snapshot install). Follow
+        //       the hint forward rather than decrementing below it.
+        //
+        // The `DO_NOT_REWIND` / `RECEIVING_SNAPSHOT` extra-order escape
+        // hatches keep their existing meaning: the follower has asked us
+        // not to touch `next_log_idx` (DO_NOT_REWIND) or has told us it is
+        // currently receiving a snapshot so the position will be refreshed
+        // by `handle_install_snapshot_resp` instead (RECEIVING_SNAPSHOT).
+        bool do_update_next_log_idx = true;
+        bool do_log_rewind = true;
+        if (resp.get_ctx()) {
+            ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
+            if (appendix->extra_order_ == resp_appendix::DO_NOT_REWIND) {
+                do_update_next_log_idx = false;
+                do_log_rewind = false;
+            } else if (appendix->extra_order_ == resp_appendix::RECEIVING_SNAPSHOT) {
+                p->set_snapshot_sync_is_needed(true);
+                p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
+                     p->get_id());
+                do_update_next_log_idx = false;
             }
-            // if not, move one log backward.
+
+            static timer_helper extra_order_timer(1000 * 1000, true);
+            int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
+            p_lv(log_lv, "received extra order: %s",
+                 resp_appendix::extra_order_msg(appendix->extra_order_));
+        }
+
+        if (do_update_next_log_idx && resp.get_next_idx() > 0) {
+            // Trust the follower's `NextIndex` hint unconditionally.
+            p->set_next_log_idx(resp.get_next_idx());
+        } else if (do_log_rewind && prev_next_log) {
+            // No usable hint: decrement by one as the legacy fallback.
             // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
-            if (do_log_rewind && prev_next_log) {
-                p->set_next_log_idx(prev_next_log - 1);
-            }
+            p->set_next_log_idx(prev_next_log - 1);
         }
         bool suppress = p->need_to_suppress_error();
 
