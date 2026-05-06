@@ -44,6 +44,7 @@ namespace nuraft {
 
 using CbReturnCode = cb_func::ReturnCode;
 
+class client_req_stream;
 class cluster_config;
 class custom_notification_msg;
 class delayed_task_scheduler;
@@ -359,6 +360,25 @@ public:
     ptr< cmd_result< ptr<buffer> > >
         append_entries_ext(const std::vector< ptr<buffer> >& logs,
                            const req_ext_params& ext_params);
+
+    /**
+     * Open a pipelined forwarding stream to the current leader. See
+     * `client_req_stream.hxx` for the full contract.
+     *
+     * Returns nullptr if no leader is known, the local term is 0,
+     * or the `rpc_client` could not be created. Failure causes are
+     * logged. Caller owns retry and backoff:
+     *
+     *     ptr<client_req_stream> stream;
+     *     while (!(stream = server->open_client_req_stream(timeout_ms))) {
+     *         if (my_shutdown_requested) return;
+     *         std::this_thread::sleep_for(retry_backoff);
+     *     }
+     *
+     * Lifetime: the returned stream must not outlive this raft_server.
+     */
+    ptr<client_req_stream>
+        open_client_req_stream(uint64_t send_timeout_ms);
 
     enum class PrioritySetResult { SET, BROADCAST, IGNORED };
 
@@ -1126,7 +1146,7 @@ protected:
     virtual void commit_in_bg();
     bool commit_in_bg_exec(size_t timeout_ms = 0, bool initial_commit_exec = false);
 
-    void append_entries_in_bg();
+    virtual void append_entries_in_bg();
     void append_entries_in_bg_exec();
 
     void commit_app_log(ulong idx_to_commit,

@@ -140,9 +140,14 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         return resp;
     }
 
-    if (ext_params.expected_term_) {
-        // If expected term is given, check the current term.
-        if (ext_params.expected_term_ != cur_term) {
+    ulong expected_term = ext_params.expected_term_
+                          ? ext_params.expected_term_
+                          : req.get_term();
+    if (expected_term) {
+        // Optional term fence. A non-zero req.term (stamped by client_req_stream)
+        // makes the leader reject after any term change — preventing reordering
+        // of a stream's requests across a re-election. Regular callers pass 0.
+        if (expected_term != cur_term) {
             resp->set_result_code( cmd_result_code::TERM_MISMATCH );
             return resp;
         }

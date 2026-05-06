@@ -26,6 +26,7 @@ limitations under the License.
 #include "buffer.hxx"
 #include "buffer_serializer.hxx"
 #include "callback.hxx"
+#include "client_req_stream.hxx"
 #include "cluster_config.hxx"
 #include "context.hxx"
 #include "delayed_task_scheduler.hxx"
