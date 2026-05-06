@@ -1361,7 +1361,7 @@ public:
         }
 
         // Socket should be idle now. If not, it should be a bug.
-        set_busy_flag(/*receive=*/ false, true);
+        set_busy_flag(/*receive=*/ false, /*busy=*/ true);
 
         ptr<asio_rpc_client> self = this->shared_from_this();
         if (!socket().is_open()) {
@@ -1473,16 +1473,16 @@ private:
         } );
     }
 
-    void set_busy_flag(bool receive, bool to) {
+    void set_busy_flag(bool receive, bool busy) {
         bool& flag = receive ? receive_busy_ : send_busy_;
-        if (flag == to) {
+        if (flag == busy) {
             p_ft("socket %p %s side is already %s, race "
                  "happened on connection to %s:%s",
                  this, receive ? "receive" : "send",
-                 to ? "in use" : "idle", host_.c_str(), port_.c_str());
+                 busy ? "in use" : "idle", host_.c_str(), port_.c_str());
             assert(0);
         }
-        flag = to;
+        flag = busy;
     }
 
     void handle_error(ptr<req_msg> req,
@@ -1535,7 +1535,6 @@ private:
 
         // Clear write queue and read queue here
         // from oldest to latest, read queue first.
-        //
         // The two queues may have an overlap of one element,
         // if post_send added the request to pending_read_reqs_
         // but didn't remove it from pending_write_reqs_ yet.
@@ -1583,7 +1582,7 @@ private:
         if (socket().is_open()) {
             p_wn("cancelling operations due to socket (%s:%s) timeout",
                 host_.c_str(), port_.c_str());
-            // This should make all current socket operations to quickly
+            // This should make all current socket operations quickly
             // complete with an error.
             socket_.cancel();
         }
@@ -1615,11 +1614,12 @@ private:
 #endif
             } else {
                 send_timer_.cancel();
-                set_busy_flag(/*receive=*/ false, false);
+                set_busy_flag(/*receive=*/ false, /*busy=*/ false);
                 this->register_req_send(req, when_done, send_timeout_ms);
             }
 
         } else {
+            send_timer_.cancel();
             std::string err_msg = sstrfmt("failed to connect to "
                                           "peer %d, %s:%s, error %d, %s")
                                           .fmt( req->get_dst(), host_.c_str(),
@@ -1640,7 +1640,7 @@ private:
         if (!err) {
             p_in( "handshake with %s:%s succeeded (as a client)",
                   host_.c_str(), port_.c_str() );
-            set_busy_flag(/*receive=*/ false, false);
+            set_busy_flag(/*receive=*/ false, /*busy=*/ false);
             this->register_req_send(req, when_done, send_timeout_ms);
 
         } else {
@@ -1669,7 +1669,7 @@ private:
         (void)buf;
         send_timer_.cancel();
         if (!err) {
-            set_busy_flag(/*receive=*/ false, false);
+            set_busy_flag(/*receive=*/ false, /*busy=*/ false);
             uint64_t receive_timeout_ms = send_timeout_ms;
             if (impl_->get_options().streaming_mode_) {
                 post_send(req, when_done, receive_timeout_ms);
@@ -1712,10 +1712,10 @@ private:
             // NOTE:
             //   The queue can be empty even though there was no `pop_front`,
             //   due to `close_socket()` when connection is suddenly closed.
-            if (pending_write_reqs_.size()) {
+            if (!pending_write_reqs_.empty()) {
                 pending_write_reqs_.pop_front();
             }
-            if (pending_write_reqs_.size() > 0) {
+            if (!pending_write_reqs_.empty()) {
                 next_req_pkg = *pending_write_reqs_.begin();
                 p_db("trigger next write, start_log_idx: %" PRIu64 ", "
                      "pending write reqs: %" PRIu64 "",
@@ -1736,7 +1736,7 @@ private:
                               uint64_t receive_timeout_ms )
     {
         ptr<asio_rpc_client> self(this->shared_from_this());
-        set_busy_flag(/*receive=*/ true, true);
+        set_busy_flag(/*receive=*/ true, /*busy=*/ true);
         if (receive_timeout_ms != 0) {
             receive_timer_.expires_after
             ( std::chrono::duration_cast<std::chrono::nanoseconds>
@@ -1959,7 +1959,7 @@ private:
 
     void post_read([[maybe_unused]] ptr<req_msg>& req, ptr<resp_msg>& rsp, rpc_handler& when_done) {
         receive_timer_.cancel();
-        set_busy_flag(/*receive=*/ true, false);
+        set_busy_flag(/*receive=*/ true, /*busy=*/ false);
 
         if (!impl_->get_options().streaming_mode_) {
             ptr<rpc_exception> except;
@@ -1980,7 +1980,7 @@ private:
                 pending_read_reqs_.pop_front();
                 popped = true;
 
-                if (pending_read_reqs_.size() > 0) {
+                if (!pending_read_reqs_.empty()) {
                     next_req_pkg = *pending_read_reqs_.begin();
                     p_db("trigger next read, start_log_idx: %" PRIu64 ", "
                         "pending read reqs: %" PRIu64 "",
