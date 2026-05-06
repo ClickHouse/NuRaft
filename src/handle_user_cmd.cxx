@@ -443,13 +443,13 @@ ptr<client_req_stream> raft_server::open_client_req_stream(
 {
     int32 leader = leader_;
     if (leader == -1) {
-        p_in("open_client_req_stream: no current leader");
+        p_tr("open_client_req_stream: no current leader");
         return nullptr;
     }
 
     ulong term = state_->get_term();
     if (term == 0) {
-        p_wn("open_client_req_stream: term is 0; cluster not yet "
+        p_tr("open_client_req_stream: term is 0; cluster not yet "
              "initialized");
         return nullptr;
     }
