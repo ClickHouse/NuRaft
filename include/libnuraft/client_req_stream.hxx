@@ -75,15 +75,11 @@ public:
      *    outcome (transport error, TERM_MISMATCH, etc.);
      *  - proactive term check — this node's current term differs
      *    from `stream_term_`, a cheap atomic read.
-     *
-     * Once true, subsequent `append` calls return a pre-resolved
-     * FAILED cmd_result; caller should close this stream and open a
-     * new one.
      */
     bool is_abandoned() const;
 
     /**
-     * If transport doesn't supports pipelining
+     * If transport supports pipelining
      * (asio_service_options::streaming_mode_ == true),
      * this is always true.
      * Otherwise this returns false if there's a request in progress.
