@@ -1031,7 +1031,7 @@ private:
                 return;
             }
             writing_resp_ = true;
-            entry = pending_resps_.front();
+            entry = std::move(pending_resps_.front());
             pending_resps_.pop_front();
         }
 
@@ -1119,7 +1119,7 @@ private:
     std::deque<ptr<pending_resp_entry>> pending_resps_;
 
     /**
-     * Lock protecting `pending_resps_`, `writing_resp_`, and `read_failed_`.
+     * Lock protecting `pending_resps_`, `writing_resp_`, and `stop_after_sending_resps_`.
      */
     std::mutex pending_resps_lock_;
 

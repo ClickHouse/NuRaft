@@ -935,7 +935,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                   cnt );
             rollback_in_progress = true;
 
-            // Fail any pending async append_entries requests: and entries they refer to
+            // Fail any pending async append_entries requests: any entries they refer to
             // are likely being rolled back, and leader term has changed.
             if (!pending_follower_resps_.empty()) {
                 p_in( "rollback: discarding %zu pending pipelined responses",
@@ -1646,33 +1646,40 @@ void raft_server::notify_log_append_completion(bool ok) {
         if (should_use_async_log_appending(*params)) {
             // Follower: send responses for async append_entries
             // requests whose entries became durable.
-            recur_lock(lock_);
-            if (!pending_follower_resps_.empty()) {
-                uint64_t durable_idx = log_store_->last_durable_index();
-                ptr<buffer> empty_buf;
-                ptr<std::exception> no_err;
-                while ( !pending_follower_resps_.empty() &&
-                        pending_follower_resps_.front().last_entry_idx <= durable_idx ) {
-                    pending_follower_resp& entry = pending_follower_resps_.front();
+            std::vector<std::pair<ptr<cmd_result<ptr<buffer>>>, cmd_result_code>> resps;
+            {
+                recur_lock(lock_);
+                if (!pending_follower_resps_.empty()) {
+                    uint64_t durable_idx = log_store_->last_durable_index();
+                    while ( !pending_follower_resps_.empty() &&
+                            pending_follower_resps_.front().last_entry_idx <= durable_idx ) {
+                        pending_follower_resp& entry = pending_follower_resps_.front();
 
-                    // Redundant check that the entries that became durable are the ones we wrote.
-                    ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);
-                    if (entry.last_entry_term == 0 || term_in_log_store == entry.last_entry_term) {
-                        entry.promise->set_result(empty_buf, no_err, cmd_result_code::OK);
-                    } else {
-                        // This should be impossible because we clear pending_follower_resps_
-                        // when doing log_store_ rollback.
-                        p_er( "term mismatch in async append_entries: "
-                              "appended entry with idx %" PRIu64 " "
-                              "term %" PRIu64 ", durable entry has "
-                              "term %" PRIu64,
-                              entry.last_entry_idx,
-                              entry.last_entry_term,
-                              term_in_log_store);
-                        entry.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                        // Redundant check that the entries that became durable are the ones we wrote.
+                        ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);
+                        if (entry.last_entry_term == 0 || term_in_log_store == entry.last_entry_term) {
+                            resps.emplace_back(std::move(entry.promise), cmd_result_code::OK);
+                        } else {
+                            // This should be impossible because we clear pending_follower_resps_
+                            // when doing log_store_ rollback.
+                            p_er( "term mismatch in async append_entries: "
+                                "appended entry with idx %" PRIu64 " "
+                                "term %" PRIu64 ", durable entry has "
+                                "term %" PRIu64,
+                                entry.last_entry_idx,
+                                entry.last_entry_term,
+                                term_in_log_store);
+                            resps.emplace_back(std::move(entry.promise), cmd_result_code::TERM_MISMATCH);
+                        }
+                        pending_follower_resps_.pop_front();
                     }
-                    pending_follower_resps_.pop_front();
                 }
+            }
+
+            ptr<buffer> empty_buf;
+            ptr<std::exception> no_err;
+            for (auto& p: resps) {
+                p.first->set_result(empty_buf, no_err, p.second);
             }
         } else {
             assert(pending_follower_resps_.empty());
