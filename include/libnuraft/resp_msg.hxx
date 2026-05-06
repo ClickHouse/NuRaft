@@ -83,6 +83,11 @@ public:
         accepted_ = true;
     }
 
+    void unaccept() {
+        next_idx_ = 0;
+        accepted_ = false;
+    }
+
     void set_ctx(ptr<buffer> src) {
         ctx_ = std::move(src);
     }
