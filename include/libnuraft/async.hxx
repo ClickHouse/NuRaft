@@ -172,8 +172,8 @@ public:
      */
     void set_result(T& result, TE& err, cmd_result_code code = cmd_result_code::OK) {
         bool call_handler = false;
-        code_ = code;
         {   std::lock_guard<std::mutex> guard(lock_);
+            code_ = code;
             result_ = result;
             err_ = err;
             has_result_ = true;
