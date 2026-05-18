@@ -934,15 +934,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
             // Fail any pending async append_entries requests: any entries they refer to
             // are likely being rolled back, and leader term has changed.
-            if (!pending_follower_resps_.empty()) {
-                p_in( "rollback: discarding %zu pending pipelined responses",
-                      pending_follower_resps_.size() );
-                for (pending_follower_resp& resp: pending_follower_resps_) {
-                    ptr<buffer> empty_buf;
-                    ptr<std::exception> no_err;
-                    resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+            {
+                auto_lock(pending_follower_resps_lock_);
+                if (!pending_follower_resps_.empty()) {
+                    p_in( "rollback: discarding %zu pending pipelined responses",
+                        pending_follower_resps_.size() );
+                    for (pending_follower_resp& resp: pending_follower_resps_) {
+                        ptr<buffer> empty_buf;
+                        ptr<std::exception> no_err;
+                        resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                    }
+                    pending_follower_resps_.clear();
                 }
-                pending_follower_resps_.clear();
             }
 
             // If rollback point is smaller than commit index,
@@ -1068,8 +1071,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                           ", deferring response (pipelined)",
                           last_durable_index, required_durable );
                     auto promise = cs_new<cmd_result<ptr<buffer>>>();
-                    pending_follower_resps_.push_back(
-                        {required_durable, req.log_entries().back()->get_term(), promise});
+                    {
+                        auto_lock(pending_follower_resps_lock_);
+                        pending_follower_resps_.push_back(
+                            {required_durable, req.log_entries().back()->get_term(), promise});
+                    }
                     resp->set_async_cb([promise]() { return promise; });
 
                 } else {
@@ -1105,8 +1111,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     ", deferring response (pipelined)",
                     last_durable_index, required_durable );
             auto promise = cs_new<cmd_result<ptr<buffer>>>();
-            pending_follower_resps_.push_back(
-                {required_durable, /*last_entry_term=*/ 0, promise});
+            {
+                auto_lock(pending_follower_resps_lock_);
+                pending_follower_resps_.push_back(
+                    {required_durable, /*last_entry_term=*/ 0, promise});
+            }
             resp->set_async_cb([promise]() { return promise; });
         }
     }
@@ -1617,8 +1626,8 @@ ulong raft_server::get_expected_committed_log_idx() {
 
 void raft_server::notify_log_append_completion(bool ok) {
     if (stopping_) {
-        recur_lock(lock_);
         // Send errors for pending async append_entries requests.
+        auto_lock(pending_follower_resps_lock_);
         if (!pending_follower_resps_.empty()) {
             p_in( "discarding %zu pending pipelined responses",
                   pending_follower_resps_.size() );
@@ -1660,7 +1669,7 @@ void raft_server::notify_log_append_completion(bool ok) {
             // entries are now durable.
             std::vector<std::pair<ptr<cmd_result<ptr<buffer>>>, cmd_result_code>> resps;
             {
-                recur_lock(lock_);
+                auto_lock(pending_follower_resps_lock_);
                 if (!pending_follower_resps_.empty()) {
                     uint64_t durable_idx = log_store_->last_durable_index();
                     while ( !pending_follower_resps_.empty() &&
@@ -1675,12 +1684,12 @@ void raft_server::notify_log_append_completion(bool ok) {
                             // This should be impossible because we clear pending_follower_resps_
                             // when doing log_store_ rollback.
                             p_er( "term mismatch in async append_entries: "
-                                "appended entry with idx %" PRIu64 " "
-                                "term %" PRIu64 ", durable entry has "
-                                "term %" PRIu64,
-                                entry.last_entry_idx,
-                                entry.last_entry_term,
-                                term_in_log_store);
+                                  "appended entry with idx %" PRIu64 " "
+                                  "term %" PRIu64 ", durable entry has "
+                                  "term %" PRIu64,
+                                  entry.last_entry_idx,
+                                  entry.last_entry_term,
+                                  term_in_log_store);
                             resps.emplace_back(std::move(entry.promise), cmd_result_code::TERM_MISMATCH);
                         }
                         pending_follower_resps_.pop_front();
