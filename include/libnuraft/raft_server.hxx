@@ -1731,6 +1731,7 @@ protected:
         ulong last_entry_term;
         ptr<cmd_result<ptr<buffer>>> promise;
     };
+    std::mutex pending_follower_resps_lock_; // may be locked while holding lock_
     std::deque<pending_follower_resp> pending_follower_resps_;
 
     /**

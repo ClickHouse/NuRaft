@@ -675,22 +675,14 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         }
     }
 
-    return req;
-}
+    if (params->max_log_gap_in_stream_ > 0) {
+        // Streaming mode: let the follower pipeline the next request
+        // while this one's response is still pending.
+        req->set_extra_flags(
+            req->get_extra_flags() | req_msg::ALLOW_ASYNC_LOG_APPENDING);
+    }
 
-// Whether handle_append_entries should return a future that later
-// gets notified by notify_log_append_completion when log entries become durable.
-// This allows the leader to send multiple append_entries messages without waiting
-// for responses.
-// Only makes sense when parallel_log_appending_ and max_log_gap_in_stream_ are both enabled;
-// otherwise either the log store or the asio handler would wait for durability anyway.
-static bool should_use_async_log_appending(const raft_params& params) {
-    // Note: the max_log_gap_in_stream_ check is just a heuristic;
-    // we're interested in the max_log_gap_in_stream_ *on the leader node*,
-    // not on this node. But typically parameters are the same on all nodes
-    // in practice, so this is ok.
-    // This function's return value doesn't affect correctness either way.
-    return params.parallel_log_appending_ && params.max_log_gap_in_stream_ > 0;
+    return req;
 }
 
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
@@ -885,7 +877,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     last_rcvd_append_entries_req_.reset();
 
     ptr<raft_params> params = ctx_->get_params();
-    bool async_log_appending = should_use_async_log_appending(*params);
+    // Pipelined processing requires both sides to opt in. Old NuRaft on
+    // either side falls back to the blocking path.
+    bool async_log_appending =
+        params->parallel_log_appending_ &&
+        (req.get_extra_flags() & req_msg::ALLOW_ASYNC_LOG_APPENDING);
 
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
@@ -938,15 +934,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
             // Fail any pending async append_entries requests: any entries they refer to
             // are likely being rolled back, and leader term has changed.
-            if (!pending_follower_resps_.empty()) {
-                p_in( "rollback: discarding %zu pending pipelined responses",
-                      pending_follower_resps_.size() );
-                for (pending_follower_resp& resp: pending_follower_resps_) {
-                    ptr<buffer> empty_buf;
-                    ptr<std::exception> no_err;
-                    resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+            {
+                auto_lock(pending_follower_resps_lock_);
+                if (!pending_follower_resps_.empty()) {
+                    p_in( "rollback: discarding %zu pending pipelined responses",
+                        pending_follower_resps_.size() );
+                    for (pending_follower_resp& resp: pending_follower_resps_) {
+                        ptr<buffer> empty_buf;
+                        ptr<std::exception> no_err;
+                        resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                    }
+                    pending_follower_resps_.clear();
                 }
-                pending_follower_resps_.clear();
             }
 
             // If rollback point is smaller than commit index,
@@ -1072,8 +1071,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                           ", deferring response (pipelined)",
                           last_durable_index, required_durable );
                     auto promise = cs_new<cmd_result<ptr<buffer>>>();
-                    pending_follower_resps_.push_back(
-                        {required_durable, req.log_entries().back()->get_term(), promise});
+                    {
+                        auto_lock(pending_follower_resps_lock_);
+                        pending_follower_resps_.push_back(
+                            {required_durable, req.log_entries().back()->get_term(), promise});
+                    }
                     resp->set_async_cb([promise]() { return promise; });
 
                 } else {
@@ -1109,8 +1111,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     ", deferring response (pipelined)",
                     last_durable_index, required_durable );
             auto promise = cs_new<cmd_result<ptr<buffer>>>();
-            pending_follower_resps_.push_back(
-                {required_durable, /*last_entry_term=*/ 0, promise});
+            {
+                auto_lock(pending_follower_resps_lock_);
+                pending_follower_resps_.push_back(
+                    {required_durable, /*last_entry_term=*/ 0, promise});
+            }
             resp->set_async_cb([promise]() { return promise; });
         }
     }
@@ -1621,8 +1626,8 @@ ulong raft_server::get_expected_committed_log_idx() {
 
 void raft_server::notify_log_append_completion(bool ok) {
     if (stopping_) {
-        recur_lock(lock_);
         // Send errors for pending async append_entries requests.
+        auto_lock(pending_follower_resps_lock_);
         if (!pending_follower_resps_.empty()) {
             p_in( "discarding %zu pending pipelined responses",
                   pending_follower_resps_.size() );
@@ -1659,12 +1664,12 @@ void raft_server::notify_log_append_completion(bool ok) {
         }
     } else {
         ptr<raft_params> params = ctx_->get_params();
-        if (should_use_async_log_appending(*params)) {
-            // Follower: send responses for async append_entries
-            // requests whose entries became durable.
+        if (params->parallel_log_appending_) {
+            // Send responses for pipelined append_entries requests whose
+            // entries are now durable.
             std::vector<std::pair<ptr<cmd_result<ptr<buffer>>>, cmd_result_code>> resps;
             {
-                recur_lock(lock_);
+                auto_lock(pending_follower_resps_lock_);
                 if (!pending_follower_resps_.empty()) {
                     uint64_t durable_idx = log_store_->last_durable_index();
                     while ( !pending_follower_resps_.empty() &&
@@ -1679,12 +1684,12 @@ void raft_server::notify_log_append_completion(bool ok) {
                             // This should be impossible because we clear pending_follower_resps_
                             // when doing log_store_ rollback.
                             p_er( "term mismatch in async append_entries: "
-                                "appended entry with idx %" PRIu64 " "
-                                "term %" PRIu64 ", durable entry has "
-                                "term %" PRIu64,
-                                entry.last_entry_idx,
-                                entry.last_entry_term,
-                                term_in_log_store);
+                                  "appended entry with idx %" PRIu64 " "
+                                  "term %" PRIu64 ", durable entry has "
+                                  "term %" PRIu64,
+                                  entry.last_entry_idx,
+                                  entry.last_entry_term,
+                                  term_in_log_store);
                             resps.emplace_back(std::move(entry.promise), cmd_result_code::TERM_MISMATCH);
                         }
                         pending_follower_resps_.pop_front();
@@ -1697,11 +1702,11 @@ void raft_server::notify_log_append_completion(bool ok) {
             for (auto& p: resps) {
                 p.first->set_result(empty_buf, no_err, p.second);
             }
-        } else {
-            assert(pending_follower_resps_.empty());
-            // Follower: wake up the waiting thread.
-            ea_follower_log_append_->invoke();
         }
+
+        // Wake the blocking-path waiter in `handle_append_entries`.
+        // No-op if nothing waits.
+        ea_follower_log_append_->invoke();
     }
 }
 

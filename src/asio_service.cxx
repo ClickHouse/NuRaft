@@ -148,6 +148,9 @@ limitations under the License.
 //     the follower is marked down by itself.
 #define MARK_DOWN (0x40)
 
+// See `req_msg::ALLOW_ASYNC_LOG_APPENDING`.
+#define ALLOW_ASYNC_LOG_APPENDING_WIRE (0x80)
+
 // =======================
 
 namespace nuraft {
@@ -698,6 +701,10 @@ private:
         if (flags_ & MARK_DOWN) {
             req->set_extra_flags(
                 req->get_extra_flags() | req_msg::EXCLUDED_FROM_THE_QUORUM);
+        }
+        if (flags_ & ALLOW_ASYNC_LOG_APPENDING_WIRE) {
+            req->set_extra_flags(
+                req->get_extra_flags() | req_msg::ALLOW_ASYNC_LOG_APPENDING);
         }
 
         if (log_data_size > 0 && log_ctx) {
@@ -1449,6 +1456,10 @@ public:
         if (req->get_extra_flags() & req_msg::EXCLUDED_FROM_THE_QUORUM) {
             // If the request is excluded from the quorum, set the flag.
             flags |= MARK_DOWN;
+        }
+
+        if (req->get_extra_flags() & req_msg::ALLOW_ASYNC_LOG_APPENDING) {
+            flags |= ALLOW_ASYNC_LOG_APPENDING_WIRE;
         }
 
         for (auto& entry: req->log_entries()) {
