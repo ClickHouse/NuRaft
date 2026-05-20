@@ -396,7 +396,7 @@ public:
 
 private:
     void handle_rpc_result(ptr<peer> myself,
-                           ptr<rpc_client> my_rpc_client,
+                           uint64_t my_rpc_client_id,
                            ptr<req_msg>& req,
                            ptr<rpc_result>& pending_result,
                            bool streaming,

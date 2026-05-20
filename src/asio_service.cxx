@@ -1357,11 +1357,11 @@ public:
                                      std::placeholders::_2 ) );
 #endif
         }
-        p_ts("asio client created: %p", this);
+        p_ts("asio client created: %p id %" PRIu64, this, client_id_);
     }
 
     virtual ~asio_rpc_client() {
-        p_ts("asio client destroyed: %p", this);
+        p_ts("asio client destroyed: %p id %" PRIu64, this, client_id_);
         close_socket();
     }
 
@@ -1828,10 +1828,11 @@ private:
 #ifdef SSL_LIBRARY_NOT_FOUND
                 assert(0); // Should not reach here.
 #else
+                ptr<asio_rpc_client> self = this->shared_from_this();
                 ssl_socket_.async_handshake
                     ( asio::ssl::stream_base::client,
                       std::bind( &asio_rpc_client::handle_handshake,
-                                 this,
+                                 self,
                                  req,
                                  when_done,
                                  send_timeout_ms,
