@@ -70,7 +70,7 @@ void peer::send_req( ptr<peer> myself,
                     ( &peer::handle_rpc_result,
                       this,
                       myself,
-                      rpc_local,
+                      rpc_local->get_id(),
                       req,
                       pending,
                       streaming,
@@ -84,13 +84,18 @@ void peer::send_req( ptr<peer> myself,
 }
 
 // WARNING:
-//   We should have the shared pointer of itself (`myself`)
-//   and pointer to RPC client (`my_rpc_client`),
-//   for the case when
-//     1) this peer is removed before this callback function is invoked. OR
-//     2) RPC client has been reset and re-connected.
+//   We capture the shared pointer of `myself` so that this callback is
+//   safe to invoke even if the peer has been removed from `raft_server`'s
+//   `peers_` map before the response arrives.
+//
+//   For the case where the RPC client has been reset and re-connected
+//   while this request was in flight (so the response refers to a stale
+//   client), we identify the originating client by id (`my_rpc_client_id`).
+//   (We shouldn't capture `ptr<rpc_client>` here as that would create
+//    circular reference: the rpc_client would hold a callback function,
+//    which would hold a ptr<rpc_client>.)
 void peer::handle_rpc_result( ptr<peer> myself,
-                              ptr<rpc_client> my_rpc_client,
+                              uint64_t my_rpc_client_id,
                               ptr<req_msg>& req,
                               ptr<rpc_result>& pending_result,
                               bool streaming,
@@ -117,19 +122,16 @@ void peer::handle_rpc_result( ptr<peer> myself,
             // The same as below, freeing busy flag should be done
             // only if the RPC hasn't been changed.
             uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
-            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
-            if (cur_rpc_id != given_rpc_id) {
+            if (cur_rpc_id != my_rpc_client_id) {
                 int32_t stale_resps = inc_stale_rpc_responses();
                 int32_t limit = raft_server::get_raft_limits().response_limit_;
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] got stale RPC response from %d: "
-                          "current %p (%" PRIu64 "), from parameter %p (%" PRIu64 "). "
+                          "current id %" PRIu64 ", from id %" PRIu64 ". "
                           "will ignore this response",
                           get_config().get_id(),
-                          rpc_.get(),
                           cur_rpc_id,
-                          my_rpc_client.get(),
-                          given_rpc_id );
+                          my_rpc_client_id );
                 } else if (stale_resps == limit) {
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
                           "will suppress it from now", config_->get_id() );
@@ -174,8 +176,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
         // Next append operation will create a new one.
         {   std::lock_guard<std::mutex> l(rpc_protector_);
             uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
-            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
-            if (cur_rpc_id == given_rpc_id) {
+            if (cur_rpc_id == my_rpc_client_id) {
                 rpc_.reset();
                 uint64_t last_streamed_log_idx = get_last_streamed_log_idx();
                 reset_stream();
@@ -205,13 +206,11 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 int32_t limit = raft_server::get_raft_limits().response_limit_;
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] RPC for %d has been reset before "
-                          "returning error: current %p (%" PRIu64
-                          "), from parameter %p (%" PRIu64 ")",
+                          "returning error: current id %" PRIu64
+                          ", from id %" PRIu64,
                           config_->get_id(),
-                          rpc_.get(),
                           cur_rpc_id,
-                          my_rpc_client.get(),
-                          given_rpc_id );
+                          my_rpc_client_id );
                 } else if (stale_resps == limit) {
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
                           "will suppress it from now", config_->get_id() );

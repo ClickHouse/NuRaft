@@ -1357,11 +1357,11 @@ public:
                                      std::placeholders::_2 ) );
 #endif
         }
-        p_ts("asio client created: %p", this);
+        p_ts("asio client created: %p id %" PRIu64, this, client_id_);
     }
 
     virtual ~asio_rpc_client() {
-        p_ts("asio client destroyed: %p", this);
+        p_ts("asio client destroyed: %p id %" PRIu64, this, client_id_);
         close_socket();
     }
 
