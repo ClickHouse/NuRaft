@@ -1828,10 +1828,11 @@ private:
 #ifdef SSL_LIBRARY_NOT_FOUND
                 assert(0); // Should not reach here.
 #else
+                ptr<asio_rpc_client> self = this->shared_from_this();
                 ssl_socket_.async_handshake
                     ( asio::ssl::stream_base::client,
                       std::bind( &asio_rpc_client::handle_handshake,
-                                 this,
+                                 self,
                                  req,
                                  when_done,
                                  send_timeout_ms,
