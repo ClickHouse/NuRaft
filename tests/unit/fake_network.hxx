@@ -170,6 +170,32 @@ public:
         }
     }
 
+    ulong getPeerMatchedIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_matched_idx();
+        }
+        return 0;
+    }
+
+    void setPeerLastAcceptedLogIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_last_accepted_log_idx(idx);
+        }
+    }
+
+    ulong getPeerLastAcceptedLogIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_last_accepted_log_idx();
+        }
+        return 0;
+    }
+
     void setPeerNextLogIdxFloor(raft_server* srv, int32 peer_id, ulong idx) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);
@@ -292,4 +318,3 @@ private:
 };
 
 }  // namespace nuraft;
-
