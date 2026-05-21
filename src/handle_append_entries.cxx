@@ -47,6 +47,7 @@ struct resp_appendix {
         NONE = 0,
         DO_NOT_REWIND = 1,
         RECEIVING_SNAPSHOT = 2,
+        COMPACTED_SNAPSHOT_BOUNDARY = 3,
     };
 
     resp_appendix() : extra_order_(NONE) {}
@@ -89,6 +90,8 @@ struct resp_appendix {
             return "DO_NOT_REWIND";
         case RECEIVING_SNAPSHOT:
             return "RECEIVING_SNAPSHOT";
+        case COMPACTED_SNAPSHOT_BOUNDARY:
+            return "COMPACTED_SNAPSHOT_BOUNDARY";
         default:
             return "UNKNOWN";
         }
@@ -758,14 +761,6 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     //   req.get_last_log_idx() == lastSnapshot.get_last_log_idx() &&
     //   req.get_last_log_term() == lastSnapshot.get_last_log_term()
     //
-    // In not accepted case, we will return log_store_->next_slot() for
-    // the leader to quick jump to the index that might aligned.
-    ptr<resp_msg> resp = cs_new<resp_msg>( state_->get_term(),
-                                           msg_type::append_entries_response,
-                                           id_,
-                                           req.get_src(),
-                                           log_store_->next_slot() );
-
     ptr<snapshot> local_snp = get_last_snapshot();
     ulong log_term = 0;
     if (req.get_last_log_idx() < log_store_->next_slot()) {
@@ -778,6 +773,26 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             ( local_snp &&
               local_snp->get_last_log_idx() == req.get_last_log_idx() &&
               local_snp->get_last_log_term() == req.get_last_log_term() );
+
+    // In not accepted case, we will return log_store_->next_slot() for
+    // the leader to quick jump to the index that might aligned.
+    ulong response_next_idx = log_store_->next_slot();
+    bool compacted_snapshot_boundary =
+        req.get_term() == state_->get_term() &&
+        !state_->is_receiving_snapshot() &&
+        local_snp &&
+        !log_okay &&
+        req.get_last_log_idx() < log_store_->start_index() &&
+        req.get_last_log_idx() < local_snp->get_last_log_idx();
+    if (compacted_snapshot_boundary) {
+        response_next_idx = local_snp->get_last_log_idx() + 1;
+    }
+
+    ptr<resp_msg> resp = cs_new<resp_msg>( state_->get_term(),
+                                           msg_type::append_entries_response,
+                                           id_,
+                                           req.get_src(),
+                                           response_next_idx );
 
     int log_lv = log_okay ? L_TRACE : (supp_exp_warning ? L_INFO : L_WARN);
     static timer_helper log_timer(500*1000, true);
@@ -821,6 +836,12 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             // this node's status. We should send an additional hint.
             resp_appendix appendix;
             appendix.extra_order_ = resp_appendix::RECEIVING_SNAPSHOT;
+            resp->set_ctx( appendix.serialize() );
+            p_lv(log_lv, "appended extra order %s",
+                 resp_appendix::extra_order_msg(appendix.extra_order_));
+        } else if (compacted_snapshot_boundary) {
+            resp_appendix appendix;
+            appendix.extra_order_ = resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY;
             resp->set_ctx( appendix.serialize() );
             p_lv(log_lv, "appended extra order %s",
                  resp_appendix::extra_order_msg(appendix.extra_order_));
@@ -1335,45 +1356,77 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     } else {
         std::lock_guard<std::mutex> guard(p->get_lock());
         ulong prev_next_log = p->get_next_log_idx();
-        if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
-            // fast move for the peer to catch up
+        resp_appendix::extra_order extra_order = resp_appendix::NONE;
+        if (resp.get_ctx()) {
+            ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
+            extra_order = appendix->extra_order_;
+
+            static timer_helper extra_order_timer(1000 * 1000, true);
+            int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
+            p_lv(log_lv, "received extra order: %s",
+                 resp_appendix::extra_order_msg(extra_order));
+        }
+
+        if (extra_order == resp_appendix::DO_NOT_REWIND) {
+            // Application-level rejection. Keep peer progress unchanged.
+        } else if (extra_order == resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY) {
             ulong floor = p->get_next_log_idx_floor();
             ulong target = std::max(resp.get_next_idx(), floor);
-            if (target != resp.get_next_idx()) {
-                p_wn("fast-move clamped to snapshot floor: "
-                     "resp next_idx %" PRIu64 ", floor %" PRIu64,
-                     resp.get_next_idx(), floor);
+            ulong max_next_idx = precommit_index_ + 1;
+            ulong matched_idx = p->get_matched_idx();
+            ulong last_accepted_log_idx = p->get_last_accepted_log_idx();
+            if ( resp.get_term() == state_->get_term() &&
+                 resp.get_next_idx() > 0 &&
+                 target > matched_idx &&
+                 target > last_accepted_log_idx &&
+                 target <= max_next_idx ) {
+                p->set_next_log_idx(target);
+                p->set_next_log_idx_floor(target);
+                p_in("peer %d compacted snapshot boundary: "
+                     "resp next_idx %" PRIu64 ", floor %" PRIu64
+                     ", target %" PRIu64,
+                     p->get_id(), resp.get_next_idx(), floor, target);
+            } else {
+                p_wn("invalid compacted snapshot boundary from peer %d: "
+                     "resp term %" PRIu64 ", my term %" PRIu64
+                     ", resp next_idx %" PRIu64 ", floor %" PRIu64
+                     ", target %" PRIu64 ", matched idx %" PRIu64
+                     ", last accepted log idx %" PRIu64
+                     ", max next_idx %" PRIu64,
+                     p->get_id(), resp.get_term(), state_->get_term(),
+                     resp.get_next_idx(), floor, target, matched_idx,
+                     last_accepted_log_idx, max_next_idx);
             }
-            p->set_next_log_idx(target);
         } else {
-            bool do_log_rewind = true;
-            // If not, check an extra order exists.
-            if (resp.get_ctx()) {
-                ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
-                if (appendix->extra_order_ == resp_appendix::DO_NOT_REWIND) {
-                    do_log_rewind = false;
-                } else if (appendix->extra_order_ == resp_appendix::RECEIVING_SNAPSHOT) {
-                    p->set_snapshot_sync_is_needed(true);
-                    p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
-                         p->get_id());
-                }
-
-                static timer_helper extra_order_timer(1000 * 1000, true);
-                int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
-                p_lv(log_lv, "received extra order: %s",
-                     resp_appendix::extra_order_msg(appendix->extra_order_));
+            if (extra_order == resp_appendix::RECEIVING_SNAPSHOT) {
+                p->set_snapshot_sync_is_needed(true);
+                p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
+                     p->get_id());
             }
-            // if not, move one log backward.
-            // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
-            if (do_log_rewind && prev_next_log) {
+
+            if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
+                // fast move for the peer to catch up
                 ulong floor = p->get_next_log_idx_floor();
-                if (prev_next_log - 1 >= floor) {
-                    p->set_next_log_idx(prev_next_log - 1);
-                } else {
-                    p_wn("skip log rewind: next_log_idx %" PRIu64
-                         " would go below snapshot floor %" PRIu64
-                         ", resp next_idx %" PRIu64,
-                         prev_next_log - 1, floor, resp.get_next_idx());
+                ulong target = std::max(resp.get_next_idx(), floor);
+                if (target != resp.get_next_idx()) {
+                    p_wn("fast-move clamped to snapshot floor: "
+                         "resp next_idx %" PRIu64 ", floor %" PRIu64,
+                         resp.get_next_idx(), floor);
+                }
+                p->set_next_log_idx(target);
+            } else {
+                // if not, move one log backward.
+                // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
+                if (prev_next_log) {
+                    ulong floor = p->get_next_log_idx_floor();
+                    if (prev_next_log - 1 >= floor) {
+                        p->set_next_log_idx(prev_next_log - 1);
+                    } else {
+                        p_wn("skip log rewind: next_log_idx %" PRIu64
+                             " would go below snapshot floor %" PRIu64
+                             ", resp next_idx %" PRIu64,
+                             prev_next_log - 1, floor, resp.get_next_idx());
+                    }
                 }
             }
         }
@@ -1711,4 +1764,3 @@ void raft_server::notify_log_append_completion(bool ok) {
 }
 
 } // namespace nuraft;
-

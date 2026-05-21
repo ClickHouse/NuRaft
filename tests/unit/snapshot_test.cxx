@@ -33,6 +33,37 @@ using raft_result = cmd_result< ptr<buffer> >;
 
 namespace snapshot_test {
 
+static ptr<buffer> make_test_msg(const std::string& test_msg) {
+    ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+    msg->put(test_msg);
+    return msg;
+}
+
+static ptr<buffer> make_resp_appendix_ctx(uint8_t order) {
+    ptr<buffer> ctx = buffer::alloc(2);
+    buffer_serializer bs(*ctx);
+    bs.put_u8(0);
+    bs.put_u8(order);
+    return ctx;
+}
+
+static int append_and_replicate(RaftPkg& leader,
+                                const std::vector<RaftPkg*>& pkgs,
+                                size_t begin,
+                                size_t count) {
+    for (size_t ii = begin; ii < begin + count; ++ii) {
+        ptr< cmd_result< ptr<buffer> > > ret =
+            leader.raftServer->append_entries(
+                { make_test_msg("test" + std::to_string(ii)) } );
+        CHK_TRUE( ret->get_accepted() );
+
+        leader.fNet->execReqResp();
+        leader.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    return 0;
+}
+
 int snapshot_basic_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -1129,6 +1160,344 @@ int snapshot_null_snapshot_join_test() {
     return 0;
 }
 
+int snapshot_append_rejection_compacted_boundary_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        if (pp->raftServer->get_id() == 3) {
+            param.snapshot_distance_ = 5;
+            param.reserved_log_items_ = 0;
+        } else {
+            param.snapshot_distance_ = 100;
+            param.reserved_log_items_ = 100;
+        }
+        pp->raftServer->update_params(param);
+    }
+
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 5) );
+
+    ptr<snapshot> s3_snp = s3.fNet->getLastSnapshot(s3.raftServer.get());
+    CHK_NONNULL( s3_snp.get() );
+    ulong snapshot_idx = s3_snp->get_last_log_idx();
+    ulong boundary_next_idx = snapshot_idx + 1;
+
+    raft_params s3_params = s3.raftServer->get_current_params();
+    s3_params.snapshot_distance_ = 100;
+    s3.raftServer->update_params(s3_params);
+
+    CHK_Z( append_and_replicate(s1, pkgs, 5, 2) );
+    CHK_GT( s3.getTestMgr()->get_inmem_log_store()->next_slot(),
+            boundary_next_idx );
+
+    ulong matched_before = 1;
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, snapshot_idx);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, 0);
+    s1.fNet->setPeerMatchedIdx(s1.raftServer.get(), 3, matched_before);
+    s1.fNet->setPeerLastAcceptedLogIdx(
+        s1.raftServer.get(), 3, matched_before);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( boundary_next_idx,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( boundary_next_idx,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+    CHK_EQ( matched_before,
+            s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( matched_before,
+            s1.fNet->getPeerLastAcceptedLogIdx(s1.raftServer.get(), 3) );
+
+    CHK_TRUE( s1.fNet->execReqResp("S3") );
+    CHK_GT( s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3),
+            boundary_next_idx );
+    CHK_GTEQ( s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3),
+              snapshot_idx );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int append_rejection_unmarked_ahead_next_index_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 100;
+        pp->raftServer->update_params(param);
+    }
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+
+    ulong prev_next_log = 2;
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, prev_next_log);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, 0);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    ptr<resp_msg> denial = cs_new<resp_msg>(
+        s1.raftServer->get_term(),
+        msg_type::append_entries_response,
+        3,
+        1,
+        s1.raftServer->get_last_log_idx() + 10,
+        false );
+    CHK_TRUE( s1.fNet->replaceLastPendingResp("S3", denial) );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( prev_next_log - 1,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( 0, s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int append_rejection_invalid_compacted_boundary_marker_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 100;
+        pp->raftServer->update_params(param);
+    }
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+
+    ulong prev_next_log = 2;
+    ulong floor = 0;
+    ulong matched_before = 1;
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, prev_next_log);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, floor);
+    s1.fNet->setPeerMatchedIdx(s1.raftServer.get(), 3, matched_before);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    ptr<resp_msg> denial = cs_new<resp_msg>(
+        s1.raftServer->get_term(),
+        msg_type::append_entries_response,
+        3,
+        1,
+        s1.raftServer->get_last_log_idx() + 10,
+        false );
+    denial->set_ctx(make_resp_appendix_ctx(3));
+    CHK_TRUE( s1.fNet->replaceLastPendingResp("S3", denial) );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( prev_next_log,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( floor,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+    CHK_EQ( matched_before,
+            s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int append_rejection_stale_compacted_boundary_marker_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 100;
+        pp->raftServer->update_params(param);
+    }
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+
+    ulong confirmed_idx = 3;
+    ulong prev_next_log = confirmed_idx + 2;
+    ulong floor = 0;
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, prev_next_log);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, floor);
+    s1.fNet->setPeerMatchedIdx(s1.raftServer.get(), 3, confirmed_idx);
+    s1.fNet->setPeerLastAcceptedLogIdx(
+        s1.raftServer.get(), 3, confirmed_idx);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    ptr<resp_msg> denial = cs_new<resp_msg>(
+        s1.raftServer->get_term(),
+        msg_type::append_entries_response,
+        3,
+        1,
+        confirmed_idx,
+        false );
+    denial->set_ctx(make_resp_appendix_ctx(3));
+    CHK_TRUE( s1.fNet->replaceLastPendingResp("S3", denial) );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( prev_next_log,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( floor,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+    CHK_EQ( confirmed_idx,
+            s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( confirmed_idx,
+            s1.fNet->getPeerLastAcceptedLogIdx(s1.raftServer.get(), 3) );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int append_rejection_do_not_rewind_ahead_next_index_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 100;
+        pp->raftServer->update_params(param);
+    }
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+
+    ulong prev_next_log = 2;
+    ulong floor = 0;
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, prev_next_log);
+    s1.fNet->setPeerNextLogIdxFloor(s1.raftServer.get(), 3, floor);
+
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    ptr<resp_msg> denial = cs_new<resp_msg>(
+        s1.raftServer->get_term(),
+        msg_type::append_entries_response,
+        3,
+        1,
+        s1.raftServer->get_last_log_idx() + 10,
+        false );
+    denial->set_ctx(make_resp_appendix_ctx(1));
+    CHK_TRUE( s1.fNet->replaceLastPendingResp("S3", denial) );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( prev_next_log,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( floor,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 // Regression test for stale-RPC-after-snapshot backward probing bug.
 //
 // Production scenario: after snapshot sync completes, a force-reconnect
@@ -1340,6 +1709,21 @@ int main(int argc, char* argv[]) {
     ts.doTest( "snapshot null snapshot join test",
                snapshot_null_snapshot_join_test );
 
+    ts.doTest( "snapshot append rejection compacted boundary test",
+               snapshot_append_rejection_compacted_boundary_test );
+
+    ts.doTest( "append rejection unmarked ahead next index test",
+               append_rejection_unmarked_ahead_next_index_test );
+
+    ts.doTest( "append rejection invalid compacted boundary marker test",
+               append_rejection_invalid_compacted_boundary_marker_test );
+
+    ts.doTest( "append rejection stale compacted boundary marker test",
+               append_rejection_stale_compacted_boundary_marker_test );
+
+    ts.doTest( "append rejection do not rewind ahead next index test",
+               append_rejection_do_not_rewind_ahead_next_index_test );
+
     ts.doTest( "snapshot rewind floor test",
                snapshot_rewind_floor_test );
 
@@ -1359,4 +1743,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
