@@ -454,6 +454,12 @@ ptr<client_req_stream> raft_server::open_client_req_stream(
         return nullptr;
     }
 
+    if (leader == id_) {
+        return cs_new<client_req_stream>(*this, term,
+                                         /*rpc=*/ ptr<rpc_client>(),
+                                         send_timeout_ms);
+    }
+
     ptr<cluster_config> c_conf = get_config();
     ptr<srv_config> srv_cfg = c_conf->get_server(leader);
     if (!srv_cfg) {

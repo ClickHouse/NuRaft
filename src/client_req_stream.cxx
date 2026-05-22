@@ -17,7 +17,7 @@ client_req_stream::client_req_stream(raft_server& srv,
     , stream_term_(stream_term)
     , rpc_(rpc)
     , send_timeout_ms_(send_timeout_ms)
-    , supports_pipelining_(rpc_->supports_pipelining())
+    , supports_pipelining_(rpc_ ? rpc_->supports_pipelining() : true)
     , state_(cs_new<State>())
 {}
 
@@ -34,19 +34,58 @@ void client_req_stream::append(std::vector< ptr<buffer> > logs)
             cs_new<log_entry>(0, buf, log_val_type::app_log));
     }
 
-    rpc_handler handler =
-        [state = state_]
-        (ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
-            const bool non_ok = err
-                || !resp
-                || !resp->get_accepted()
-                || resp->get_result_code() != cmd_result_code::OK;
-            if (non_ok) state->abandoned_.store(true);
-            size_t prev_in_flight = state->in_flight_.fetch_sub(1);
-            assert(prev_in_flight > 0);
-            (void)prev_in_flight;
-        };
     state_->in_flight_.fetch_add(1);
+
+    auto handle_result = [state = state_](bool success)
+    {
+        if (!success) state->abandoned_.store(true);
+        size_t prev_in_flight = state->in_flight_.fetch_sub(1);
+        assert(prev_in_flight > 0);
+        (void)prev_in_flight;
+    };
+
+    if (!rpc_) {
+        // Leader is on current node. Pass the request to it directly without
+        // going through network. This is mostly to allow running a single-node
+        // cluster without loopback network available.
+        ptr<resp_msg> resp;
+        try {
+            resp = process_req(srv_, *req);
+        } catch (...) {
+            resp.reset();
+        }
+
+        if (resp && resp->has_async_cb()) {
+            ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
+            ret->when_ready(
+                [handle_result = std::move(handle_result)]
+                ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
+                    ptr<std::exception>& exp ) {
+                    bool success = !exp && res.get_accepted() &&
+                        res.get_result_code() == cmd_result_code::OK;
+                    handle_result(success);
+                }
+            );
+        }
+        else
+        {
+            if (resp && resp->has_cb())
+                resp = resp->call_cb(resp);
+
+            bool success = resp && resp->get_accepted() &&
+                resp->get_result_code() == cmd_result_code::OK;
+            handle_result(success);
+        }
+        return;
+    }
+
+    rpc_handler handler =
+        [handle_result = std::move(handle_result)]
+        (ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
+            bool success = !err && resp && resp->get_accepted() &&
+                resp->get_result_code() == cmd_result_code::OK;
+            handle_result(success);
+        };
     rpc_->send(req, handler, send_timeout_ms_);
 }
 

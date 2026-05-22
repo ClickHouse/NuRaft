@@ -6,6 +6,7 @@
 #include "async.hxx"
 #include "buffer.hxx"
 #include "ptr.hxx"
+#include "raft_server_handler.hxx"
 
 #include <atomic>
 #include <cstdint>
@@ -48,17 +49,16 @@ class rpc_client;
  *
  * Lifetime: the stream must not outlive its `raft_server`.
  *
- * Notes:
- *  - In contrast to client_req_stream, auto-forwarding
- *    (raft_params::auto_forwarding_) dispatches through an
- *    `rpc_client` pool, so concurrent requests may reach the leader
- *    out of order.
- *  - client_req_stream sends messages through network even if the
- *    leader is on the local node, for simplicity.
+ * Note: in contrast to this class, auto-forwarding
+ *       (raft_params::auto_forwarding_) dispatches through an
+ *       `rpc_client` pool, so concurrent requests may reach the
+ *       leader out of order.
  */
-class client_req_stream {
+class client_req_stream : private raft_server_handler {
 public:
     // Prefer `raft_server::open_client_req_stream`.
+    // If `rpc` is null, requests are passed directly to local node's handler,
+    // expecting that this node is the leader (for the given term).
     client_req_stream(raft_server& srv,
                       uint64_t stream_term,
                       ptr<rpc_client> rpc,
