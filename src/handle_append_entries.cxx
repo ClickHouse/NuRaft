@@ -998,6 +998,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                           idx, old_entry->get_term() );
 
                 } else if (old_entry->get_val_type() == log_val_type::conf) {
+                    buf->pos(0);
                     ptr<cluster_config> conf_to_rollback =
                         cluster_config::deserialize(*buf);
                     state_machine_->rollback_config(idx, conf_to_rollback);

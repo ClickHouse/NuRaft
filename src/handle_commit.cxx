@@ -32,10 +32,12 @@ limitations under the License.
 #include "state_mgr.hxx"
 #include "tracer.hxx"
 
+#include <algorithm>
 #include <cassert>
 #include <list>
-#include <sstream>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 
 namespace nuraft {
 
@@ -494,6 +496,72 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
     return true;
 }
 
+static ptr<cluster_config>
+find_config_at_or_before(const ptr<cluster_config>& current_conf,
+                         const ptr<snapshot>& last_snp,
+                         const ptr<log_store>& log_store,
+                         ulong log_idx,
+                         std::string& err_msg) {
+    if (current_conf && current_conf->get_log_idx() <= log_idx) {
+        return current_conf;
+    }
+
+    if (!log_store) {
+        err_msg = "log store is null";
+        return nullptr;
+    }
+
+    const ulong start_idx = log_store->start_index();
+    const ulong next_slot = log_store->next_slot();
+    const ulong last_log_idx = next_slot > 0 ? next_slot - 1 : 0;
+    const ulong end_idx = std::min(log_idx, last_log_idx);
+
+    if (end_idx >= start_idx) {
+        for (ulong idx = end_idx;; --idx) {
+            if (log_store->is_conf(idx)) {
+                ptr<log_entry> le = log_store->entry_at(idx);
+                if (!le.get()) {
+                    err_msg = "config log entry is null";
+                    return nullptr;
+                }
+                if (le->is_buf_null()) {
+                    err_msg = "config log entry buffer is null";
+                    return nullptr;
+                }
+
+                le->get_buf().pos(0);
+                ptr<cluster_config> candidate =
+                    cluster_config::deserialize(le->get_buf());
+                if (candidate->get_log_idx() <= log_idx) {
+                    return candidate;
+                }
+            }
+
+            if (idx == start_idx) {
+                break;
+            }
+        }
+    }
+
+    if (last_snp &&
+        last_snp->get_last_config() &&
+        last_snp->get_last_log_idx() <= log_idx &&
+        last_snp->get_last_config()->get_log_idx() <= log_idx) {
+        return last_snp->get_last_config();
+    }
+
+    std::ostringstream ss;
+    ss << "no valid config at or before cutoff " << log_idx
+       << ", log_store start_index " << start_idx
+       << ", next_slot " << next_slot
+       << ", current config index "
+       << (current_conf ? current_conf->get_log_idx() : 0)
+       << ", snapshot index "
+       << (last_snp ? last_snp->get_last_log_idx() : 0);
+    err_msg = ss.str();
+    return nullptr;
+}
+
 ulong raft_server::create_snapshot(const create_snapshot_options& options) {
     auto exec_internal = [&]() {
         uint64_t committed_idx = sm_commit_index_;
@@ -531,11 +599,6 @@ bool raft_server::snapshot_and_compact(ulong committed_idx, bool forced_creation
 
     // get the latest configuration info
     ptr<cluster_config> conf = get_config();
-    if ( conf->get_prev_log_idx() >= log_store_->next_slot() ) {
-        // The latest config and previous config is not in log_store,
-        // so skip the snapshot creation.
-        return false;
-    }
 
     auto snapshot_distance = (ulong)params->snapshot_distance_;
     // Randomized snapshot distance for the first creation.
@@ -623,41 +686,45 @@ bool raft_server::snapshot_and_compact(ulong committed_idx, bool forced_creation
             p_in("snapshot creation is scheduled by user");
         }
 
-        while ( conf->get_log_idx() > committed_idx &&
-                conf->get_prev_log_idx() >= log_store_->start_index() ) {
-            ptr<log_entry> conf_log
-                ( log_store_->entry_at( conf->get_prev_log_idx() ) );
-            conf = cluster_config::deserialize(conf_log->get_buf());
+        auto fail_snapshot_creation =
+            [&](const std::string& err_msg) {
+                if (snapshot_in_action) {
+                    bool val = true;
+                    snp_in_progress_.compare_exchange_strong(val, false);
+                }
+                if (manual_creation_cb) {
+                    ptr<std::exception> err =
+                        cs_new<std::runtime_error>(err_msg);
+                    manual_creation_cb->set_result(committed_idx, err,
+                                                   cmd_result_code::FAILED);
+                    sched_snp_creation_result_.reset();
+                    snp_creation_scheduled_ = false;
+                }
+            };
+
+        if (conf->get_log_idx() > committed_idx) {
+            std::string err_msg;
+            ptr<cluster_config> validated_conf =
+                find_config_at_or_before(conf, local_snp, log_store_,
+                                         committed_idx, err_msg);
+            if (!validated_conf) {
+                p_er("failed to find a valid config at or before committed index "
+                     "%" PRIu64 " while creating snapshot: %s",
+                     committed_idx, err_msg.c_str());
+                fail_snapshot_creation("no valid config for snapshot at committed idx");
+                return false;
+            }
+            p_in("snapshot creation using committed config idx %" PRIu64
+                 " instead of stale current config idx %" PRIu64,
+                 validated_conf->get_log_idx(), conf->get_log_idx());
+            conf = validated_conf;
         }
 
-        if ( conf->get_log_idx() > committed_idx &&
-             conf->get_prev_log_idx() > 0 &&
-             conf->get_prev_log_idx() < log_store_->start_index() ) {
-            if (!local_snp) {
-                // LCOV_EXCL_START
-                p_er("No snapshot could be found while no configuration "
-                     "cannot be found in current committed logs, "
-                     "this is a system error, exiting");
-                ctx_->state_mgr_->system_exit(raft_err::N6_no_snapshot_found);
-                _sys_exit(-1);
-                return false;
-                // LCOV_EXCL_STOP
-            }
-            conf = local_snp->get_last_config();
-
-        } else if ( conf->get_log_idx() > committed_idx &&
-                    conf->get_prev_log_idx() == 0 ) {
-            // Modified by Jung-Sang Ahn in May, 2018:
-            //  Since we remove configure from state machine
-            //  (necessary when we clone a node to another node),
-            //  config at log idx 1 may not be visiable in some condition.
-            p_wn("config at log idx 1 is not availabe, "
-                 "config log idx %" PRIu64 ", prev log idx %" PRIu64
-                 ", committed idx %" PRIu64,
-                 conf->get_log_idx(), conf->get_prev_log_idx(), committed_idx);
-            //ctx_->state_mgr_->system_exit(raft_err::N7_no_config_at_idx_one);
-            //_sys_exit(-1);
-            //return;
+        if ( conf->get_prev_log_idx() >= log_store_->next_slot() ) {
+            // The latest config and previous config is not in log_store,
+            // so skip the snapshot creation.
+            fail_snapshot_creation("snapshot config is not available in log store");
+            return false;
         }
 
         ulong log_term_to_compact = log_store_->term_at(committed_idx);
@@ -1064,4 +1131,3 @@ bool raft_server::wait_for_state_machine_pause(size_t timeout_ms) {
 }
 
 } // namespace nuraft;
-
