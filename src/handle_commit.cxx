@@ -450,6 +450,7 @@ void raft_server::commit_conf(ulong idx_to_commit,
     } else {
         p_in( "skipped config %" PRIu64 ", latest config %" PRIu64 "",
               new_conf->get_log_idx(), cur_conf->get_log_idx() );
+        update_target_priority();
     }
 
     cb_func::Param param(id_, leader_);
@@ -496,13 +497,20 @@ bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
     return true;
 }
 
+static bool is_valid_config_at_or_before(const ptr<cluster_config>& conf,
+                                         ulong log_idx) {
+    return conf &&
+           !conf->get_servers().empty() &&
+           conf->get_log_idx() <= log_idx;
+}
+
 static ptr<cluster_config>
 find_config_at_or_before(const ptr<cluster_config>& current_conf,
                          const ptr<snapshot>& last_snp,
                          const ptr<log_store>& log_store,
                          ulong log_idx,
                          std::string& err_msg) {
-    if (current_conf && current_conf->get_log_idx() <= log_idx) {
+    if (is_valid_config_at_or_before(current_conf, log_idx)) {
         return current_conf;
     }
 
@@ -532,7 +540,7 @@ find_config_at_or_before(const ptr<cluster_config>& current_conf,
                 le->get_buf().pos(0);
                 ptr<cluster_config> candidate =
                     cluster_config::deserialize(le->get_buf());
-                if (candidate->get_log_idx() <= log_idx) {
+                if (is_valid_config_at_or_before(candidate, log_idx)) {
                     return candidate;
                 }
             }
@@ -544,9 +552,8 @@ find_config_at_or_before(const ptr<cluster_config>& current_conf,
     }
 
     if (last_snp &&
-        last_snp->get_last_config() &&
         last_snp->get_last_log_idx() <= log_idx &&
-        last_snp->get_last_config()->get_log_idx() <= log_idx) {
+        is_valid_config_at_or_before(last_snp->get_last_config(), log_idx)) {
         return last_snp->get_last_config();
     }
 
@@ -702,7 +709,7 @@ bool raft_server::snapshot_and_compact(ulong committed_idx, bool forced_creation
                 }
             };
 
-        if (conf->get_log_idx() > committed_idx) {
+        if (!is_valid_config_at_or_before(conf, committed_idx)) {
             std::string err_msg;
             ptr<cluster_config> validated_conf =
                 find_config_at_or_before(conf, local_snp, log_store_,
@@ -715,8 +722,9 @@ bool raft_server::snapshot_and_compact(ulong committed_idx, bool forced_creation
                 return false;
             }
             p_in("snapshot creation using committed config idx %" PRIu64
-                 " instead of stale current config idx %" PRIu64,
-                 validated_conf->get_log_idx(), conf->get_log_idx());
+                 " instead of current config idx %" PRIu64,
+                 validated_conf->get_log_idx(),
+                 conf ? conf->get_log_idx() : 0);
             conf = validated_conf;
         }
 

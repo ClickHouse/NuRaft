@@ -37,6 +37,13 @@ limitations under the License.
 
 namespace nuraft {
 
+static bool is_valid_snapshot_config(const ptr<cluster_config>& conf,
+                                     ulong snapshot_last_log_idx) {
+    return conf &&
+           !conf->get_servers().empty() &&
+           conf->get_log_idx() <= snapshot_last_log_idx;
+}
+
 int32 raft_server::get_snapshot_sync_block_size() const {
     int32 block_size = ctx_->get_params()->snapshot_block_size_;
     return block_size == 0 ? default_snapshot_sync_block_size : block_size;
@@ -595,19 +602,41 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
 
             auto snap_conf = req.get_snapshot().get_last_config();
             ptr<cluster_config> c_conf = get_config();
-            if (snap_conf->get_log_idx() > c_conf->get_log_idx()) {
-                ctx_->state_mgr_->save_config(*snap_conf);
-                reconfigure(snap_conf);
-                c_conf = get_config();
-            } else {
-                p_in("snapshot config idx %" PRIu64 " prev idx %" PRIu64
-                     " is not newer than "
-                     "current config idx %" PRIu64 " prev idx %" PRIu64
+            ptr<cluster_config> snapshot_meta_conf;
+            const ulong snapshot_last_log_idx = req.get_snapshot().get_last_log_idx();
+            if (!is_valid_snapshot_config(snap_conf, snapshot_last_log_idx)) {
+                p_wn("snapshot config idx %" PRIu64 " server count %" PRIu64
+                     " is invalid for snapshot idx %" PRIu64
                      ", will not apply it",
-                     snap_conf->get_log_idx(),
-                     snap_conf->get_prev_log_idx(),
-                     c_conf->get_log_idx(),
-                     c_conf->get_prev_log_idx());
+                     snap_conf ? snap_conf->get_log_idx() : 0,
+                     snap_conf ? (ulong)snap_conf->get_servers().size() : 0,
+                     snapshot_last_log_idx);
+            } else {
+                snapshot_meta_conf = snap_conf;
+                if (!c_conf || snap_conf->get_log_idx() > c_conf->get_log_idx()) {
+                    ctx_->state_mgr_->save_config(*snap_conf);
+                    reconfigure(snap_conf);
+                    c_conf = get_config();
+                } else {
+                    p_in("snapshot config idx %" PRIu64 " prev idx %" PRIu64
+                         " is not newer than "
+                         "current config idx %" PRIu64 " prev idx %" PRIu64
+                         ", will not apply it",
+                         snap_conf->get_log_idx(),
+                         snap_conf->get_prev_log_idx(),
+                         c_conf->get_log_idx(),
+                         c_conf->get_prev_log_idx());
+                }
+            }
+
+            if (!snapshot_meta_conf && is_valid_snapshot_config(c_conf, snapshot_last_log_idx)) {
+                snapshot_meta_conf = c_conf;
+            }
+            if (!snapshot_meta_conf) {
+                p_wn("no config valid for snapshot idx %" PRIu64
+                     ", storing non-authoritative empty snapshot config",
+                     snapshot_last_log_idx);
+                snapshot_meta_conf = cs_new<cluster_config>();
             }
 
             precommit_index_ = req.get_snapshot().get_last_log_idx();
@@ -620,7 +649,7 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
             ptr<snapshot> new_snp = cs_new<snapshot>
                                     ( req.get_snapshot().get_last_log_idx(),
                                       req.get_snapshot().get_last_log_term(),
-                                      c_conf,
+                                      snapshot_meta_conf,
                                       req.get_snapshot().size(),
                                       req.get_snapshot().get_type() );
             set_last_snapshot(new_snp);
@@ -658,4 +687,3 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
 }
 
 } // namespace nuraft;
-
