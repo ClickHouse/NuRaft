@@ -1176,6 +1176,14 @@ protected:
     void set_last_snapshot(const ptr<snapshot>& new_snapshot);
 
     ulong store_log_entry(ptr<log_entry>& entry, ulong index = 0);
+    bool should_reject_client_request_by_uncommitted_log_entries(const std::vector<ptr<log_entry>>& entries,
+                                                                 uint64_t configured_max_entries,
+                                                                 uint64_t& current_entries,
+                                                                 uint64_t& request_entries,
+                                                                 uint64_t& max_entries) const;
+    void log_uncommitted_log_entry_limit_rejection(uint64_t current_entries,
+                                                   uint64_t request_entries,
+                                                   uint64_t max_entries) const;
 
     ptr<resp_msg> handle_out_of_log_msg(req_msg& req,
                                         ptr<custom_notification_msg> msg,
@@ -1295,6 +1303,11 @@ protected:
      * Actual commit index of state machine.
      */
     std::atomic<ulong> sm_commit_index_;
+
+    /**
+     * Last rate-limited warning timestamp for uncommitted limit rejections.
+     */
+    mutable std::atomic<uint64_t> last_uncommitted_limit_log_us_;
 
     /**
      * If `grace_period_of_lagging_state_machine_` option is enabled,

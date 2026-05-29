@@ -103,7 +103,13 @@ struct raft_params {
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
         , max_bytes_in_flight_in_stream_(0)
+        , max_uncommitted_log_entries_(0)
         {}
+
+    raft_params& with_max_uncommitted_log_entries(uint64_t max_entries) {
+        max_uncommitted_log_entries_ = max_entries;
+        return *this;
+    }
 
     /**
      * Election timeout upper bound in milliseconds
@@ -699,6 +705,15 @@ public:
      * specified byte limit. This limitation is effective only in streaming mode.
      */
     int64_t max_bytes_in_flight_in_stream_;
+
+    /**
+     * If non-zero, leader-side admission of new client requests will reject
+     * batches that would make the local uncommitted Raft log tail exceed this
+     * entry count. `0` disables this limit. The count is based on
+     * `next_slot - sm_commit_index_ - 1`. Control and recovery traffic is not
+     * limited by this setting.
+     */
+    uint64_t max_uncommitted_log_entries_;
 };
 
 }

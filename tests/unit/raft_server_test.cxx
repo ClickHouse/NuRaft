@@ -25,6 +25,7 @@ limitations under the License.
 #include "test_common.h"
 
 #include <stdio.h>
+#include <string>
 
 using namespace nuraft;
 using namespace raft_functional_common;
@@ -32,6 +33,46 @@ using namespace raft_functional_common;
 using raft_result = cmd_result< ptr<buffer> >;
 
 namespace raft_server_test {
+
+ptr<buffer> make_buffer(size_t size, char ch = 'x') {
+    ptr<buffer> msg = buffer::alloc(size);
+    if (size) {
+        std::string payload(size, ch);
+        msg->put_raw(reinterpret_cast<const byte*>(payload.data()), payload.size());
+    }
+    msg->pos(0);
+    return msg;
+}
+
+void set_uncommitted_limits(const std::vector<RaftPkg*>& pkgs, uint64_t entries) {
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.leadership_expiry_ = -1;
+        param.max_uncommitted_log_entries_ = entries;
+        pp->raftServer->update_params(param);
+    }
+}
+
+ptr<raft_result> append_one(RaftPkg& leader, size_t size) {
+    return leader.raftServer->append_entries( {make_buffer(size)} );
+}
+
+ptr<raft_result> append_batch(RaftPkg& leader, const std::vector<size_t>& sizes) {
+    std::vector<ptr<buffer>> messages;
+    for (size_t size: sizes) {
+        messages.push_back(make_buffer(size));
+    }
+    return leader.raftServer->append_entries(messages);
+}
+
+int drain_and_commit(RaftPkg& leader, const std::vector<RaftPkg*>& pkgs) {
+    for (size_t ii = 0; ii < 6; ++ii) {
+        leader.fNet->execReqResp();
+    }
+    return wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC);
+}
 
 int make_group_test() {
     reset_log_files();
@@ -2055,6 +2096,141 @@ int extended_append_entries_api_test() {
     return 0;
 }
 
+int uncommitted_log_entry_limit_rejects_client_appends_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    set_uncommitted_limits(pkgs, 2);
+
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    uint64_t last_log_idx = s1.raftServer->get_last_log_idx();
+    ptr<raft_result> rejected = append_one(s1, 1);
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+    CHK_EQ( last_log_idx, s1.raftServer->get_last_log_idx() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+int uncommitted_log_entry_limit_rejects_whole_batch_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    set_uncommitted_limits(pkgs, 2);
+
+    uint64_t callback_count = 0;
+    raft_server::req_ext_params ext_params;
+    ext_params.after_precommit_ = [&](const raft_server::req_ext_cb_params&) {
+        callback_count++;
+    };
+
+    std::vector<ptr<buffer>> batch = {make_buffer(1), make_buffer(1), make_buffer(1)};
+    uint64_t last_log_idx = s1.raftServer->get_last_log_idx();
+    ptr<raft_result> rejected = s1.raftServer->append_entries_ext(batch, ext_params);
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+    CHK_EQ( last_log_idx, s1.raftServer->get_last_log_idx() );
+    CHK_Z( callback_count );
+
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    rejected = append_one(s1, 1);
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+int uncommitted_log_entry_limit_accepts_after_commit_catches_up_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    set_uncommitted_limits(pkgs, 2);
+
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    ptr<raft_result> rejected = append_one(s1, 1);
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+
+    CHK_Z( drain_and_commit(s1, pkgs) );
+    CHK_TRUE( append_one(s1, 1)->get_accepted() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+int uncommitted_log_limit_allows_control_append_and_counts_it_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    set_uncommitted_limits(pkgs, 2);
+
+    CHK_TRUE( append_one(s1, 8)->get_accepted() );
+    uint64_t last_log_idx = s1.raftServer->get_last_log_idx();
+    ptr<raft_result> rejected = append_batch(s1, {8, 8});
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+    CHK_EQ( last_log_idx, s1.raftServer->get_last_log_idx() );
+
+    s1.raftServer->set_user_ctx("ctx");
+    CHK_EQ( last_log_idx + 1, s1.raftServer->get_last_log_idx() );
+
+    rejected = append_one(s1, 8);
+    CHK_FALSE( rejected->get_accepted() );
+    CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
+    CHK_EQ( last_log_idx + 1, s1.raftServer->get_last_log_idx() );
+
+    CHK_Z( drain_and_commit(s1, pkgs) );
+    CHK_TRUE( append_one(s1, 8)->get_accepted() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
 }  // namespace raft_server_test;
 using namespace raft_server_test;
 
@@ -2125,6 +2301,18 @@ int main(int argc, char** argv) {
 
     ts.doTest( "extended append_entries API test",
                extended_append_entries_api_test );
+
+    ts.doTest( "uncommitted log entry limit rejects client appends test",
+               uncommitted_log_entry_limit_rejects_client_appends_test );
+
+    ts.doTest( "uncommitted log entry limit rejects whole batch test",
+               uncommitted_log_entry_limit_rejects_whole_batch_test );
+
+    ts.doTest( "uncommitted log entry limit accepts after commit catches up test",
+               uncommitted_log_entry_limit_accepts_after_commit_catches_up_test );
+
+    ts.doTest( "uncommitted log limit allows control append and counts it test",
+               uncommitted_log_limit_allows_control_append_and_counts_it_test );
 
     ts.doTest( "priority v2 test",
                priority_v2_test );
