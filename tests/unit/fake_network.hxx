@@ -42,11 +42,12 @@ public:
                 ptr<FakeNetworkBase>& _base);
 
     struct ReqPkg {
-        ReqPkg(ptr<req_msg>& _req, rpc_handler& _when_done)
-            : req(_req), whenDone(_when_done)
+        ReqPkg(ptr<req_msg>& _req, rpc_handler& _when_done, uint64_t _timeout_ms)
+            : req(_req), whenDone(_when_done), timeoutMs(_timeout_ms)
             {}
         ptr<req_msg> req;
         rpc_handler whenDone;
+        uint64_t timeoutMs;
     };
 
     struct RespPkg {
@@ -89,6 +90,16 @@ public:
     size_t getNumPendingReqs(const std::string& endpoint);
 
     size_t getNumPendingResps(const std::string& endpoint);
+
+    int getFirstPendingReqType(const std::string& endpoint);
+
+    uint64_t getFirstPendingReqTimeout(const std::string& endpoint);
+
+    ptr<peer> getPeer(raft_server* srv, int32 peer_id);
+
+    bool isPeerBusy(raft_server* srv, int32 peer_id);
+
+    bool doesPeerNeedToReconnect(raft_server* srv, int32 peer_id);
 
     void goesOffline() { online = false; }
 

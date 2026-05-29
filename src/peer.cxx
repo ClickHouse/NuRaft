@@ -22,8 +22,11 @@ limitations under the License.
 
 #include "debugging_options.hxx"
 #include "raft_server.hxx"
+#include "strfmt.hxx"
 #include "tracer.hxx"
 
+#include <atomic>
+#include <memory>
 #include <unordered_set>
 
 namespace nuraft {
@@ -31,11 +34,13 @@ namespace nuraft {
 void peer::send_req( ptr<peer> myself,
                      ptr<req_msg>& req,
                      rpc_handler& handler,
-                     bool streaming )
+                     bool streaming,
+                     uint64_t send_timeout_ms )
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
              get_config().get_id());
+        set_free();
         return;
     }
 
@@ -66,20 +71,68 @@ void peer::send_req( ptr<peer> myself,
         }
     }
 
-    rpc_handler h = (rpc_handler)std::bind
-                    ( &peer::handle_rpc_result,
-                      this,
-                      myself,
-                      rpc_local->get_id(),
-                      req,
-                      pending,
-                      streaming,
-                      req_size_bytes,
-                      std::placeholders::_1,
-                      std::placeholders::_2 );
-    if (rpc_local) {
-        myself->bytes_in_flight_add(req_size_bytes);
-        rpc_local->send(req, h);
+    uint64_t rpc_client_id = rpc_local->get_id();
+    auto rpc_callback_invoked = std::make_shared<std::atomic<bool>>(false);
+    rpc_handler h =
+        [this,
+         myself,
+         rpc_client_id,
+         req,
+         pending,
+         streaming,
+         req_size_bytes,
+         rpc_callback_invoked]
+        (ptr<resp_msg>& resp, ptr<rpc_exception>& err) mutable
+        {
+            rpc_callback_invoked->store(true, std::memory_order_relaxed);
+            handle_rpc_result(myself,
+                              rpc_client_id,
+                              req,
+                              pending,
+                              streaming,
+                              req_size_bytes,
+                              resp,
+                              err);
+        };
+    myself->bytes_in_flight_add(req_size_bytes);
+    try {
+        rpc_local->send(req, h, send_timeout_ms);
+    } catch (const std::exception& e) {
+        if (rpc_callback_invoked->load(std::memory_order_relaxed)) {
+            throw;
+        }
+
+        std::string err_msg =
+            lstrfmt("synchronous exception from rpc_client::send to peer %d: %s")
+                .fmt(req->get_dst(), e.what());
+        ptr<resp_msg> no_resp;
+        ptr<rpc_exception> err = cs_new<rpc_exception>(err_msg, req);
+        handle_rpc_result(myself,
+                          rpc_client_id,
+                          req,
+                          pending,
+                          streaming,
+                          req_size_bytes,
+                          no_resp,
+                          err);
+    } catch (...) {
+        if (rpc_callback_invoked->load(std::memory_order_relaxed)) {
+            throw;
+        }
+
+        std::string err_msg =
+            lstrfmt("synchronous unknown exception from rpc_client::send to peer %d")
+                .fmt(req->get_dst());
+        ptr<resp_msg> no_resp;
+        ptr<rpc_exception> err = cs_new<rpc_exception>(err_msg, req);
+        handle_rpc_result(myself,
+                          rpc_client_id,
+                          req,
+                          pending,
+                          streaming,
+                          req_size_bytes,
+                          no_resp,
+                          err);
     }
 }
 
@@ -152,12 +205,15 @@ void peer::handle_rpc_result( ptr<peer> myself,
             auto_lock(lock_);
             resume_hb_speed();
         }
-        ptr<rpc_exception> no_except;
-        resp->set_peer(myself);
-        pending_result->set_result(resp, no_except);
 
         reconn_backoff_.reset();
         reconn_backoff_.set_duration_ms(1);
+
+        ptr<rpc_exception> no_except;
+        resp->set_peer(myself);
+        // `set_result` invokes user handlers synchronously, so all peer
+        // lifecycle cleanup must stay before this call.
+        pending_result->set_result(resp, no_except);
 
     } else {
         // Failed.
@@ -169,8 +225,6 @@ void peer::handle_rpc_result( ptr<peer> myself,
             auto_lock(lock_);
             slow_down_hb();
         }
-        ptr<resp_msg> no_resp;
-        pending_result->set_result(no_resp, err);
 
         // Destroy this connection, we MUST NOT re-use existing socket.
         // Next append operation will create a new one.
@@ -217,6 +271,11 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 }
             }
         }
+
+        ptr<resp_msg> no_resp;
+        // `set_result` invokes user handlers synchronously, so all peer
+        // lifecycle cleanup must stay before this call.
+        pending_result->set_result(no_resp, err);
     }
 }
 
@@ -327,4 +386,3 @@ void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
 }
 
 } // namespace nuraft;
-

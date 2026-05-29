@@ -33,6 +33,24 @@ limitations under the License.
 
 namespace nuraft {
 
+namespace {
+
+uint64_t get_election_rpc_timeout_ms(const raft_params& params, int32 response_limit) {
+    if (params.election_timeout_upper_bound_ > 0) {
+        return static_cast<uint64_t>(params.election_timeout_upper_bound_);
+    }
+    if (params.election_timeout_lower_bound_ > 0) {
+        return static_cast<uint64_t>(params.election_timeout_lower_bound_);
+    }
+    if (params.heart_beat_interval_ > 0 && response_limit > 0) {
+        return static_cast<uint64_t>(params.heart_beat_interval_) *
+               static_cast<uint64_t>(response_limit);
+    }
+    return 0;
+}
+
+} // namespace
+
 bool raft_server::check_cond_for_zp_election() {
     ptr<raft_params> params = ctx_->get_params();
     if ( params->allow_temporary_zero_priority_leader_ &&
@@ -47,6 +65,20 @@ bool raft_server::check_cond_for_zp_election() {
 
 void raft_server::request_prevote() {
     ptr<raft_params> params = ctx_->get_params();
+    const int32 response_limit = raft_server::raft_limits_.response_limit_.load();
+    const uint64_t election_rpc_timeout_ms =
+        get_election_rpc_timeout_ms(*params, response_limit);
+    if (!election_rpc_timeout_ms) {
+        p_er("cannot send election RPC with disabled timeout: "
+             "election_timeout_upper_bound %d, election_timeout_lower_bound %d, "
+             "heart_beat_interval %d, response_limit %d",
+             params->election_timeout_upper_bound_,
+             params->election_timeout_lower_bound_,
+             params->heart_beat_interval_,
+             response_limit);
+        return;
+    }
+
     ptr<cluster_config> c_config = get_config();
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
         ptr<peer> pp = it->second;
@@ -165,7 +197,7 @@ void raft_server::request_prevote() {
                             log_store_->next_slot() - 1,
                             quick_commit_index_.load() ) );
         if (pp->make_busy()) {
-            pp->send_req(pp, req, resp_handler_);
+            pp->send_req(pp, req, resp_handler_, false, election_rpc_timeout_ms);
         } else {
             pre_vote_.connection_busy_++;
             p_wn("failed to send prevote request: peer %d (%s) is busy, count %d",
@@ -197,7 +229,8 @@ void raft_server::request_prevote() {
 }
 
 void raft_server::initiate_vote(bool force_vote) {
-    int grace_period = ctx_->get_params()->grace_period_of_lagging_state_machine_;
+    ptr<raft_params> params = ctx_->get_params();
+    int grace_period = params->grace_period_of_lagging_state_machine_;
     ulong cur_term = state_->get_term();
     if ( !force_vote &&
          grace_period &&
@@ -235,6 +268,20 @@ void raft_server::initiate_vote(bool force_vote) {
          check_cond_for_zp_election() ||
          ( get_quorum_for_election() == 0 &&
            my_priority_ > 0 ) ) {
+        const int32 response_limit = raft_server::raft_limits_.response_limit_.load();
+        const uint64_t election_rpc_timeout_ms =
+            get_election_rpc_timeout_ms(*params, response_limit);
+        if (!election_rpc_timeout_ms) {
+            p_er("cannot send election RPC with disabled timeout: "
+                 "election_timeout_upper_bound %d, election_timeout_lower_bound %d, "
+                 "heart_beat_interval %d, response_limit %d",
+                 params->election_timeout_upper_bound_,
+                 params->election_timeout_lower_bound_,
+                 params->heart_beat_interval_,
+                 response_limit);
+            return;
+        }
+
         // Request vote when
         //  1) my priority satisfies the target, OR
         //  2) I'm the only node in the group.
@@ -247,7 +294,7 @@ void raft_server::initiate_vote(bool force_vote) {
         election_completed_ = false;
         // NOTE: Following `request_vote` will call `save_state()`,
         //       hence we don't call it here even though `state_` changes.
-        request_vote(force_vote);
+        request_vote(force_vote, election_rpc_timeout_ms);
     }
 
     if (role_ != srv_role::leader) {
@@ -256,7 +303,7 @@ void raft_server::initiate_vote(bool force_vote) {
     }
 }
 
-void raft_server::request_vote(bool force_vote) {
+void raft_server::request_vote(bool force_vote, uint64_t election_rpc_timeout_ms) {
     state_->set_voted_for(id_);
     ctx_->state_mgr_->save_state(*state_);
     votes_granted_ += 1;
@@ -305,7 +352,7 @@ void raft_server::request_vote(bool force_vote) {
               it->second->get_id(),
               state_->get_term() );
         if (pp->make_busy()) {
-            pp->send_req(pp, req, resp_handler_);
+            pp->send_req(pp, req, resp_handler_, false, election_rpc_timeout_ms);
         } else {
             p_wn("failed to send vote request: peer %d (%s) is busy",
                  pp->get_id(), pp->get_endpoint().c_str());
@@ -552,4 +599,3 @@ void raft_server::handle_prevote_resp(resp_msg& resp) {
 }
 
 } // namespace nuraft;
-
