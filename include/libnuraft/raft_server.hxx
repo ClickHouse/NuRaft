@@ -1082,7 +1082,7 @@ protected:
     bool check_cond_for_zp_election();
     void request_prevote();
     void initiate_vote(bool force_vote = false);
-    void request_vote(bool force_vote);
+    void request_vote(bool force_vote, uint64_t election_rpc_timeout_ms);
     void request_append_entries();
     bool request_append_entries(ptr<peer> p);
     bool send_request(ptr<peer>& p,

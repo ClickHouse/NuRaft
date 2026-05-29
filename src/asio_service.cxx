@@ -1594,20 +1594,33 @@ public:
                   this, host_.c_str(), port_.c_str() );
 
             if (impl_->get_options().custom_resolver_) {
-                impl_->get_options().custom_resolver_(
-                    host_,
-                    port_,
-                    [this, self, req, when_done, send_timeout_ms]
-                    ( const std::string& resolved_host,
-                      const std::string& resolved_port,
-                      std::error_code err ) {
-                        if (!err) {
-                            p_in( "custom resolver: %s:%s to %s:%s",
-                                  host_.c_str(), port_.c_str(),
-                                  resolved_host.c_str(), resolved_port.c_str() );
-                            execute_resolver(self, req, resolved_host, resolved_port,
-                                             when_done, send_timeout_ms);
-                        } else {
+                std::string completion_error_msg;
+                auto custom_resolver_callback_invoked =
+                    std::make_shared<std::atomic<bool>>(false);
+                try {
+                    impl_->get_options().custom_resolver_(
+                        host_,
+                        port_,
+                        [this,
+                         self,
+                         req,
+                         when_done,
+                         send_timeout_ms,
+                         custom_resolver_callback_invoked]
+                        ( const std::string& resolved_host,
+                          const std::string& resolved_port,
+                          std::error_code err ) {
+                            custom_resolver_callback_invoked
+                                ->store(true, std::memory_order_relaxed);
+                            if (!err) {
+                                p_in( "custom resolver: %s:%s to %s:%s",
+                                      host_.c_str(), port_.c_str(),
+                                      resolved_host.c_str(), resolved_port.c_str() );
+                                execute_resolver(self, req, resolved_host, resolved_port,
+                                                 when_done, send_timeout_ms);
+                                return;
+                            }
+
                             std::string err_msg = lstrfmt("failed to resolve "
                                                           "host %s by given "
                                                           "custom resolver "
@@ -1615,40 +1628,73 @@ public:
                                                           .fmt( host_.c_str(),
                                                                 err.value(),
                                                                 err.message().c_str() );
+                            clear_busy_flag_if_set(false);
                             handle_error(req, err_msg, when_done);
-                        }
-                    } );
+                        } );
+                } catch (const std::exception& e) {
+                    if (custom_resolver_callback_invoked->load(std::memory_order_relaxed)) {
+                        throw;
+                    }
+                    send_timer_.cancel();
+                    completion_error_msg =
+                        setup_exception_message("custom resolver setup", req, e);
+                } catch (...) {
+                    if (custom_resolver_callback_invoked->load(std::memory_order_relaxed)) {
+                        throw;
+                    }
+                    send_timer_.cancel();
+                    completion_error_msg =
+                        setup_unknown_exception_message("custom resolver setup", req);
+                }
+
+                if (!completion_error_msg.empty()) {
+                    clear_busy_flag_if_set(false);
+                    handle_error(req, completion_error_msg, when_done);
+                }
             } else {
                 execute_resolver(self, req, host_, port_, when_done, send_timeout_ms);
             }
             return;
         }
 
-        ptr<buffer> req_buf = serialize_req(req);
+        try {
+            ptr<buffer> req_buf = serialize_req(req);
 
-        if (send_timeout_ms != 0)
-        {
-            send_timer_.expires_after
-                   ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                     ( std::chrono::milliseconds( send_timeout_ms ) ) );
-            send_timer_.async_wait( std::bind( &asio_rpc_client::cancel_socket,
-                                               this,
-                                               std::placeholders::_1 ) );
+            if (send_timeout_ms != 0)
+            {
+                send_timer_.expires_after
+                       ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                         ( std::chrono::milliseconds( send_timeout_ms ) ) );
+                send_timer_.async_wait(
+                    [self](const ERROR_CODE& err) {
+                        self->cancel_socket(err);
+                    } );
+            }
+
+            // Note: without passing `req_buf` to callback function, it will be
+            //       unreachable before the write is done so that it is freed
+            //       and the memory corruption will occur.
+            aa::write( ssl_enabled_, ssl_socket_, socket_,
+                       asio::buffer(req_buf->data(), req_buf->size()),
+                       std::bind( &asio_rpc_client::sent,
+                                  self,
+                                  req,
+                                  req_buf,
+                                  when_done,
+                                  send_timeout_ms,
+                                  std::placeholders::_1,
+                                  std::placeholders::_2 ) );
+        } catch (const std::exception& e) {
+            send_timer_.cancel();
+            clear_busy_flag_if_set(false);
+            std::string err_msg = setup_exception_message("request send setup", req, e);
+            handle_error(req, err_msg, when_done);
+        } catch (...) {
+            send_timer_.cancel();
+            clear_busy_flag_if_set(false);
+            std::string err_msg = setup_unknown_exception_message("request send setup", req);
+            handle_error(req, err_msg, when_done);
         }
-
-        // Note: without passing `req_buf` to callback function, it will be
-        //       unreachable before the write is done so that it is freed
-        //       and the memory corruption will occur.
-        aa::write( ssl_enabled_, ssl_socket_, socket_,
-                   asio::buffer(req_buf->data(), req_buf->size()),
-                   std::bind( &asio_rpc_client::sent,
-                              self,
-                              req,
-                              req_buf,
-                              when_done,
-                              send_timeout_ms,
-                              std::placeholders::_1,
-                              std::placeholders::_2 ) );
     }
 private:
     void execute_resolver(ptr<asio_rpc_client> self,
@@ -1658,44 +1704,81 @@ private:
                           rpc_handler when_done,
                           uint64_t send_timeout_ms) {
 
-        resolver_.async_resolve
-        (
-            host,
-            port,
-            asio::ip::tcp::resolver::flags::all_matching,
-            [self, this, req, when_done, host, port, send_timeout_ms](
-                const std::error_code& err,
-                asio::ip::tcp::resolver::results_type endpoints ) -> void
-        {
-            if (!err) {
-                if (send_timeout_ms != 0) {
-                    send_timer_.expires_after
-                    ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
-                    send_timer_.async_wait(
-                        std::bind( &asio_rpc_client::cancel_socket,
-                                   this,
-                                   std::placeholders::_1 ) );
+        std::string setup_error_msg;
+        try {
+            resolver_.async_resolve
+            (
+                host,
+                port,
+                asio::ip::tcp::resolver::flags::all_matching,
+                [self,
+                 this,
+                 req,
+                 when_done,
+                 host,
+                 port,
+                 send_timeout_ms](
+                    const std::error_code& err,
+                    asio::ip::tcp::resolver::results_type endpoints ) -> void
+            {
+                std::string completion_error_msg;
+                try {
+                    if (!err) {
+                        if (send_timeout_ms != 0) {
+                            send_timer_.expires_after
+                            ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                              ( std::chrono::milliseconds( send_timeout_ms ) ) );
+                            send_timer_.async_wait(
+                                [self](const ERROR_CODE& timer_err) {
+                                    self->cancel_socket(timer_err);
+                                } );
+                        }
+                        asio::async_connect
+                            ( socket(),
+                              endpoints,
+                              std::bind( &asio_rpc_client::connected,
+                                         self,
+                                         req,
+                                         when_done,
+                                         send_timeout_ms,
+                                         std::placeholders::_1,
+                                         std::placeholders::_2 ) );
+                        return;
+                    } else {
+                        completion_error_msg =
+                            lstrfmt("failed to resolve host %s "
+                                    "due to error %d, %s")
+                                    .fmt( host.c_str(),
+                                          err.value(),
+                                          err.message().c_str() );
+                    }
+                } catch (const std::exception& e) {
+                    send_timer_.cancel();
+                    completion_error_msg =
+                        setup_exception_message("resolver completion", req, e);
+                } catch (...) {
+                    send_timer_.cancel();
+                    completion_error_msg =
+                        setup_unknown_exception_message("resolver completion", req);
                 }
-                asio::async_connect
-                    ( socket(),
-                      endpoints,
-                      std::bind( &asio_rpc_client::connected,
-                                 self,
-                                 req,
-                                 when_done,
-                                 send_timeout_ms,
-                                 std::placeholders::_1,
-                                 std::placeholders::_2 ) );
-            } else {
-                std::string err_msg = lstrfmt("failed to resolve host %s "
-                                              "due to error %d, %s")
-                                              .fmt( host.c_str(),
-                                                    err.value(),
-                                                    err.message().c_str() );
-                handle_error(req, err_msg, when_done);
-            }
-        } );
+
+                if (!completion_error_msg.empty()) {
+                    clear_busy_flag_if_set(false);
+                    handle_error(req, completion_error_msg, when_done);
+                }
+            } );
+        } catch (const std::exception& e) {
+            send_timer_.cancel();
+            setup_error_msg = setup_exception_message("resolver setup", req, e);
+        } catch (...) {
+            send_timer_.cancel();
+            setup_error_msg = setup_unknown_exception_message("resolver setup", req);
+        }
+
+        if (!setup_error_msg.empty()) {
+            clear_busy_flag_if_set(false);
+            handle_error(req, setup_error_msg, when_done);
+        }
     }
 
     void set_busy_flag(bool receive, bool busy) {
@@ -1708,6 +1791,29 @@ private:
             assert(0);
         }
         flag = busy;
+    }
+
+    // Use only from the same per-direction ASIO chain that owns the flag.
+    // The flags are non-atomic and this helper is not a cross-thread
+    // synchronization primitive.
+    void clear_busy_flag_if_set(bool receive) {
+        bool& flag = receive ? receive_busy_ : send_busy_;
+        if (flag) {
+            set_busy_flag(receive, false);
+        }
+    }
+
+    std::string setup_exception_message(const char* phase,
+                                        const ptr<req_msg>& req,
+                                        const std::exception& e) {
+        return lstrfmt("exception during %s for peer %d, %s:%s: %s")
+            .fmt(phase, req->get_dst(), host_.c_str(), port_.c_str(), e.what());
+    }
+
+    std::string setup_unknown_exception_message(const char* phase,
+                                                const ptr<req_msg>& req) {
+        return lstrfmt("unknown exception during %s for peer %d, %s:%s")
+            .fmt(phase, req->get_dst(), host_.c_str(), port_.c_str());
     }
 
     void handle_error(ptr<req_msg> req,
@@ -1730,7 +1836,22 @@ private:
         if (!impl_->get_options().streaming_mode_) {
             ptr<resp_msg> resp;
             ptr<rpc_exception> except(cs_new<rpc_exception>(err_msg, req));
-            when_done(resp, except);
+            invoke_rpc_error_callback(req, when_done, resp, except);
+        }
+    }
+
+    void invoke_rpc_error_callback(const ptr<req_msg>& req,
+                                   rpc_handler& when_done,
+                                   ptr<resp_msg>& rsp,
+                                   ptr<rpc_exception>& except) {
+        try {
+            when_done(rsp, except);
+        } catch (const std::exception& e) {
+            p_er("RPC error callback for peer %d threw exception: %s",
+                 req->get_dst(), e.what());
+        } catch (...) {
+            p_er("RPC error callback for peer %d threw unknown exception",
+                 req->get_dst());
         }
     }
 
@@ -1787,7 +1908,7 @@ private:
                 err_msg = lstrfmt("socket to host %s is closed").fmt( host_.c_str() );
             }
             ptr<rpc_exception> except( cs_new<rpc_exception>( err_msg, pkg->req_) );
-            pkg->when_done_(rsp, except);
+            invoke_rpc_error_callback(pkg->req_, pkg->when_done_, rsp, except);
         }
 
         ptr<req_msg> last_req;
@@ -1820,32 +1941,45 @@ private:
                    const asio::ip::tcp::endpoint&)
     {
         if (!err) {
-            asio::ip::tcp::no_delay option(true);
-            socket().set_option(option);
-            p_in( "%p connected to %s:%s (as a client)",
-                  this, host_.c_str(), port_.c_str() );
-            if (ssl_enabled_) {
+            try {
+                asio::ip::tcp::no_delay option(true);
+                socket().set_option(option);
+                p_in( "%p connected to %s:%s (as a client)",
+                      this, host_.c_str(), port_.c_str() );
+                if (ssl_enabled_) {
 #ifdef SSL_LIBRARY_NOT_FOUND
-                assert(0); // Should not reach here.
+                    assert(0); // Should not reach here.
 #else
-                ptr<asio_rpc_client> self = this->shared_from_this();
-                ssl_socket_.async_handshake
-                    ( asio::ssl::stream_base::client,
-                      std::bind( &asio_rpc_client::handle_handshake,
-                                 self,
-                                 req,
-                                 when_done,
-                                 send_timeout_ms,
-                                 std::placeholders::_1 ) );
+                    ptr<asio_rpc_client> self = this->shared_from_this();
+                    ssl_socket_.async_handshake
+                        ( asio::ssl::stream_base::client,
+                          std::bind( &asio_rpc_client::handle_handshake,
+                                     self,
+                                     req,
+                                     when_done,
+                                     send_timeout_ms,
+                                     std::placeholders::_1 ) );
 #endif
-            } else {
+                } else {
+                    send_timer_.cancel();
+                    set_busy_flag(/*receive=*/ false, /*busy=*/ false);
+                    this->register_req_send(req, when_done, send_timeout_ms);
+                }
+            } catch (const std::exception& e) {
                 send_timer_.cancel();
-                set_busy_flag(/*receive=*/ false, /*busy=*/ false);
-                this->register_req_send(req, when_done, send_timeout_ms);
+                clear_busy_flag_if_set(false);
+                std::string err_msg = setup_exception_message("connect completion", req, e);
+                handle_error(req, err_msg, when_done);
+            } catch (...) {
+                send_timer_.cancel();
+                clear_busy_flag_if_set(false);
+                std::string err_msg = setup_unknown_exception_message("connect completion", req);
+                handle_error(req, err_msg, when_done);
             }
 
         } else {
             send_timer_.cancel();
+            clear_busy_flag_if_set(false);
             std::string err_msg = sstrfmt("failed to connect to "
                                           "peer %d, %s:%s, error %d, %s")
                                           .fmt( req->get_dst(), host_.c_str(),
@@ -1861,13 +1995,22 @@ private:
                           const ERROR_CODE& err)
     {
         send_timer_.cancel();
-        ptr<asio_rpc_client> self = this->shared_from_this();
 
         if (!err) {
-            p_in( "handshake with %s:%s succeeded (as a client)",
-                  host_.c_str(), port_.c_str() );
-            set_busy_flag(/*receive=*/ false, /*busy=*/ false);
-            this->register_req_send(req, when_done, send_timeout_ms);
+            try {
+                p_in( "handshake with %s:%s succeeded (as a client)",
+                      host_.c_str(), port_.c_str() );
+                set_busy_flag(/*receive=*/ false, /*busy=*/ false);
+                this->register_req_send(req, when_done, send_timeout_ms);
+            } catch (const std::exception& e) {
+                clear_busy_flag_if_set(false);
+                std::string err_msg = setup_exception_message("handshake completion", req, e);
+                handle_error(req, err_msg, when_done);
+            } catch (...) {
+                clear_busy_flag_if_set(false);
+                std::string err_msg = setup_unknown_exception_message("handshake completion", req);
+                handle_error(req, err_msg, when_done);
+            }
 
         } else {
             p_er( "failed SSL handshake with peer %d, %s:%s, error %d, %s",
@@ -1880,6 +2023,7 @@ private:
                                           .fmt( req->get_dst(), host_.c_str(),
                                                 port_.c_str(), err.value(),
                                                 err.message().c_str() );
+            clear_busy_flag_if_set(false);
             handle_error(req, err_msg, when_done);
         }
     }
@@ -1896,13 +2040,22 @@ private:
         send_timer_.cancel();
         if (!err) {
             set_busy_flag(/*receive=*/ false, /*busy=*/ false);
-            uint64_t receive_timeout_ms = send_timeout_ms;
-            if (impl_->get_options().streaming_mode_) {
-                post_send(req, when_done, receive_timeout_ms);
-            } else {
-                register_response_read(req, when_done, receive_timeout_ms);
+            try {
+                uint64_t receive_timeout_ms = send_timeout_ms;
+                if (impl_->get_options().streaming_mode_) {
+                    post_send(req, when_done, receive_timeout_ms);
+                } else {
+                    register_response_read(req, when_done, receive_timeout_ms);
+                }
+            } catch (const std::exception& e) {
+                std::string err_msg = setup_exception_message("post-send setup", req, e);
+                handle_error(req, err_msg, when_done);
+            } catch (...) {
+                std::string err_msg = setup_unknown_exception_message("post-send setup", req);
+                handle_error(req, err_msg, when_done);
             }
         } else {
+            clear_busy_flag_if_set(false);
             std::string err_msg = sstrfmt( "failed to send request to peer %d, %s:%s, "
                                            "error %d, %s" )
                                            .fmt( req->get_dst(), host_.c_str(),
@@ -1963,25 +2116,37 @@ private:
     {
         ptr<asio_rpc_client> self(this->shared_from_this());
         set_busy_flag(/*receive=*/ true, /*busy=*/ true);
-        if (receive_timeout_ms != 0) {
-            receive_timer_.expires_after
-            ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                ( std::chrono::milliseconds( receive_timeout_ms ) ) );
-            receive_timer_.async_wait(
-                std::bind( &asio_rpc_client::cancel_socket,
-                            this,
-                            std::placeholders::_1 ) );
+        try {
+            if (receive_timeout_ms != 0) {
+                receive_timer_.expires_after
+                ( std::chrono::duration_cast<std::chrono::nanoseconds>
+                    ( std::chrono::milliseconds( receive_timeout_ms ) ) );
+                receive_timer_.async_wait(
+                    [self](const ERROR_CODE& err) {
+                        self->cancel_socket(err);
+                    } );
+            }
+            ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
+            aa::read( ssl_enabled_, ssl_socket_, socket_,
+                      asio::buffer(resp_buf->data(), resp_buf->size()),
+                      std::bind( &asio_rpc_client::response_read,
+                                 self,
+                                 req,
+                                 when_done,
+                                 resp_buf,
+                                 std::placeholders::_1,
+                                 std::placeholders::_2 ) );
+        } catch (const std::exception& e) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_exception_message("response read setup", req, e);
+            handle_error(req, err_msg, when_done);
+        } catch (...) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_unknown_exception_message("response read setup", req);
+            handle_error(req, err_msg, when_done);
         }
-        ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
-        aa::read( ssl_enabled_, ssl_socket_, socket_,
-                  asio::buffer(resp_buf->data(), resp_buf->size()),
-                  std::bind( &asio_rpc_client::response_read,
-                             self,
-                             req,
-                             when_done,
-                             resp_buf,
-                             std::placeholders::_1,
-                             std::placeholders::_2 ) );
     }
 
     void response_read(ptr<req_msg>& req,
@@ -1993,6 +2158,7 @@ private:
         ptr<asio_rpc_client> self(this->shared_from_this());
         if (err) {
             receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
             std::string err_msg = sstrfmt( "failed to read response to peer %d, %s:%s, "
                                            "error %d, %s" )
                                            .fmt( req->get_dst(), host_.c_str(),
@@ -2002,73 +2168,90 @@ private:
             return;
         }
 
-        buffer_serializer bs(resp_buf);
-        uint32_t crc_local = crc32_8( resp_buf->data_begin(),
-                                      RPC_RESP_HEADER_SIZE - CRC_FLAGS_LEN,
-                                      0 );
-        bs.pos(RPC_RESP_HEADER_SIZE - CRC_FLAGS_LEN);
-        uint64_t flags_and_crc = bs.get_u64();
-        uint32_t crc_buf = flags_and_crc & (uint32_t)0xffffffff;
-        uint32_t flags = (flags_and_crc >> 32);
+        ptr<resp_msg> rsp;
+        std::string completion_error_msg;
+        try {
+            buffer_serializer bs(resp_buf);
+            uint32_t crc_local = crc32_8( resp_buf->data_begin(),
+                                          RPC_RESP_HEADER_SIZE - CRC_FLAGS_LEN,
+                                          0 );
+            bs.pos(RPC_RESP_HEADER_SIZE - CRC_FLAGS_LEN);
+            uint64_t flags_and_crc = bs.get_u64();
+            uint32_t crc_buf = flags_and_crc & (uint32_t)0xffffffff;
+            uint32_t flags = (flags_and_crc >> 32);
 
-        if (crc_local != crc_buf) {
+            if (crc_local != crc_buf) {
+                completion_error_msg =
+                    sstrfmt( "CRC mismatch in response from "
+                             "peer %d, %s:%s, "
+                             "local calculation %x, from buffer %x")
+                             .fmt( req->get_dst(), host_.c_str(),
+                                   port_.c_str(), crc_local, crc_buf );
+            } else {
+                bs.pos(1);
+                byte msg_type_val = bs.get_u8();
+                int32 src = bs.get_i32();
+                int32 dst = bs.get_i32();
+                ulong term = bs.get_u64();
+                ulong nxt_idx = bs.get_u64();
+                byte accepted_val = bs.get_u8();
+                int32 carried_data_size = bs.get_i32();
+                rsp = cs_new<resp_msg>
+                      ( term, (msg_type)msg_type_val, src, dst,
+                        nxt_idx, accepted_val == 1 );
+
+                if ( !(flags & INCLUDE_META) &&
+                     impl_->get_options().read_resp_meta_ &&
+                     impl_->get_options().invoke_resp_cb_on_empty_meta_ ) {
+                    // If callback is given, but meta is empty, and
+                    // the "always invoke" flag is set, invoke it.
+                    handle_custom_resp_meta
+                    ( req, rsp, std::string(), completion_error_msg );
+                }
+
+                if (completion_error_msg.empty() && (flags & MARK_DOWN)) {
+                    // Mark down flag is set in the response.
+                    rsp->set_extra_flags(rsp->get_extra_flags() | resp_msg::SELF_MARK_DOWN);
+                }
+
+                if (completion_error_msg.empty() && carried_data_size) {
+                    ptr<buffer> ctx_buf = buffer::alloc(carried_data_size);
+                    aa::read( ssl_enabled_, ssl_socket_, socket_,
+                              asio::buffer(ctx_buf->data(), carried_data_size),
+                              std::bind( &asio_rpc_client::ctx_read,
+                                         self,
+                                         req,
+                                         rsp,
+                                         when_done,
+                                         ctx_buf,
+                                         flags,
+                                         std::placeholders::_1,
+                                         std::placeholders::_2 ) );
+                    return;
+                }
+            }
+        } catch (const std::exception& e) {
             receive_timer_.cancel();
-            std::string err_msg = sstrfmt( "CRC mismatch in response from "
-                                           "peer %d, %s:%s, "
-                                           "local calculation %x, from buffer %x")
-                                           .fmt( req->get_dst(), host_.c_str(),
-                                                 port_.c_str(), crc_local, crc_buf );
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_exception_message("response read completion", req, e);
+            handle_error(req, err_msg, when_done);
+            return;
+        } catch (...) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_unknown_exception_message("response read completion", req);
             handle_error(req, err_msg, when_done);
             return;
         }
 
-        bs.pos(1);
-        byte msg_type_val = bs.get_u8();
-        int32 src = bs.get_i32();
-        int32 dst = bs.get_i32();
-        ulong term = bs.get_u64();
-        ulong nxt_idx = bs.get_u64();
-        byte accepted_val = bs.get_u8();
-        int32 carried_data_size = bs.get_i32();
-        ptr<resp_msg> rsp
-            ( cs_new<resp_msg>
-              ( term, (msg_type)msg_type_val, src, dst,
-                nxt_idx, accepted_val == 1 ) );
-
-        if ( !(flags & INCLUDE_META) &&
-             impl_->get_options().read_resp_meta_ &&
-             impl_->get_options().invoke_resp_cb_on_empty_meta_ ) {
-            // If callback is given, but meta is empty, and
-            // the "always invoke" flag is set, invoke it.
-            bool meta_ok = handle_custom_resp_meta
-                           ( req, rsp, when_done, std::string() );
-            if (!meta_ok) {
-                receive_timer_.cancel();
-                return;
-            }
+        if (!completion_error_msg.empty()) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            handle_error(req, completion_error_msg, when_done);
+            return;
         }
 
-        if (flags & MARK_DOWN) {
-            // Mark down flag is set in the response.
-            rsp->set_extra_flags(rsp->get_extra_flags() | resp_msg::SELF_MARK_DOWN);
-        }
-
-        if (carried_data_size) {
-            ptr<buffer> ctx_buf = buffer::alloc(carried_data_size);
-            aa::read( ssl_enabled_, ssl_socket_, socket_,
-                      asio::buffer(ctx_buf->data(), carried_data_size),
-                      std::bind( &asio_rpc_client::ctx_read,
-                                 self,
-                                 req,
-                                 rsp,
-                                 when_done,
-                                 ctx_buf,
-                                 flags,
-                                 std::placeholders::_1,
-                                 std::placeholders::_2 ) );
-        } else {
-            post_read(req, rsp, when_done);
-        }
+        post_read(req, rsp, when_done);
     }
 
     void ctx_read(ptr<req_msg>& req,
@@ -2081,6 +2264,7 @@ private:
     {
         if (err) {
             receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
             std::string err_msg = sstrfmt( "failed to read response context "
                                            "from peer %d, %s:%s, error %d, %s" )
                                            .fmt( req->get_dst(), host_.c_str(),
@@ -2090,74 +2274,92 @@ private:
             return;
         }
 
-        if ( !(flags & INCLUDE_META) &&
-             !(flags & INCLUDE_HINT) &&
-	     !(flags & INCLUDE_RESULT_CODE)) {
-            // Neither meta nor hint nor result code exists,
-            // just use the buffer as it is for ctx.
-            ctx_buf->pos(0);
-            rsp->set_ctx(ctx_buf);
+        std::string completion_error_msg;
+        try {
+            if ( !(flags & INCLUDE_META) &&
+                 !(flags & INCLUDE_HINT) &&
+                 !(flags & INCLUDE_RESULT_CODE)) {
+                // Neither meta nor hint nor result code exists,
+                // just use the buffer as it is for ctx.
+                ctx_buf->pos(0);
+                rsp->set_ctx(ctx_buf);
+            }
+            else
+            {
+                // Otherwise: buffer contains composite data.
+                buffer_serializer bs(ctx_buf);
+                int remaining_len = ctx_buf->size();
 
-            post_read(req, rsp, when_done);
+                // 1) Custom meta.
+                if (flags & INCLUDE_META) {
+                    size_t resp_meta_len = 0;
+                    void* resp_meta_raw = bs.get_bytes(resp_meta_len);
+
+                    // If callback is given, verify meta
+                    // (if meta is empty, invoke callback according to the flag).
+                    if ( impl_->get_options().read_resp_meta_ &&
+                         ( resp_meta_len ||
+                           impl_->get_options().invoke_resp_cb_on_empty_meta_ ) ) {
+
+                        handle_custom_resp_meta
+                        ( req, rsp,
+                          std::string( (const char*)resp_meta_raw,
+                                       resp_meta_len ),
+                          completion_error_msg );
+                    }
+                    remaining_len -= sizeof(int32) + resp_meta_len;
+                }
+
+                // 2) Hint.
+                if (completion_error_msg.empty() && (flags & INCLUDE_HINT)) {
+                    size_t hint_len = 0;
+                    uint16_t hint_version = bs.get_u16();
+                    (void)hint_version;
+                    hint_len = bs.get_u16();
+                    rsp->set_next_batch_size_hint_in_bytes(bs.get_i64());
+                    remaining_len -= sizeof(uint16_t) * 2 + hint_len;
+                }
+
+                // 3) Context.
+                assert(remaining_len >= 0);
+                size_t ctx_len = remaining_len;
+                if (completion_error_msg.empty() && (flags & INCLUDE_RESULT_CODE)) {
+                    ctx_len -= sizeof(int32_t);
+                }
+                if (completion_error_msg.empty() && ctx_len) {
+                    // It has context, read it.
+                    ptr<buffer> actual_ctx = buffer::alloc(ctx_len);
+                    bs.get_buffer(actual_ctx);
+                    rsp->set_ctx(actual_ctx);
+                    remaining_len -= ctx_len;
+                }
+
+                // 4) Result code
+                if (completion_error_msg.empty() && (flags & INCLUDE_RESULT_CODE)) {
+                    assert((size_t)remaining_len >= sizeof(int32_t));
+                    cmd_result_code res = static_cast<cmd_result_code>(bs.get_i32());
+                    rsp->set_result_code(res);
+                }
+            }
+        } catch (const std::exception& e) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_exception_message("context read completion", req, e);
+            handle_error(req, err_msg, when_done);
+            return;
+        } catch (...) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            std::string err_msg = setup_unknown_exception_message("context read completion", req);
+            handle_error(req, err_msg, when_done);
             return;
         }
 
-        // Otherwise: buffer contains composite data.
-        buffer_serializer bs(ctx_buf);
-        int remaining_len = ctx_buf->size();
-
-        // 1) Custom meta.
-        if (flags & INCLUDE_META) {
-            size_t resp_meta_len = 0;
-            void* resp_meta_raw = bs.get_bytes(resp_meta_len);
-
-            // If callback is given, verify meta
-            // (if meta is empty, invoke callback according to the flag).
-            if ( impl_->get_options().read_resp_meta_ &&
-                 ( resp_meta_len ||
-                   impl_->get_options().invoke_resp_cb_on_empty_meta_ ) ) {
-
-                bool meta_ok = handle_custom_resp_meta
-                               ( req, rsp, when_done,
-                                 std::string( (const char*)resp_meta_raw,
-                                              resp_meta_len) );
-                if (!meta_ok) {
-                    receive_timer_.cancel();
-                    return;
-                }
-            }
-            remaining_len -= sizeof(int32) + resp_meta_len;
-        }
-
-        // 2) Hint.
-        if (flags & INCLUDE_HINT) {
-            size_t hint_len = 0;
-            uint16_t hint_version = bs.get_u16();
-            (void)hint_version;
-            hint_len = bs.get_u16();
-            rsp->set_next_batch_size_hint_in_bytes(bs.get_i64());
-            remaining_len -= sizeof(uint16_t) * 2 + hint_len;
-        }
-
-        // 3) Context.
-        assert(remaining_len >= 0);
-        size_t ctx_len = remaining_len;
-        if (flags & INCLUDE_RESULT_CODE) {
-            ctx_len -= sizeof(int32_t);
-        }
-        if (ctx_len) {
-            // It has context, read it.
-            ptr<buffer> actual_ctx = buffer::alloc(ctx_len);
-            bs.get_buffer(actual_ctx);
-            rsp->set_ctx(actual_ctx);
-            remaining_len -= ctx_len;
-        }
-
-        // 4) Result code
-        if (flags & INCLUDE_RESULT_CODE) {
-            assert((size_t)remaining_len >= sizeof(int32_t));
-            cmd_result_code res = static_cast<cmd_result_code>(bs.get_i32());
-            rsp->set_result_code(res);
+        if (!completion_error_msg.empty()) {
+            receive_timer_.cancel();
+            clear_busy_flag_if_set(true);
+            handle_error(req, completion_error_msg, when_done);
+            return;
         }
 
         post_read(req, rsp, when_done);
@@ -2165,19 +2367,18 @@ private:
 
     bool handle_custom_resp_meta(ptr<req_msg>& req,
                                  ptr<resp_msg>& rsp,
-                                 rpc_handler& when_done,
-                                 const std::string& meta_str)
+                                 const std::string& meta_str,
+                                 std::string& err_msg)
     {
         bool meta_ok = impl_->get_options().read_resp_meta_
                        ( req_to_params(req.get(), rsp.get()), meta_str );
 
         if (!meta_ok) {
             // Callback function returns false, should return failure.
-            std::string err_msg = sstrfmt( "response meta verification failed: "
-                                           "from peer %d, %s:%s")
-                                           .fmt( req->get_dst(), host_.c_str(),
-                                                 port_.c_str() );
-            handle_error(req, err_msg, when_done);
+            err_msg = sstrfmt( "response meta verification failed: "
+                               "from peer %d, %s:%s")
+                               .fmt( req->get_dst(), host_.c_str(),
+                                     port_.c_str() );
             return false;
         }
         return true;

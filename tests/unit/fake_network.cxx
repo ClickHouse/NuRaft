@@ -290,6 +290,35 @@ size_t FakeNetwork::getNumPendingResps(const std::string& endpoint) {
     return conn->pendingResps.size();
 }
 
+int FakeNetwork::getFirstPendingReqType(const std::string& endpoint) {
+    ptr<FakeClient> conn = findClient(endpoint);
+    if (!conn || conn->pendingReqs.empty()) return -1;
+    return static_cast<int>(conn->pendingReqs.front().req->get_type());
+}
+
+uint64_t FakeNetwork::getFirstPendingReqTimeout(const std::string& endpoint) {
+    ptr<FakeClient> conn = findClient(endpoint);
+    if (!conn || conn->pendingReqs.empty()) return 0;
+    return conn->pendingReqs.front().timeoutMs;
+}
+
+ptr<peer> FakeNetwork::getPeer(raft_server* srv, int32 peer_id) {
+    auto& peers = get_peers(srv);
+    auto it = peers.find(peer_id);
+    if (it == peers.end()) return nullptr;
+    return it->second;
+}
+
+bool FakeNetwork::isPeerBusy(raft_server* srv, int32 peer_id) {
+    ptr<peer> pp = getPeer(srv, peer_id);
+    return pp ? pp->is_busy() : false;
+}
+
+bool FakeNetwork::doesPeerNeedToReconnect(raft_server* srv, int32 peer_id) {
+    ptr<peer> pp = getPeer(srv, peer_id);
+    return pp ? pp->need_to_reconnect() : false;
+}
+
 void FakeNetwork::stop() {
     handler = nullptr;
 }
@@ -320,14 +349,14 @@ FakeClient::~FakeClient() {}
 
 void FakeClient::send(ptr<req_msg>& req,
                       rpc_handler& when_done,
-                      uint64_t /*send_timeout_ms*/)
+                      uint64_t send_timeout_ms)
 {
     SimpleLogger* ll = motherNet->getBase()->getLogger();
     _log_info(ll, "got request %s -> %s, %s",
               motherNet->getEndpoint().c_str(),
               dstNet->getEndpoint().c_str(),
               msg_type_to_string( req->get_type() ).c_str() );
-    pendingReqs.push_back( FakeNetwork::ReqPkg(req, when_done) );
+    pendingReqs.push_back( FakeNetwork::ReqPkg(req, when_done, send_timeout_ms) );
 }
 
 void FakeClient::dropPackets() {
@@ -429,4 +458,3 @@ void FakeTimer::cancel_impl(ptr<delayed_task>& task) {
 }
 
 }  // namespace nuraft;
-

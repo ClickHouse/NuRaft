@@ -242,7 +242,8 @@ public:
     void send_req(ptr<peer> myself,
                   ptr<req_msg>& req,
                   rpc_handler& handler,
-                  bool streaming = false);
+                  bool streaming = false,
+                  uint64_t send_timeout_ms = 0);
 
     void shutdown();
 

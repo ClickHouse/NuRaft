@@ -16,6 +16,7 @@ limitations under the License.
 **************************************************************************/
 
 #include "buffer_serializer.hxx"
+#include "crc32.hxx"
 #include "debugging_options.hxx"
 #include "in_memory_log_store.hxx"
 #include "raft_package_asio.hxx"
@@ -33,7 +34,13 @@ limitations under the License.
     using asio_error_code = asio::error_code;
 #endif
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include <stdio.h>
 
@@ -723,6 +730,483 @@ int auto_forwarding_timeout_test() {
 
     SimpleLogger::shutdown();
 
+    return 0;
+}
+
+int rpc_response_timeout_invokes_callback_once_test(bool streaming_mode) {
+    reset_log_files();
+
+    asio_service::options opt;
+    opt.thread_pool_size_ = 1;
+    opt.streaming_mode_ = streaming_mode;
+    asio_service svc(opt);
+
+    asio::io_context server_io;
+    asio::ip::tcp::acceptor acceptor(
+        server_io,
+        asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    asio::ip::tcp::endpoint server_endpoint = acceptor.local_endpoint();
+    uint16_t port = server_endpoint.port();
+
+    EventAwaiter accepted_ea;
+    EventAwaiter stop_server_ea;
+    std::atomic<bool> accept_ready(false);
+    std::shared_ptr<asio::ip::tcp::socket> accepted_socket;
+    std::mutex accepted_socket_lock;
+    std::thread server_thread([&]() {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(server_io);
+        asio_error_code err;
+        acceptor.accept(*socket, err);
+        if (!err) {
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock);
+                accepted_socket = socket;
+            }
+            accept_ready = true;
+            accepted_ea.invoke();
+            stop_server_ea.wait();
+            socket->close(err);
+        }
+    });
+
+    struct ServerThreadGuard {
+        EventAwaiter& stop_server_ea_;
+        asio::io_context& server_io_;
+        asio::ip::tcp::acceptor& acceptor_;
+        asio::ip::tcp::endpoint server_endpoint_;
+        std::shared_ptr<asio::ip::tcp::socket>& accepted_socket_;
+        std::mutex& accepted_socket_lock_;
+        std::atomic<bool>& accept_ready_;
+        std::thread& server_thread_;
+
+        ~ServerThreadGuard() {
+            stop_server_ea_.invoke();
+
+            asio_error_code err;
+            if (!accept_ready_.load()) {
+                asio::ip::tcp::socket unblock_socket(server_io_);
+                unblock_socket.connect(server_endpoint_, err);
+            }
+
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock_);
+                socket = accepted_socket_;
+            }
+
+            if (socket) {
+                socket->close(err);
+            }
+            acceptor_.close(err);
+            if (server_thread_.joinable()) {
+                server_thread_.join();
+            }
+        }
+    };
+    ServerThreadGuard server_thread_guard{
+        stop_server_ea,
+        server_io,
+        acceptor,
+        server_endpoint,
+        accepted_socket,
+        accepted_socket_lock,
+        accept_ready,
+        server_thread};
+
+    ptr<rpc_client> client =
+        svc.create_client("127.0.0.1:" + std::to_string(port));
+    CHK_NONNULL(client.get());
+
+    ptr<req_msg> req = cs_new<req_msg>(1,
+                                       msg_type::append_entries_request,
+                                       1,
+                                       2,
+                                       0,
+                                       0,
+                                       0);
+
+    EventAwaiter first_callback_ea;
+    EventAwaiter duplicate_callback_ea;
+    std::atomic<int> callback_count(0);
+    std::atomic<bool> got_error(false);
+    std::atomic<bool> got_empty_resp(false);
+
+    rpc_handler handler = [&](ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
+        int count = callback_count.fetch_add(1) + 1;
+        got_error = (err != nullptr);
+        got_empty_resp = (resp == nullptr);
+        if (count == 1) {
+            first_callback_ea.invoke();
+        } else {
+            duplicate_callback_ea.invoke();
+        }
+    };
+
+    client->send(req, handler, 50);
+    accepted_ea.wait_ms(3000);
+    CHK_TRUE( accept_ready.load() );
+
+    first_callback_ea.wait_ms(3000);
+    CHK_EQ( 1, callback_count.load() );
+    CHK_TRUE( got_error.load() );
+    CHK_TRUE( got_empty_resp.load() );
+    CHK_TRUE( client->is_abandoned() );
+
+    duplicate_callback_ea.wait_ms(300);
+    CHK_EQ( 1, callback_count.load() );
+
+    svc.stop();
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
+int rpc_response_meta_rejection_throwing_callback_test() {
+    reset_log_files();
+
+    asio_service::options opt;
+    opt.thread_pool_size_ = 1;
+    opt.streaming_mode_ = false;
+    opt.invoke_resp_cb_on_empty_meta_ = true;
+    opt.read_resp_meta_ =
+        [](const asio_service::meta_cb_params&, const std::string&) -> bool {
+            return false;
+        };
+    asio_service svc(opt);
+
+    asio::io_context server_io;
+    asio::ip::tcp::acceptor acceptor(
+        server_io,
+        asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    asio::ip::tcp::endpoint server_endpoint = acceptor.local_endpoint();
+    uint16_t port = server_endpoint.port();
+
+    EventAwaiter accepted_ea;
+    EventAwaiter stop_server_ea;
+    std::atomic<bool> accept_ready(false);
+    std::shared_ptr<asio::ip::tcp::socket> accepted_socket;
+    std::mutex accepted_socket_lock;
+    std::thread server_thread([&]() {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(server_io);
+        asio_error_code err;
+        acceptor.accept(*socket, err);
+        if (!err) {
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock);
+                accepted_socket = socket;
+            }
+            accept_ready = true;
+            accepted_ea.invoke();
+
+            const size_t rpc_req_header_size = 4 * 3 + 8 * 5 + 1 * 2;
+            std::vector<byte> req_header(rpc_req_header_size);
+            asio::read(*socket, asio::buffer(req_header), err);
+
+            if (!err) {
+                const size_t rpc_resp_header_size = 4 * 3 + 8 * 3 + 1 * 3;
+                const size_t crc_flags_len = 8;
+                ptr<buffer> resp_buf = buffer::alloc(rpc_resp_header_size);
+                buffer_serializer bs(resp_buf);
+                bs.put_u8(0x1);
+                bs.put_u8(static_cast<byte>(msg_type::append_entries_response));
+                bs.put_i32(2);
+                bs.put_i32(1);
+                bs.put_u64(1);
+                bs.put_u64(1);
+                bs.put_u8(1);
+                bs.put_i32(0);
+
+                uint32_t crc_val = crc32_8(resp_buf->data_begin(),
+                                           rpc_resp_header_size - crc_flags_len,
+                                           0);
+                bs.put_u64(crc_val);
+
+                asio::write(*socket,
+                            asio::buffer(resp_buf->data_begin(), resp_buf->size()),
+                            err);
+            }
+
+            stop_server_ea.wait();
+            socket->close(err);
+        }
+    });
+
+    struct ServerThreadGuard {
+        EventAwaiter& stop_server_ea_;
+        asio::io_context& server_io_;
+        asio::ip::tcp::acceptor& acceptor_;
+        asio::ip::tcp::endpoint server_endpoint_;
+        std::shared_ptr<asio::ip::tcp::socket>& accepted_socket_;
+        std::mutex& accepted_socket_lock_;
+        std::atomic<bool>& accept_ready_;
+        std::thread& server_thread_;
+
+        ~ServerThreadGuard() {
+            stop_server_ea_.invoke();
+
+            asio_error_code err;
+            if (!accept_ready_.load()) {
+                asio::ip::tcp::socket unblock_socket(server_io_);
+                unblock_socket.connect(server_endpoint_, err);
+            }
+
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock_);
+                socket = accepted_socket_;
+            }
+
+            if (socket) {
+                socket->close(err);
+            }
+            acceptor_.close(err);
+            if (server_thread_.joinable()) {
+                server_thread_.join();
+            }
+        }
+    };
+    ServerThreadGuard server_thread_guard{
+        stop_server_ea,
+        server_io,
+        acceptor,
+        server_endpoint,
+        accepted_socket,
+        accepted_socket_lock,
+        accept_ready,
+        server_thread};
+
+    ptr<rpc_client> client =
+        svc.create_client("127.0.0.1:" + std::to_string(port));
+    CHK_NONNULL(client.get());
+
+    ptr<req_msg> req = cs_new<req_msg>(1,
+                                       msg_type::append_entries_request,
+                                       1,
+                                       2,
+                                       0,
+                                       0,
+                                       0);
+
+    EventAwaiter first_callback_ea;
+    EventAwaiter duplicate_callback_ea;
+    std::atomic<int> callback_count(0);
+    std::atomic<bool> got_error(false);
+
+    rpc_handler handler = [&](ptr<resp_msg>&, ptr<rpc_exception>& err) {
+        int count = callback_count.fetch_add(1) + 1;
+        got_error = (err != nullptr);
+        if (count == 1) {
+            first_callback_ea.invoke();
+            throw std::runtime_error("metadata rejection callback exception");
+        }
+        duplicate_callback_ea.invoke();
+    };
+
+    client->send(req, handler, 0);
+    accepted_ea.wait_ms(3000);
+    CHK_TRUE( accept_ready.load() );
+
+    first_callback_ea.wait_ms(3000);
+    CHK_EQ( 1, callback_count.load() );
+    CHK_TRUE( got_error.load() );
+    CHK_TRUE( client->is_abandoned() );
+
+    duplicate_callback_ea.wait_ms(300);
+    CHK_EQ( 1, callback_count.load() );
+
+    svc.stop();
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
+int rpc_custom_resolver_error_throwing_callback_test() {
+    reset_log_files();
+
+    asio_service::options opt;
+    opt.thread_pool_size_ = 1;
+    opt.streaming_mode_ = false;
+    opt.custom_resolver_ =
+        [](const std::string&,
+           const std::string&,
+           asio_service_custom_resolver_response when_done) {
+            when_done(std::string(),
+                      std::string(),
+                      std::make_error_code(std::errc::host_unreachable));
+        };
+    asio_service svc(opt);
+
+    ptr<rpc_client> client = svc.create_client("unresolved-host:1");
+    CHK_NONNULL(client.get());
+
+    ptr<req_msg> req = cs_new<req_msg>(1,
+                                       msg_type::append_entries_request,
+                                       1,
+                                       2,
+                                       0,
+                                       0,
+                                       0);
+
+    EventAwaiter first_callback_ea;
+    EventAwaiter duplicate_callback_ea;
+    std::atomic<int> callback_count(0);
+    std::atomic<bool> got_error(false);
+
+    rpc_handler handler = [&](ptr<resp_msg>&, ptr<rpc_exception>& err) {
+        int count = callback_count.fetch_add(1) + 1;
+        got_error = (err != nullptr);
+        if (count == 1) {
+            first_callback_ea.invoke();
+            throw std::runtime_error("custom resolver callback exception");
+        }
+        duplicate_callback_ea.invoke();
+    };
+
+    try {
+        client->send(req, handler, 0);
+    } catch (const std::runtime_error&) {
+    }
+
+    first_callback_ea.wait_ms(3000);
+    CHK_EQ( 1, callback_count.load() );
+    CHK_TRUE( got_error.load() );
+    CHK_TRUE( client->is_abandoned() );
+
+    duplicate_callback_ea.wait_ms(300);
+    CHK_EQ( 1, callback_count.load() );
+
+    svc.stop();
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
+int rpc_write_req_meta_exception_throwing_callback_test() {
+    reset_log_files();
+
+    asio_service::options opt;
+    opt.thread_pool_size_ = 1;
+    opt.streaming_mode_ = false;
+    opt.write_req_meta_ =
+        [](const asio_service::meta_cb_params&) -> std::string {
+            throw std::runtime_error("write request metadata exception");
+        };
+    asio_service svc(opt);
+
+    asio::io_context server_io;
+    asio::ip::tcp::acceptor acceptor(
+        server_io,
+        asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    asio::ip::tcp::endpoint server_endpoint = acceptor.local_endpoint();
+    uint16_t port = server_endpoint.port();
+
+    EventAwaiter accepted_ea;
+    EventAwaiter stop_server_ea;
+    std::atomic<bool> accept_ready(false);
+    std::shared_ptr<asio::ip::tcp::socket> accepted_socket;
+    std::mutex accepted_socket_lock;
+    std::thread server_thread([&]() {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(server_io);
+        asio_error_code err;
+        acceptor.accept(*socket, err);
+        if (!err) {
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock);
+                accepted_socket = socket;
+            }
+            accept_ready = true;
+            accepted_ea.invoke();
+            stop_server_ea.wait();
+            socket->close(err);
+        }
+    });
+
+    struct ServerThreadGuard {
+        EventAwaiter& stop_server_ea_;
+        asio::io_context& server_io_;
+        asio::ip::tcp::acceptor& acceptor_;
+        asio::ip::tcp::endpoint server_endpoint_;
+        std::shared_ptr<asio::ip::tcp::socket>& accepted_socket_;
+        std::mutex& accepted_socket_lock_;
+        std::atomic<bool>& accept_ready_;
+        std::thread& server_thread_;
+
+        ~ServerThreadGuard() {
+            stop_server_ea_.invoke();
+
+            asio_error_code err;
+            if (!accept_ready_.load()) {
+                asio::ip::tcp::socket unblock_socket(server_io_);
+                unblock_socket.connect(server_endpoint_, err);
+            }
+
+            std::shared_ptr<asio::ip::tcp::socket> socket;
+            {
+                std::lock_guard<std::mutex> guard(accepted_socket_lock_);
+                socket = accepted_socket_;
+            }
+
+            if (socket) {
+                socket->close(err);
+            }
+            acceptor_.close(err);
+            if (server_thread_.joinable()) {
+                server_thread_.join();
+            }
+        }
+    };
+    ServerThreadGuard server_thread_guard{
+        stop_server_ea,
+        server_io,
+        acceptor,
+        server_endpoint,
+        accepted_socket,
+        accepted_socket_lock,
+        accept_ready,
+        server_thread};
+
+    ptr<rpc_client> client =
+        svc.create_client("127.0.0.1:" + std::to_string(port));
+    CHK_NONNULL(client.get());
+
+    ptr<req_msg> req = cs_new<req_msg>(1,
+                                       msg_type::append_entries_request,
+                                       1,
+                                       2,
+                                       0,
+                                       0,
+                                       0);
+
+    EventAwaiter first_callback_ea;
+    EventAwaiter duplicate_callback_ea;
+    std::atomic<int> callback_count(0);
+    std::atomic<bool> got_error(false);
+
+    rpc_handler handler = [&](ptr<resp_msg>&, ptr<rpc_exception>& err) {
+        int count = callback_count.fetch_add(1) + 1;
+        got_error = (err != nullptr);
+        if (count == 1) {
+            first_callback_ea.invoke();
+            throw std::runtime_error("write request metadata callback exception");
+        }
+        duplicate_callback_ea.invoke();
+    };
+
+    client->send(req, handler, 0);
+    accepted_ea.wait_ms(3000);
+    CHK_TRUE( accept_ready.load() );
+
+    first_callback_ea.wait_ms(3000);
+    CHK_EQ( 1, callback_count.load() );
+    CHK_TRUE( got_error.load() );
+    CHK_TRUE( client->is_abandoned() );
+
+    duplicate_callback_ea.wait_ms(300);
+    CHK_EQ( 1, callback_count.load() );
+
+    svc.stop();
+
+    SimpleLogger::shutdown();
     return 0;
 }
 
@@ -2074,6 +2558,19 @@ int main(int argc, char** argv) {
     ts.doTest( "auto forwarding timeout test",
                auto_forwarding_timeout_test );
 
+    ts.doTest( "RPC response timeout invokes callback once test",
+               rpc_response_timeout_invokes_callback_once_test,
+               TestRange<bool>( {false, true} ) );
+
+    ts.doTest( "RPC response meta rejection throwing callback test",
+               rpc_response_meta_rejection_throwing_callback_test );
+
+    ts.doTest( "RPC custom resolver error throwing callback test",
+               rpc_custom_resolver_error_throwing_callback_test );
+
+    ts.doTest( "RPC write request metadata exception throwing callback test",
+               rpc_write_req_meta_exception_throwing_callback_test );
+
     ts.doTest( "auto forwarding test",
                auto_forwarding_test,
                TestRange<bool>( {false, true} ) );
@@ -2142,4 +2639,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-

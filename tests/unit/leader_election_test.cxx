@@ -25,6 +25,7 @@ limitations under the License.
 #include "test_common.h"
 
 #include <stdio.h>
+#include <stdexcept>
 
 using namespace nuraft;
 using namespace raft_functional_common;
@@ -964,6 +965,140 @@ int temporary_leader_test() {
     return 0;
 }
 
+int election_rpc_timeout_clears_stale_prevote_busy_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    s2.dbgLog(" --- invoke election timer of S2 ---");
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->execReqResp();
+
+    s3.dbgLog(" --- invoke election timer of S3 ---");
+    s3.fTimer->invoke( timer_task_type::election_timer );
+
+    uint64_t election_timeout_ms =
+        s3.raftServer->get_current_params().election_timeout_upper_bound_;
+
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1_addr) );
+    CHK_EQ( static_cast<int>(msg_type::pre_vote_request),
+            s3.fNet->getFirstPendingReqType(s1_addr) );
+    CHK_EQ( election_timeout_ms, s3.fNet->getFirstPendingReqTimeout(s1_addr) );
+    CHK_TRUE( s3.fNet->isPeerBusy(s3.raftServer.get(), 1) );
+
+    s3.fNet->execReqResp(s2_addr);
+
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1_addr) );
+    CHK_EQ( static_cast<int>(msg_type::pre_vote_request),
+            s3.fNet->getFirstPendingReqType(s1_addr) );
+    CHK_TRUE( s3.fNet->isPeerBusy(s3.raftServer.get(), 1) );
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s2_addr) );
+    CHK_EQ( static_cast<int>(msg_type::request_vote_request),
+            s3.fNet->getFirstPendingReqType(s2_addr) );
+    CHK_EQ( election_timeout_ms, s3.fNet->getFirstPendingReqTimeout(s2_addr) );
+
+    CHK_TRUE( s3.fNet->makeReqFail(s1_addr) );
+    CHK_Z( s3.fNet->getNumPendingReqs(s1_addr) );
+    CHK_FALSE( s3.fNet->isPeerBusy(s3.raftServer.get(), 1) );
+
+    s3.dbgLog(" --- invoke election timer of S3 after stale pre-vote timeout ---");
+    s3.fTimer->invoke( timer_task_type::election_timer );
+
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1_addr) );
+    CHK_EQ( static_cast<int>(msg_type::pre_vote_request),
+            s3.fNet->getFirstPendingReqType(s1_addr) );
+    CHK_EQ( election_timeout_ms, s3.fNet->getFirstPendingReqTimeout(s1_addr) );
+    CHK_TRUE( s3.fNet->isPeerBusy(s3.raftServer.get(), 1) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int peer_error_cleanup_before_throwing_handler_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ptr<peer> peer_to_s1 = s3.fNet->getPeer(s3.raftServer.get(), 1);
+    CHK_NONNULL(peer_to_s1.get());
+    CHK_TRUE(peer_to_s1->make_busy());
+
+    ptr<req_msg> req = cs_new<req_msg>(s3.raftServer->get_term(),
+                                       msg_type::pre_vote_request,
+                                       3,
+                                       1,
+                                       0,
+                                       0,
+                                       0);
+
+    std::atomic<int> callback_count(0);
+    rpc_handler throwing_handler =
+        [&callback_count](ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
+            callback_count.fetch_add(1);
+            CHK_NULL(resp.get());
+            CHK_NONNULL(err.get());
+            throw std::runtime_error("peer RPC error handler exception");
+        };
+
+    peer_to_s1->send_req(peer_to_s1,
+                         req,
+                         throwing_handler,
+                         false,
+                         s3.raftServer->get_current_params().election_timeout_upper_bound_);
+
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1_addr) );
+
+    bool handler_threw = false;
+    try {
+        // `FakeNetwork` propagates handler exceptions directly. Production
+        // ASIO error completion catches them, but this test needs to verify
+        // peer cleanup before any handler exception can escape.
+        s3.fNet->makeReqFail(s1_addr);
+    } catch (const std::runtime_error&) {
+        handler_threw = true;
+    }
+
+    CHK_TRUE(handler_threw);
+    CHK_EQ( 1, callback_count.load() );
+    CHK_FALSE( s3.fNet->isPeerBusy(s3.raftServer.get(), 1) );
+    CHK_TRUE( s3.fNet->doesPeerNeedToReconnect(s3.raftServer.get(), 1) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 }  // namespace leader_election_test;
 using namespace leader_election_test;
 
@@ -1002,6 +1137,12 @@ int main(int argc, char** argv) {
     ts.doTest( "temporary leader test",
                temporary_leader_test );
 
+    ts.doTest( "election RPC timeout clears stale pre-vote busy test",
+               election_rpc_timeout_clears_stale_prevote_busy_test );
+
+    ts.doTest( "peer error cleanup before throwing handler test",
+               peer_error_cleanup_before_throwing_handler_test );
+
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
 #else
@@ -1018,4 +1159,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
