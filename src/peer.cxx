@@ -192,6 +192,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 // The first request on the next connection will re-check
                 // the flag.
                 set_snapshot_sync_is_needed(false);
+                reset_cnt_backward_log_probe();
 
             } else {
                 // WARNING (MONSTOR-9378):
@@ -289,6 +290,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reset_bytes_in_flight();
         set_free();
         set_manual_free();
+        reset_cnt_backward_log_probe();
         return true;
 
     } else {
@@ -327,4 +329,3 @@ void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
 }
 
 } // namespace nuraft;
-

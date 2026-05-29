@@ -69,6 +69,7 @@ void raft_server::clear_snapshot_sync_ctx(peer& pp) {
         destroy_user_snp_ctx(snp_ctx);
         p_tr("destroy snapshot sync ctx %p", snp_ctx.get());
     }
+    pp.reset_cnt_backward_log_probe();
     pp.set_snapshot_in_sync(nullptr);
 }
 
@@ -81,6 +82,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     peer& p = *pp;
     ptr<raft_params> params = ctx_->get_params();
     std::unique_lock<std::mutex> guard(p.get_lock());
+    p.reset_cnt_backward_log_probe();
     ptr<snapshot_sync_ctx> sync_ctx = p.get_snapshot_sync_ctx();
     ptr<snapshot> snp = nullptr;
     ulong prev_sync_snp_log_idx = 0;
@@ -341,6 +343,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
     ptr<peer> p = it->second;
     if (resp.get_accepted()) {
         std::lock_guard<std::mutex> guard(p->get_lock());
+        p->reset_cnt_backward_log_probe();
         ptr<snapshot_sync_ctx> sync_ctx = p->get_snapshot_sync_ctx();
         if (sync_ctx == nullptr) {
             p_in("no snapshot sync context for this peer, drop the response");
@@ -418,6 +421,7 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
         return;
     }
 
+    srv_to_join_->reset_cnt_backward_log_probe();
     if (!resp.get_accepted()) {
         p_wn("peer doesn't accept the snapshot installation request, "
              "next log idx %" PRIu64 ", "
@@ -658,4 +662,3 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
 }
 
 } // namespace nuraft;
-

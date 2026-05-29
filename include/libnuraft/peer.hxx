@@ -70,6 +70,7 @@ public:
         , stale_rpc_responses_(0)
         , last_sent_idx_(0)
         , cnt_not_applied_(0)
+        , cnt_backward_log_probe_(0)
         , leave_requested_(false)
         , hb_cnt_since_leave_(0)
         , stepping_down_(false)
@@ -297,6 +298,10 @@ public:
     int32 inc_cnt_not_applied()         { cnt_not_applied_++;
                                           return cnt_not_applied_; }
     int32 get_cnt_not_applied() const   { return cnt_not_applied_; }
+
+    void reset_cnt_backward_log_probe()       { cnt_backward_log_probe_ = 0; }
+    int32 inc_cnt_backward_log_probe()        { return cnt_backward_log_probe_.fetch_add(1) + 1; }
+    int32 get_cnt_backward_log_probe() const  { return cnt_backward_log_probe_; }
 
     void step_down()                { stepping_down_ = true; }
     bool is_stepping_down() const   { return stepping_down_.load(); }
@@ -561,6 +566,12 @@ private:
      * Number of count where start log index is the same as previous.
      */
     std::atomic<int32> cnt_not_applied_;
+
+    /**
+     * Number of consecutive rejected append responses that moved
+     * `next_log_idx_` one step backward while probing for a matching log.
+     */
+    std::atomic<int32> cnt_backward_log_probe_;
 
     /**
      * `true` if leave request has been sent to this peer.
