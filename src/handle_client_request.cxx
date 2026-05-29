@@ -155,6 +155,19 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
 
     std::vector< ptr<log_entry> >& entries = req.log_entries();
 
+    uint64_t current_entries = 0;
+    uint64_t request_entries = 0;
+    uint64_t max_entries = 0;
+    if (should_reject_client_request_by_uncommitted_log_entries(entries,
+                                                                params->max_uncommitted_log_entries_,
+                                                                current_entries,
+                                                                request_entries,
+                                                                max_entries)) {
+        resp->set_result_code(cmd_result_code::TIMEOUT);
+        log_uncommitted_log_entry_limit_rejection(current_entries, request_entries, max_entries);
+        return resp;
+    }
+
     size_t num_entries = entries.size();
 
     for (size_t i = 0; i < num_entries; ++i) {
@@ -276,6 +289,51 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
 
     resp->accept(resp_idx);
     return resp;
+}
+
+bool raft_server::should_reject_client_request_by_uncommitted_log_entries(const std::vector<ptr<log_entry>>& entries,
+                                                                         uint64_t configured_max_entries,
+                                                                         uint64_t& current_entries,
+                                                                         uint64_t& request_entries,
+                                                                         uint64_t& max_entries) const
+{
+    current_entries = 0;
+    request_entries = 0;
+
+    max_entries = configured_max_entries;
+    if (!max_entries || entries.empty()) {
+        return false;
+    }
+
+    uint64_t committed = sm_commit_index_.load();
+    uint64_t next = log_store_->next_slot();
+    if (next > committed && next - committed > 1) {
+        current_entries = next - committed - 1;
+    }
+    request_entries = entries.size();
+
+    if (current_entries >= max_entries) {
+        return true;
+    }
+    return request_entries > max_entries - current_entries;
+}
+
+void raft_server::log_uncommitted_log_entry_limit_rejection(uint64_t current_entries,
+                                                            uint64_t request_entries,
+                                                            uint64_t max_entries) const
+{
+    uint64_t now = timer_helper::get_timeofday_us();
+    uint64_t last = last_uncommitted_limit_log_us_.load();
+    if (now - last < 1000000 ||
+        !last_uncommitted_limit_log_us_.compare_exchange_strong(last, now)) {
+        return;
+    }
+
+    p_wn("reject client request by uncommitted log entry limit: "
+         "current entries %" PRIu64 ", request entries %" PRIu64 ", max entries %" PRIu64,
+         current_entries,
+         request_entries,
+         max_entries);
 }
 
 ptr<resp_msg> raft_server::handle_cli_req_callback(ptr<commit_ret_elem> elem,

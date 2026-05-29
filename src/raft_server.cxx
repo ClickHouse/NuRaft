@@ -60,6 +60,7 @@ raft_server::raft_server(context* ctx, const init_options& opt)
     , leader_commit_index_(0)
     , quick_commit_index_(ctx->state_machine_->last_commit_index())
     , sm_commit_index_(ctx->state_machine_->last_commit_index())
+    , last_uncommitted_limit_log_us_(0)
     , index_at_becoming_leader_(0)
     , initial_commit_index_(ctx->state_machine_->last_commit_index())
     , hb_alive_(false)
@@ -407,7 +408,8 @@ void raft_server::apply_and_log_current_params() {
           "grace period of lagging state machine %d, "
           "snapshot IO: %s, "
           "parallel log appending: %s, "
-          "streaming mode max log gap %d, max bytes %" PRIu64,
+          "streaming mode max log gap %d, max bytes %" PRIu64 ", "
+          "max uncommitted log entries %" PRIu64,
           params->election_timeout_lower_bound_,
           params->election_timeout_upper_bound_,
           params->heart_beat_interval_,
@@ -431,7 +433,8 @@ void raft_server::apply_and_log_current_params() {
           params->use_bg_thread_for_snapshot_io_ ? "async" : "blocking",
           params->parallel_log_appending_ ? "on" : "off",
           params->max_log_gap_in_stream_,
-          params->max_bytes_in_flight_in_stream_ );
+          params->max_bytes_in_flight_in_stream_,
+          params->max_uncommitted_log_entries_ );
 
     status_check_timer_.set_duration_ms(params->heart_beat_interval_);
     status_check_timer_.reset();
