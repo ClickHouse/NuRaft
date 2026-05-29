@@ -273,7 +273,7 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     ptr<peer> p = it->second;
 
     p->set_next_log_idx(resp.get_next_idx());
+    p->reset_cnt_backward_log_probe();
 }
 
 } // namespace nuraft;
-

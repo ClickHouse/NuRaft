@@ -78,6 +78,7 @@ struct raft_params {
         , enable_randomized_snapshot_creation_(false)
         , max_append_size_(100)
         , max_append_size_bytes_(0)
+        , append_entries_backward_probe_throttle_threshold_(5)
         , reserved_log_items_(100000)
         , client_req_timeout_(3000)
         , fresh_log_gap_(200)
@@ -168,6 +169,20 @@ struct raft_params {
      */
     raft_params& with_max_append_size_bytes(int64 size_bytes) {
         max_append_size_bytes_ = size_bytes;
+        return *this;
+    }
+
+    /**
+     * Number of consecutive backward log-match probes after which the leader
+     * limits appendEntries payloads to one log entry.
+     * If set to 0, the backward-probe payload throttle is disabled.
+     *
+     * @param threshold
+     * @return self
+     */
+    raft_params& with_append_entries_backward_probe_throttle_threshold(
+            int32 threshold) {
+        append_entries_backward_probe_throttle_threshold_ = threshold;
         return *this;
     }
 
@@ -459,6 +474,13 @@ public:
      * If set to 0, only max_append_size_ will be used.
      */
     int64 max_append_size_bytes_;
+
+    /**
+     * Number of consecutive backward log-match probes after which
+     * append entry requests are limited to one log entry.
+     * If set to 0, this throttle is disabled.
+     */
+    int32 append_entries_backward_probe_throttle_threshold_;
 
     /**
      * Minimum number of logs that will be preserved

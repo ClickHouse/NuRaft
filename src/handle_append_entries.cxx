@@ -100,6 +100,8 @@ struct resp_appendix {
     extra_order extra_order_;
 };
 
+const static int32 APPEND_ENTRIES_SAME_START_THROTTLE_THRESHOLD = 5;
+
 void raft_server::append_entries_in_bg() {
     std::string thread_name = "nuraft_append";
 #ifdef __linux__
@@ -457,6 +459,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         std::lock_guard<std::mutex> guard(p.get_lock());
         if (p.get_next_log_idx() == 0L) {
             p.set_next_log_idx(cur_nxt_idx);
+            p.reset_cnt_backward_log_probe();
         }
 
         if (custom_last_log_idx > 0) {
@@ -533,13 +536,26 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         int32 cur_cnt = p.inc_cnt_not_applied();
         p_ts("last sent log (%" PRIu64 ") to peer %d is not applied, cnt %d",
              peer_last_sent_idx, p.get_id(), cur_cnt);
-        if (cur_cnt >= 5) {
+        if (cur_cnt >= APPEND_ENTRIES_SAME_START_THROTTLE_THRESHOLD) {
             ulong prev_end_idx = end_idx;
             end_idx = std::min( cur_nxt_idx, last_log_idx + 1 + 1 );
             p_ts("reduce end_idx %" PRIu64 " -> %" PRIu64, prev_end_idx, end_idx);
         }
     } else {
         p.reset_cnt_not_applied();
+    }
+
+    int32 backward_probe_cnt = p.get_cnt_backward_log_probe();
+    int32 backward_probe_threshold =
+        params->append_entries_backward_probe_throttle_threshold_;
+    if ( backward_probe_threshold > 0 &&
+         backward_probe_cnt >= backward_probe_threshold &&
+         last_log_idx + 2 < end_idx ) {
+        ulong prev_end_idx = end_idx;
+        end_idx = std::min( cur_nxt_idx, last_log_idx + 1 + 1 );
+        p_ts("reduce end_idx %" PRIu64 " -> %" PRIu64
+             " for peer %d after %d backward log probes",
+             prev_end_idx, end_idx, p.get_id(), backward_probe_cnt);
     }
 
     ptr<std::vector<ptr<log_entry>>> log_entries;
@@ -628,6 +644,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
             cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
         req->log_entries().push_back(custom_noti_le);
+        p.reset_cnt_backward_log_probe();
         return req;
     }
 
@@ -1298,6 +1315,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         {
             std::lock_guard<std::mutex> l(p->get_lock());
             p->set_next_log_idx(resp.get_next_idx());
+            p->reset_cnt_backward_log_probe();
             prev_matched_idx = p->get_matched_idx();
             new_matched_idx = resp.get_next_idx() - 1;
 
@@ -1367,9 +1385,23 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
                  resp_appendix::extra_order_msg(extra_order));
         }
 
+        bool current_term_log_probe =
+            extra_order == resp_appendix::NONE &&
+            resp.get_term() == state_->get_term();
+        bool stale_term_log_probe =
+            extra_order == resp_appendix::NONE &&
+            resp.get_term() != state_->get_term();
+        bool unknown_extra_order =
+            extra_order != resp_appendix::NONE &&
+            extra_order != resp_appendix::DO_NOT_REWIND &&
+            extra_order != resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY &&
+            extra_order != resp_appendix::RECEIVING_SNAPSHOT;
+
         if (extra_order == resp_appendix::DO_NOT_REWIND) {
             // Application-level rejection. Keep peer progress unchanged.
+            p->reset_cnt_backward_log_probe();
         } else if (extra_order == resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY) {
+            p->reset_cnt_backward_log_probe();
             ulong floor = p->get_next_log_idx_floor();
             ulong target = std::max(resp.get_next_idx(), floor);
             ulong max_next_idx = precommit_index_ + 1;
@@ -1398,7 +1430,13 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
                      last_accepted_log_idx, max_next_idx);
             }
         } else {
+            if (unknown_extra_order) {
+                p->reset_cnt_backward_log_probe();
+                p_wn("unknown append response extra order from peer %d: %d",
+                     p->get_id(), (int)extra_order);
+            }
             if (extra_order == resp_appendix::RECEIVING_SNAPSHOT) {
+                p->reset_cnt_backward_log_probe();
                 p->set_snapshot_sync_is_needed(true);
                 p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
                      p->get_id());
@@ -1414,19 +1452,35 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
                          resp.get_next_idx(), floor);
                 }
                 p->set_next_log_idx(target);
+                p->reset_cnt_backward_log_probe();
             } else {
                 // if not, move one log backward.
                 // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
                 if (prev_next_log) {
                     ulong floor = p->get_next_log_idx_floor();
                     if (prev_next_log - 1 >= floor) {
-                        p->set_next_log_idx(prev_next_log - 1);
+                        ulong new_next_log = prev_next_log - 1;
+                        p->set_next_log_idx(new_next_log);
+                        if (current_term_log_probe) {
+                            int32 probe_cnt = p->inc_cnt_backward_log_probe();
+                            p_tr("peer %d backward log probe: prev next idx %" PRIu64
+                                 ", new next idx %" PRIu64 ", cnt %d",
+                                 p->get_id(), prev_next_log, new_next_log, probe_cnt);
+                        } else if (stale_term_log_probe) {
+                            p->reset_cnt_backward_log_probe();
+                            p_tr("ignore stale-term backward log probe from peer %d: "
+                                 "resp term %" PRIu64 ", my term %" PRIu64,
+                                 p->get_id(), resp.get_term(), state_->get_term());
+                        }
                     } else {
+                        p->reset_cnt_backward_log_probe();
                         p_wn("skip log rewind: next_log_idx %" PRIu64
                              " would go below snapshot floor %" PRIu64
                              ", resp next_idx %" PRIu64,
                              prev_next_log - 1, floor, resp.get_next_idx());
                     }
+                } else if (current_term_log_probe || stale_term_log_probe) {
+                    p->reset_cnt_backward_log_probe();
                 }
             }
         }

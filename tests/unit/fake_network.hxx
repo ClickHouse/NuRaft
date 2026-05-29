@@ -90,6 +90,8 @@ public:
 
     size_t getNumPendingResps(const std::string& endpoint);
 
+    ptr<req_msg> getFirstPendingReq(const std::string& endpoint);
+
     void goesOffline() { online = false; }
 
     void goesOnline() { online =  true; }
@@ -211,6 +213,28 @@ public:
             return it->second->get_next_log_idx();
         }
         return 0;
+    }
+
+    int32 getPeerBackwardLogProbeCount(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_cnt_backward_log_probe();
+        }
+        return 0;
+    }
+
+    void setPeerBackwardLogProbeCount(raft_server* srv,
+                                      int32 peer_id,
+                                      int32 value) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->reset_cnt_backward_log_probe();
+            for (int32 ii = 0; ii < value; ++ii) {
+                it->second->inc_cnt_backward_log_probe();
+            }
+        }
     }
 
     bool replaceLastPendingResp(const std::string& endpoint,
