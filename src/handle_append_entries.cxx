@@ -1094,44 +1094,48 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                                          req.log_entries().size() );
 
         if (params->parallel_log_appending_) {
-            uint64_t last_durable_index = log_store_->last_durable_index();
             ulong required_durable =
                 req.get_last_log_idx() + req.log_entries().size();
 
-            if (last_durable_index < required_durable) {
-                if (async_log_appending) {
-                    // Pipelined mode (streaming + parallel log appending):
-                    // defer the response until entries become durable.
-                    // Unblock this thread to allow processing more appends
-                    // while waiting for durability (typically fsync, slow).
-                    // `notify_log_append_completion` will fulfill the promise.
-                    p_ts( "durable index %" PRIu64 ", required %" PRIu64
-                          ", deferring response (pipelined)",
-                          last_durable_index, required_durable );
+            if (async_log_appending) {
+                // Pipelined mode (streaming + parallel log appending):
+                // defer the response until entries become durable.
+                // Unblock this thread to allow processing more appends
+                // while waiting for durability (typically fsync, slow).
+                // `notify_log_append_completion` will fulfill the promise.
+
+                auto_lock(pending_follower_resps_lock_);
+
+                // Read last_durable_index after locking pending_follower_resps_lock_
+                // to avoid missing a notification if notify_log_append_completion
+                // happens after we check last_durable_index but before we add to
+                // pending_follower_resps_.
+                uint64_t last_durable_index = log_store_->last_durable_index();
+                p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                        ", deferring response (pipelined)",
+                        last_durable_index, required_durable );
+                if (last_durable_index < required_durable) {
                     auto promise = cs_new<cmd_result<ptr<buffer>>>();
-                    {
-                        auto_lock(pending_follower_resps_lock_);
-                        pending_follower_resps_.push_back(
-                            {required_durable, req.log_entries().back()->get_term(), promise});
-                    }
+                    pending_follower_resps_.push_back(
+                        {required_durable, req.log_entries().back()->get_term(), promise});
                     resp->set_async_cb([promise]() { return promise; });
+                }
+            } else {
+                uint64_t last_durable_index = log_store_->last_durable_index();
+                while ( last_durable_index < required_durable ) {
+                    if (stopping_) return resp;
 
-                } else {
-                    while ( last_durable_index < required_durable ) {
-                        if (stopping_) return resp;
+                    // Some logs are not durable yet, wait here and block the thread.
+                    p_ts( "durable index %" PRIu64
+                        ", sleep and wait for log appending completion",
+                        last_durable_index );
+                    ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
 
-                        // Some logs are not durable yet, wait here and block the thread.
-                        p_ts( "durable index %" PRIu64
-                            ", sleep and wait for log appending completion",
-                            last_durable_index );
-                        ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
+                    // --- `notify_log_append_completion` API will wake it up. ---
 
-                        // --- `notify_log_append_completion` API will wake it up. ---
-
-                        ea_follower_log_append_->reset();
-                        last_durable_index = log_store_->last_durable_index();
-                        p_tr( "wake up, durable index %" PRIu64, last_durable_index );
-                    }
+                    ea_follower_log_append_->reset();
+                    last_durable_index = log_store_->last_durable_index();
+                    p_tr( "wake up, durable index %" PRIu64, last_durable_index );
                 }
             }
         }
@@ -1141,20 +1145,20 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         // We should wait for those entries to become durable before
         // sending response with `next_log_idx = target_precommit_index + 1`,
         // even if this request had no new entries.
-        uint64_t last_durable_index = log_store_->last_durable_index();
-        ulong required_durable =
-            req.get_last_log_idx() + req.log_entries().size();
-        if (last_durable_index < required_durable) {
-            p_ts( "durable index %" PRIu64 ", required %" PRIu64
-                    ", deferring response (pipelined)",
-                    last_durable_index, required_durable );
-            auto promise = cs_new<cmd_result<ptr<buffer>>>();
-            {
-                auto_lock(pending_follower_resps_lock_);
+        auto_lock(pending_follower_resps_lock_);
+        if (!pending_follower_resps_.empty()) {
+            uint64_t last_durable_index = log_store_->last_durable_index();
+            ulong required_durable =
+                req.get_last_log_idx() + req.log_entries().size();
+            if (last_durable_index < required_durable) {
+                p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                        ", deferring response (pipelined)",
+                        last_durable_index, required_durable );
+                auto promise = cs_new<cmd_result<ptr<buffer>>>();
                 pending_follower_resps_.push_back(
                     {required_durable, /*last_entry_term=*/ 0, promise});
+                resp->set_async_cb([promise]() { return promise; });
             }
-            resp->set_async_cb([promise]() { return promise; });
         }
     }
 
