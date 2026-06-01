@@ -151,6 +151,9 @@ limitations under the License.
 // See `req_msg::ALLOW_ASYNC_LOG_APPENDING`.
 #define ALLOW_ASYNC_LOG_APPENDING_WIRE (0x80)
 
+// See `req_msg::CLOSE_ON_ERROR`.
+#define CLOSE_ON_ERROR_WIRE (0x100)
+
 // =======================
 
 namespace nuraft {
@@ -801,6 +804,8 @@ private:
             }
         }
 
+        const bool close_on_error_req = (flags_ & CLOSE_ON_ERROR_WIRE) != 0;
+
         // === RAFT server processes the request here. ===
         ptr<resp_msg> resp = raft_server_handler::process_req(handler.get(), *req);
         if (!resp) {
@@ -822,6 +827,12 @@ private:
             if (resp->has_cb())
                 resp = resp->call_cb(resp);
 
+            const bool close_after_drain =
+                close_on_error_req
+                && !resp->has_async_cb()
+                && ( !resp->get_accepted()
+                     || resp->get_result_code() != cmd_result_code::OK );
+
             auto entry = cs_new<pending_resp_entry>();
             entry->req = req;
             entry->resp = resp;
@@ -829,9 +840,18 @@ private:
             {
                 std::lock_guard<std::mutex> guard(pending_resps_lock_);
                 pending_resps_.push_back(entry);
+                if (close_after_drain) {
+                    stop_after_sending_resps_ = true;
+                }
             }
 
             if (resp->has_async_cb()) {
+                // Note: in this case close_on_error_req can't work as
+                // we may have already started processing the next request by
+                // the time an error is reported.
+                // This is currently ok because CLOSE_ON_ERROR is used only by
+                // client_req_stream to handle leader rejections, in particular
+                // max_uncommitted_log_entries_, which happen synchronously.
                 ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
                 ret->when_ready(
                     [this, self, entry]
@@ -854,8 +874,13 @@ private:
                 try_send_pending_resps(self);
             }
 
-            // Receive next message.
-            this->start(self);
+            if (close_after_drain) {
+                p_in("session %" PRIu64 " CLOSE_ON_ERROR: close after drain", session_id_);
+                // try_send_pending_resps will stop() once the queue drains.
+            } else {
+                // Receive next message.
+                this->start(self);
+            }
 
         } else if (resp->has_async_cb()) {
             // Response will be ready later, setup a callback function
@@ -865,11 +890,15 @@ private:
 
             // WARNING: `self` should be captured to avoid releasing this `rpc_session`.
             ret->when_ready(
-                [this, self, req, resp]
+                [this, self, req, resp, close_on_error_req]
                 ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
                   ptr<std::exception>& exp ) {
                     update_resp_with_async_result(resp.get(), res, exp);
-                    on_resp_ready(req, resp);
+                    const bool close_after =
+                        close_on_error_req
+                        && ( !resp->get_accepted()
+                            || resp->get_result_code() != cmd_result_code::OK );
+                    on_resp_ready(req, resp, close_after);
                     // This is needed to avoid circular reference.
                     res.reset();
                 }
@@ -881,7 +910,11 @@ private:
                 // If callback function exists, get new response message.
                 resp = resp->call_cb(resp);
             }
-            on_resp_ready(req, resp);
+            const bool close_after =
+                close_on_error_req
+                && ( !resp->get_accepted()
+                     || resp->get_result_code() != cmd_result_code::OK );
+            on_resp_ready(req, resp, close_after);
         }
 
        } catch (std::exception& ex) {
@@ -980,7 +1013,7 @@ private:
         return resp_buf;
     }
 
-    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp) {
+    void on_resp_ready(ptr<req_msg> req, ptr<resp_msg> resp, bool close_after) {
         ptr<rpc_session> self = this->shared_from_this();
 
        try {
@@ -988,13 +1021,18 @@ private:
 
         aa::write( ssl_enabled_, ssl_socket_, socket_,
                    asio::buffer(resp_buf->data_begin(), resp_buf->size()),
-                   [this, self, resp_buf]
+                   [this, self, resp_buf, close_after]
                    (ERROR_CODE err_code, size_t) -> void
         {
             // To avoid releasing `resp_buf` before the write is done.
             (void)resp_buf;
             if (!err_code) {
-                this->start(self);
+                if (close_after) {
+                    p_in("session %" PRIu64 " CLOSE_ON_ERROR: close after resp", session_id_);
+                    this->request_stop();
+                } else {
+                    this->start(self);
+                }
             } else {
                 p_er( "session %" PRIu64 " failed to send response to peer due "
                       "to error %d",
@@ -1460,6 +1498,10 @@ public:
 
         if (req->get_extra_flags() & req_msg::ALLOW_ASYNC_LOG_APPENDING) {
             flags |= ALLOW_ASYNC_LOG_APPENDING_WIRE;
+        }
+
+        if (req->get_extra_flags() & req_msg::CLOSE_ON_ERROR) {
+            flags |= CLOSE_ON_ERROR_WIRE;
         }
 
         for (auto& entry: req->log_entries()) {

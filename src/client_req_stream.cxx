@@ -23,10 +23,19 @@ client_req_stream::client_req_stream(raft_server& srv,
 
 void client_req_stream::append(std::vector< ptr<buffer> > logs)
 {
+    if (state_->abandoned_.load()) {
+        // If leader rejected a previous append, drop all subsequent ones.
+        return;
+    }
+
     ptr<req_msg> req = cs_new<req_msg>(
         /*term=*/ stream_term_, msg_type::client_request,
         /*src=*/ 0, /*dst=*/ 0,
         /*last_log_term=*/ 0, /*last_log_idx=*/ 0, /*commit_idx=*/ 0);
+    // CLOSE_ON_ERROR is required to avoid skipping/reordering if the leader
+    // rejects a request (e.g. because of max_uncommitted_log_entries_)
+    // but accepts the next one.
+    req->set_extra_flags(req->get_extra_flags() | req_msg::CLOSE_ON_ERROR);
     req->log_entries().reserve(logs.size());
     for (auto& buf : logs) {
         buf->pos(0);

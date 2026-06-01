@@ -43,6 +43,12 @@ public:
     // with `raft_params::parallel_log_appending_` enabled.
     static constexpr uint64_t ALLOW_ASYNC_LOG_APPENDING = 0x2;
 
+    // If set, the server closes the connection if this request fails.
+    // Doesn't work for pipelined requests (streaming_mode_ == true,
+    // process_req returns async_cb, e.g. append_entries request).
+    // Used by `client_req_stream` to preserve its no-skipping guarantee.
+    static constexpr uint64_t CLOSE_ON_ERROR = 0x4;
+
     req_msg(ulong term,
             msg_type type,
             int32 src,
