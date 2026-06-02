@@ -28,6 +28,8 @@ limitations under the License.
 
 #include <memory>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 namespace nuraft {
 
@@ -42,7 +44,7 @@ struct context {
 public:
     context(ptr<state_mgr> mgr,
             ptr<state_machine> m,
-            ptr<rpc_listener> listener,
+            std::vector<ptr<rpc_listener>> listeners,
             ptr<logger> l,
             ptr<rpc_client_factory> cli_factory,
             ptr<delayed_task_scheduler> scheduler,
@@ -50,7 +52,7 @@ public:
             global_mgr* custom_global_mgr = nullptr)
         : state_mgr_(std::move(mgr))
         , state_machine_(std::move(m))
-        , rpc_listener_(std::move(listener))
+        , rpc_listeners_(std::move(listeners))
         , logger_(std::move(l))
         , rpc_cli_factory_(std::move(cli_factory))
         , scheduler_(std::move(scheduler))
@@ -104,7 +106,7 @@ public:
     /**
      * RPC listener instance.
      */
-    ptr<rpc_listener> rpc_listener_;
+    std::vector<ptr<rpc_listener>> rpc_listeners_;
 
     /**
      * System logger instance.

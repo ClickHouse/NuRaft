@@ -77,6 +77,8 @@ struct raft_params {
         , snapshot_sync_ctx_timeout_(0)
         , enable_randomized_snapshot_creation_(false)
         , max_append_size_(100)
+        , max_append_size_bytes_(0)
+        , append_entries_backward_probe_throttle_threshold_(5)
         , reserved_log_items_(100000)
         , client_req_timeout_(3000)
         , fresh_log_gap_(200)
@@ -102,7 +104,13 @@ struct raft_params {
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
         , max_bytes_in_flight_in_stream_(0)
+        , max_uncommitted_log_entries_(0)
         {}
+
+    raft_params& with_max_uncommitted_log_entries(uint64_t max_entries) {
+        max_uncommitted_log_entries_ = max_entries;
+        return *this;
+    }
 
     /**
      * Election timeout upper bound in milliseconds
@@ -156,6 +164,32 @@ struct raft_params {
      */
     raft_params& with_max_append_size(int32 size) {
         max_append_size_ = size;
+        return *this;
+    }
+
+    /**
+     * The maximum bytes of log entries that could be attached to an appendEntries call.
+     * If set to 0, only max_append_size_ will be used.
+     *
+     * @param size_bytes
+     * @return self
+     */
+    raft_params& with_max_append_size_bytes(int64 size_bytes) {
+        max_append_size_bytes_ = size_bytes;
+        return *this;
+    }
+
+    /**
+     * Number of consecutive backward log-match probes after which the leader
+     * limits appendEntries payloads to one log entry.
+     * If set to 0, the backward-probe payload throttle is disabled.
+     *
+     * @param threshold
+     * @return self
+     */
+    raft_params& with_append_entries_backward_probe_throttle_threshold(
+            int32 threshold) {
+        append_entries_backward_probe_throttle_threshold_ = threshold;
         return *this;
     }
 
@@ -240,7 +274,7 @@ struct raft_params {
      * @param number_of_logs Number of log items.
      * @return self
      */
-    raft_params& with_reserved_log_items(int number_of_logs) {
+    raft_params& with_reserved_log_items(int32 number_of_logs) {
         reserved_log_items_ = number_of_logs;
         return *this;
     }
@@ -440,6 +474,20 @@ public:
      * for append entry request.
      */
     int32 max_append_size_;
+
+    /**
+     * Max bytes of logs that can be packed in a RPC
+     * for append entry request.
+     * If set to 0, only max_append_size_ will be used.
+     */
+    int64 max_append_size_bytes_;
+
+    /**
+     * Number of consecutive backward log-match probes after which
+     * append entry requests are limited to one log entry.
+     * If set to 0, this throttle is disabled.
+     */
+    int32 append_entries_backward_probe_throttle_threshold_;
 
     /**
      * Minimum number of logs that will be preserved
@@ -668,6 +716,15 @@ public:
      * specified byte limit. This limitation is effective only in streaming mode.
      */
     int64_t max_bytes_in_flight_in_stream_;
+
+    /**
+     * If non-zero, leader-side admission of new client requests will reject
+     * batches that would make the local uncommitted Raft log tail exceed this
+     * entry count. `0` disables this limit. The count is based on
+     * `next_slot - sm_commit_index_ - 1`. Control and recovery traffic is not
+     * limited by this setting.
+     */
+    uint64_t max_uncommitted_log_entries_;
 };
 
 }

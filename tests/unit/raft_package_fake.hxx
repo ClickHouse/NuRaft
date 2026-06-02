@@ -88,7 +88,7 @@ public:
         // For deterministic test, we should not use BG thread.
         params.use_bg_thread_for_urgent_commit_ = false;
 
-        ctx = new context( sMgr, sm, listener, myLog,
+        ctx = new context( sMgr, sm, {listener}, myLog,
                            rpcCliFactory, scheduler, params );
 
         if (init_cb) {
@@ -122,7 +122,7 @@ public:
         // For deterministic test, we should not use BG thread.
         params.use_bg_thread_for_urgent_commit_ = false;
 
-        ctx = new context( sMgr, sm, listener, myLog,
+        ctx = new context( sMgr, sm, {listener}, myLog,
                            rpcCliFactory, scheduler, params );
         raftServer = cs_new<raft_server>(ctx, opt);
     }
@@ -152,6 +152,10 @@ public:
         _s_info(ll) << msg;
     }
 
+    void dropPeerConnection(int peer_id) {
+        fNet->dropPeerConnection(raftServer.get(), peer_id);
+    }
+
     int myId;
     std::string myEndpoint;
     ptr<FakeNetworkBase> fBase;
@@ -175,7 +179,7 @@ static std::atomic<bool> commit_done(false);
 static std::list<int> removed_servers;
 static std::vector<RaftPkg*> pkgs_to_watch;
 static std::mutex pkgs_to_watch_lock;
-static EventAwaiter ea_wait_for_commit;
+static nuraft::EventAwaiter ea_wait_for_commit;
 
 static bool ATTR_UNUSED check_pkgs() {
     // Check if all current committed logs are executed in

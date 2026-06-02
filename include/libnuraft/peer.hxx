@@ -53,6 +53,7 @@ public:
         , sm_committed_idx_(0)
         , next_batch_size_hint_in_bytes_(0)
         , matched_idx_(0)
+        , next_log_idx_floor_(0)
         , busy_flag_(false)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
@@ -70,6 +71,7 @@ public:
         , stale_rpc_responses_(0)
         , last_sent_idx_(0)
         , cnt_not_applied_(0)
+        , cnt_backward_log_probe_(0)
         , leave_requested_(false)
         , hb_cnt_since_leave_(0)
         , stepping_down_(false)
@@ -95,14 +97,17 @@ public:
 
 public:
     int32 get_id() const {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         return config_->get_id();
     }
 
     const std::string& get_endpoint() const {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         return config_->get_endpoint();
     }
 
     bool is_learner() const {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         return config_->is_learner();
     }
 
@@ -111,10 +116,12 @@ public:
     }
 
     const srv_config& get_config() {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         return *config_;
     }
 
     void set_config(ptr<srv_config> new_config) {
+        std::lock_guard<std::mutex> lock(config_mutex_);
         config_ = new_config;
     }
 
@@ -162,6 +169,14 @@ public:
 
     void set_next_log_idx(ulong idx) {
         next_log_idx_ = idx;
+    }
+
+    ulong get_next_log_idx_floor() const {
+        return next_log_idx_floor_;
+    }
+
+    void set_next_log_idx_floor(ulong idx) {
+        next_log_idx_floor_ = idx;
     }
 
     uint64_t get_last_accepted_log_idx() const {
@@ -241,6 +256,10 @@ public:
 
     void shutdown();
 
+    void reopen(context& ctx, timer_task<int32>::executor& hb_exec);
+
+    bool is_abandoned() const { return abandoned_; }
+
     // Time that sent the last request.
     void reset_ls_timer()       { last_sent_timer_.reset(); }
     uint64_t get_ls_timer_us()  { return last_sent_timer_.get_us(); }
@@ -268,6 +287,11 @@ public:
     bool recreate_rpc(ptr<srv_config>& config,
                       context& ctx);
 
+    void reset_rpc() {
+        std::lock_guard<std::mutex> l(rpc_protector_);
+        rpc_.reset();
+    }
+
     void reset_rpc_errs()   { rpc_errs_ = 0; }
     void inc_rpc_errs()     { rpc_errs_.fetch_add(1); }
     int32 get_rpc_errs()    { return rpc_errs_; }
@@ -283,6 +307,10 @@ public:
     int32 inc_cnt_not_applied()         { cnt_not_applied_++;
                                           return cnt_not_applied_; }
     int32 get_cnt_not_applied() const   { return cnt_not_applied_; }
+
+    void reset_cnt_backward_log_probe()       { cnt_backward_log_probe_ = 0; }
+    int32 inc_cnt_backward_log_probe()        { return cnt_backward_log_probe_.fetch_add(1) + 1; }
+    int32 get_cnt_backward_log_probe() const  { return cnt_backward_log_probe_; }
 
     void step_down()                { stepping_down_ = true; }
     bool is_stepping_down() const   { return stepping_down_.load(); }
@@ -382,7 +410,7 @@ public:
 
 private:
     void handle_rpc_result(ptr<peer> myself,
-                           ptr<rpc_client> my_rpc_client,
+                           uint64_t my_rpc_client_id,
                            ptr<req_msg>& req,
                            ptr<rpc_result>& pending_result,
                            bool streaming,
@@ -394,6 +422,8 @@ private:
      * Information (config) of this server.
      */
     ptr<srv_config> config_;
+
+    mutable std::mutex config_mutex_;
 
     /**
      * Heartbeat scheduler for this server.
@@ -454,6 +484,13 @@ private:
      * The last log index whose term matches up with the leader.
      */
     ulong matched_idx_;
+
+    /**
+     * Floor for `next_log_idx_`, set after successful snapshot sync.
+     * Prevents stale RPC responses from rewinding `next_log_idx_`
+     * below the snapshot-established position.
+     */
+    ulong next_log_idx_floor_;
 
     /**
      * `true` if we sent message to this server and waiting for
@@ -545,6 +582,12 @@ private:
     std::atomic<int32> cnt_not_applied_;
 
     /**
+     * Number of consecutive rejected append responses that moved
+     * `next_log_idx_` one step backward while probing for a matching log.
+     */
+    std::atomic<int32> cnt_backward_log_probe_;
+
+    /**
      * `true` if leave request has been sent to this peer.
      */
     std::atomic<bool> leave_requested_;
@@ -625,6 +668,7 @@ private:
      * If `true`, this peer marks itself down.
      */
     std::atomic<bool> self_mark_down_;
+
 
     /**
      * Logger instance.

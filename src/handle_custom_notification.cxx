@@ -168,6 +168,9 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     case custom_notification_msg::request_resignation: {
         return handle_resignation_request(req, msg, resp);
     }
+    case custom_notification_msg::request_leadership: {
+        return handle_request_leadership_request(req, msg, resp);
+    }
     default:
         break;
     }
@@ -246,6 +249,19 @@ ptr<resp_msg> raft_server::handle_resignation_request
     return resp;
 }
 
+ptr<resp_msg> raft_server::handle_request_leadership_request
+                           ( req_msg& req,
+                             ptr<custom_notification_msg> msg,
+                             ptr<resp_msg> resp )
+{
+    p_in("[REQUEST LEADER REQUEST] got request");
+
+    request_leadership();
+
+    return resp;
+}
+
+
 void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     if (!resp.get_accepted()) return;
 
@@ -257,7 +273,7 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     ptr<peer> p = it->second;
 
     p->set_next_log_idx(resp.get_next_idx());
+    p->reset_cnt_backward_log_probe();
 }
 
 } // namespace nuraft;
-

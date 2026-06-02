@@ -200,6 +200,7 @@ if(NOT WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pessimizing-move")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 
@@ -306,6 +307,7 @@ set(RAFT_CORE
     ${ASIO_SERVICE_SRC}
     ${ROOT_SRC}/buffer.cxx
     ${ROOT_SRC}/buffer_serializer.cxx
+    ${ROOT_SRC}/client_req_stream.cxx
     ${ROOT_SRC}/cluster_config.cxx
     ${ROOT_SRC}/crc32.cxx
     ${ROOT_SRC}/error_code.cxx

@@ -306,6 +306,15 @@ void FakeNetwork::handleAllFrom(const std::string& endpoint) {
     while (handleRespFrom(endpoint));
 }
 
+bool FakeNetwork::replaceLastPendingResp(const std::string& endpoint,
+                                         ptr<resp_msg> new_resp) {
+    ptr<FakeClient> conn = findClient(endpoint);
+    if (!conn || conn->pendingResps.empty()) return false;
+    auto& last = conn->pendingResps.back();
+    last.resp = new_resp;
+    return true;
+}
+
 size_t FakeNetwork::getNumPendingReqs(const std::string& endpoint) {
     ptr<FakeClient> conn = findClient(endpoint);
     if (!conn) return 0;
@@ -316,6 +325,12 @@ size_t FakeNetwork::getNumPendingResps(const std::string& endpoint) {
     ptr<FakeClient> conn = findClient(endpoint);
     if (!conn) return 0;
     return conn->pendingResps.size();
+}
+
+ptr<req_msg> FakeNetwork::getFirstPendingReq(const std::string& endpoint) {
+    ptr<FakeClient> conn = findClient(endpoint);
+    if (!conn || conn->pendingReqs.empty()) return nullptr;
+    return conn->pendingReqs.begin()->req;
 }
 
 void FakeNetwork::stop() {
@@ -457,4 +472,3 @@ void FakeTimer::cancel_impl(ptr<delayed_task>& task) {
 }
 
 }  // namespace nuraft;
-

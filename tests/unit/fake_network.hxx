@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "nuraft.hxx"
 
+#include "peer.hxx"
 #include "raft_server_handler.hxx"
 
 #include <map>
@@ -93,15 +94,169 @@ public:
 
     size_t getNumPendingResps(const std::string& endpoint);
 
+    ptr<req_msg> getFirstPendingReq(const std::string& endpoint);
+
     void goesOffline() { online = false; }
 
     void goesOnline() { online =  true; }
+
+    void dropPeerConnection(raft_server* srv, int peer_id) {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        if (entry != peers.end()) {
+            entry->second->reset_rpc();
+        }
+    }
 
     bool isOnline() const { return online; }
 
     void stop();
 
     void shutdown();
+
+    void setPeerSnapshotSyncNeeded(raft_server* srv,
+                                   int32 peer_id,
+                                   bool val) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_snapshot_sync_is_needed(val);
+        }
+    }
+
+    bool getPeerSnapshotSyncNeeded(raft_server* srv,
+                                   int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->is_snapshot_sync_needed();
+        }
+        return false;
+    }
+
+    void clearLastSnapshot(raft_server* srv) {
+        clear_last_snapshot(srv);
+    }
+
+    bool isServerOutOfLogRange(raft_server* srv) {
+        return is_out_of_log_range(srv);
+    }
+
+    bool hasPeerSnapshotSyncCtx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_snapshot_sync_ctx() != nullptr;
+        }
+        return false;
+    }
+
+    ulong getPeerNextLogIdxFloor(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_next_log_idx_floor();
+        }
+        return 0;
+    }
+
+    void setPeerNextLogIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_next_log_idx(idx);
+        }
+    }
+
+    void setPeerMatchedIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_matched_idx(idx);
+        }
+    }
+
+    ulong getPeerMatchedIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_matched_idx();
+        }
+        return 0;
+    }
+
+    void setPeerLastAcceptedLogIdx(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_last_accepted_log_idx(idx);
+        }
+    }
+
+    ulong getPeerLastAcceptedLogIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_last_accepted_log_idx();
+        }
+        return 0;
+    }
+
+    void setPeerNextLogIdxFloor(raft_server* srv, int32 peer_id, ulong idx) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_next_log_idx_floor(idx);
+        }
+    }
+
+    ulong getPeerNextLogIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_next_log_idx();
+        }
+        return 0;
+    }
+
+    int32 getPeerBackwardLogProbeCount(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_cnt_backward_log_probe();
+        }
+        return 0;
+    }
+
+    void setPeerBackwardLogProbeCount(raft_server* srv,
+                                      int32 peer_id,
+                                      int32 value) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->reset_cnt_backward_log_probe();
+            for (int32 ii = 0; ii < value; ++ii) {
+                it->second->inc_cnt_backward_log_probe();
+            }
+        }
+    }
+
+    bool replaceLastPendingResp(const std::string& endpoint,
+                                ptr<resp_msg> new_resp);
+
+    void setPeerSnapshotInSync(raft_server* srv,
+                               int32 peer_id,
+                               ptr<snapshot> snp) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            it->second->set_snapshot_in_sync(snp);
+        }
+    }
+
+    ptr<snapshot> getLastSnapshot(raft_server* srv) {
+        return get_last_snapshot(srv);
+    }
 
 private:
     std::string myEndpoint;
@@ -191,4 +346,3 @@ private:
 };
 
 }  // namespace nuraft;
-

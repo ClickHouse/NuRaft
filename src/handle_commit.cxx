@@ -47,6 +47,13 @@ void raft_server::commit(ulong target_idx) {
         quick_commit_index_ = target_idx;
         lagging_sm_target_index_ = target_idx;
 
+        p_ts( "local log idx %" PRIu64 ", target_commit_idx %" PRIu64 ", "
+            "quick_commit_index_ %" PRIu64 ", state_->get_commit_idx() %" PRIu64 "",
+            log_store_->next_slot() - 1, target_idx,
+            quick_commit_index_.load(), sm_commit_index_.load() );
+
+        p_ts( "trigger commit upto %" PRIu64 "", quick_commit_index_.load() );
+
         // if this is a leader notify peers to commit as well
         // for peers that are free, send the request, otherwise,
         // set pending commit flag for that peer
@@ -66,11 +73,6 @@ void raft_server::commit(ulong target_idx) {
         }
     }
 
-    p_tr( "local log idx %" PRIu64 ", target_commit_idx %" PRIu64 ", "
-          "quick_commit_index_ %" PRIu64 ", state_->get_commit_idx() %" PRIu64 "",
-          log_store_->next_slot() - 1, target_idx,
-          quick_commit_index_.load(), sm_commit_index_.load() );
-
     if ( log_store_->next_slot() - 1 > sm_commit_index_ &&
          quick_commit_index_ > sm_commit_index_ ) {
 
@@ -80,7 +82,7 @@ void raft_server::commit(ulong target_idx) {
             p_tr("request commit to global thread pool");
             mgr->request_commit( this->shared_from_this() );
         } else {
-            p_tr("commit_cv_ notify (local thread)");
+            p_ts("commit_cv_ notify (local thread)");
             std::unique_lock<std::mutex> lock(commit_cv_lock_);
             commit_cv_.notify_one();
         }
@@ -113,6 +115,12 @@ void raft_server::commit_in_bg() {
 #endif
 
     while (true) {
+     /// Server can start and have some uncommited entries between snapshots and logs
+     /// This entries are not user requests, so they need to be treated slightly different.
+     /// Also we can start without any uncommited log entries, and in this case first user request
+     /// must be treated as always. That is why we set this flag here.
+     bool is_log_store_commit_exec = initial_commit_exec_.exchange(false);
+
      try {
         // WARNING:
         //   If `sm_commit_paused_` is set, we shouldn't enter
@@ -139,10 +147,10 @@ void raft_server::commit_in_bg() {
                 return ( log_store_->next_slot() - 1 > sm_commit_index_ &&
                          quick_commit_index_ > sm_commit_index_ );
             };
-            p_tr("commit_cv_ sleep\n");
+            p_ts("commit_cv_ sleep\n");
             commit_cv_.wait(lock, wait_check);
 
-            p_tr("commit_cv_ wake up\n");
+            p_ts("commit_cv_ wake up\n");
             if (stopping_) {
                 lock.unlock();
                 lock.release();
@@ -160,7 +168,14 @@ void raft_server::commit_in_bg() {
             //     2) log store's latest log index.
         }
 
-        commit_in_bg_exec();
+        if (stopping_) {
+            { std::unique_lock<std::mutex> lock2(ready_to_stop_cv_lock_);
+              ready_to_stop_cv_.notify_all(); }
+            commit_bg_stopped_ = true;
+            return;
+        }
+
+        commit_in_bg_exec(0, is_log_store_commit_exec);
 
         if (sm_commit_notifier_target_idx_ > sm_commit_notifier_notified_idx_) {
             uint64_t target_idx = sm_commit_notifier_target_idx_;
@@ -181,7 +196,7 @@ void raft_server::commit_in_bg() {
     commit_bg_stopped_ = true;
 }
 
-bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
+bool raft_server::commit_in_bg_exec(size_t timeout_ms, bool initial_commit_exec) {
     std::unique_lock<std::mutex> ll(commit_lock_, std::try_to_lock);
     if (!ll.owns_lock()) {
         // Other thread is already doing commit.
@@ -209,6 +224,7 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
           quick_commit_index_.load(), sm_commit_index_.load() );
 
     ulong log_start_idx = log_store_->start_index();
+
     if ( log_start_idx &&
          sm_commit_index_ < log_start_idx - 1 ) {
         p_wn("current commit idx %" PRIu64 " is smaller than log start idx %" PRIu64 " - 1, "
@@ -236,6 +252,9 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
             break;
         }
         first_loop_exec = false;
+
+        if (stopping_)
+            return false;
 
         // Break the loop if state machine commit is paused.
         if (sm_commit_paused_) {
@@ -268,7 +287,7 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
         }
 
         if (le->get_val_type() == log_val_type::app_log) {
-            commit_app_log(index_to_commit, le, need_to_handle_commit_elem);
+            commit_app_log(index_to_commit, le, need_to_handle_commit_elem, initial_commit_exec);
 
         } else if (le->get_val_type() == log_val_type::conf) {
             commit_conf(index_to_commit, le);
@@ -320,6 +339,12 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
 
     p_db( "DONE: commit upto %" PRIu64 ", current idx %" PRIu64,
           quick_commit_index_.load(), sm_commit_index_.load() );
+
+    if (initial_commit_exec) {
+        cb_func::Param param(id_, leader_);
+        ctx_->cb_func_.call(cb_func::InitialBatchCommited, &param);
+    }
+
     if (role_ == srv_role::follower) {
         ulong leader_idx = leader_commit_index_.load();
         ulong local_idx = sm_commit_index_.load();
@@ -354,7 +379,8 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
 
 void raft_server::commit_app_log(ulong idx_to_commit,
                                  ptr<log_entry>& le,
-                                 bool need_to_handle_commit_elem)
+                                 bool need_to_handle_commit_elem,
+                                 bool initial_commit_exec)
 {
     ptr<buffer> ret_value = nullptr;
     ptr<buffer> buf = le->get_buf_ptr();
@@ -369,7 +395,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
         _sys_exit(-1);
     }
     ret_value = state_machine_->commit_ext
-                ( state_machine::ext_op_params( sm_idx, buf ) );
+                ( state_machine::ext_op_params( sm_idx, buf, le->get_term() ) );
     if (ret_value) ret_value->pos(0);
 
     auto params = ctx_->get_params();
@@ -398,6 +424,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
                 elem->result_code_ = cmd_result_code::OK;
                 elem->ret_value_ = ret_value;
                 need_to_check_commit_ret = false;
+                p_ts("notify cb %" PRIu64 " %p", sm_idx, &elem->awaiter_);
 
                 if (params->track_peers_sm_commit_idx_) {
                     // Respond upon all peers' SM commit.
@@ -429,7 +456,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
             }
         }
 
-        if (need_to_check_commit_ret) {
+        if (need_to_check_commit_ret && !initial_commit_exec) {
             // If not found, commit thread is invoked earlier than user thread.
             // Create one here.
             ptr<commit_ret_elem> elem = cs_new<commit_ret_elem>();
@@ -1226,4 +1253,3 @@ bool raft_server::wait_for_state_machine_pause(size_t timeout_ms) {
 }
 
 } // namespace nuraft;
-

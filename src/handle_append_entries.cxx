@@ -48,7 +48,8 @@ struct resp_appendix {
         NONE = 0,
         DO_NOT_REWIND = 1,
         RECEIVING_SNAPSHOT = 2,
-        NOTIFYING_SM_COMMITTED_INDEX = 3,
+        COMPACTED_SNAPSHOT_BOUNDARY = 3,
+        NOTIFYING_SM_COMMITTED_INDEX = 4,
     };
 
     resp_appendix()
@@ -109,6 +110,8 @@ struct resp_appendix {
             return "DO_NOT_REWIND";
         case RECEIVING_SNAPSHOT:
             return "RECEIVING_SNAPSHOT";
+        case COMPACTED_SNAPSHOT_BOUNDARY:
+            return "COMPACTED_SNAPSHOT_BOUNDARY";
         case NOTIFYING_SM_COMMITTED_INDEX:
             return "NOTIFYING_SM_COMMITTED_INDEX";
         default:
@@ -127,6 +130,8 @@ struct resp_appendix {
      */
     uint64_t sm_committed_idx_;
 };
+
+const static int32 APPEND_ENTRIES_SAME_START_THROTTLE_THRESHOLD = 5;
 
 void raft_server::append_entries_in_bg() {
     std::string thread_name = "nuraft_append";
@@ -288,11 +293,12 @@ bool raft_server::request_append_entries(ptr<peer> p) {
             //   eventually have the same impact of removing and then
             //   re-adding the peer.
             //
-            p_tr("new rpc for peer %d is created, "
+            p_ts("new rpc for peer %d is created, "
                  "reset next log idx (%" PRIu64 ") and matched log idx (%" PRIu64 ")",
                  p->get_id(), p_next_log_idx, p->get_matched_idx());
             p->set_next_log_idx(0);
             p->set_matched_idx(0);
+            p->set_next_log_idx_floor(0);
         }
         p->clear_reconnection();
     }
@@ -330,7 +336,7 @@ bool raft_server::request_append_entries(ptr<peer> p) {
         bool streaming = last_streamed_log_idx > 0;
 
         if (streaming || p->make_busy()) {
-            p_tr("send request to %d, streaming: %d, is_busy: %d\n", (int)p->get_id(),
+            p_ts("send request to %d, streaming: %d, is_busy: %d\n", (int)p->get_id(),
                  streaming, p->is_busy());
             msg = create_append_entries_req(p, last_streamed_log_idx);
             m_handler = resp_handler_;
@@ -351,7 +357,7 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                          p->get_bytes_in_flight() > max_stream_bytes)) {
                         streaming = false;
                     } else {
-                        p_tr("send following request to %d in stream mode, "
+                        p_ts("send following request to %d in stream mode, "
                              "start idx: %" PRIu64 "", (int)p->get_id(),
                              msg->get_last_log_idx());
                         p->set_last_streamed_log_idx(
@@ -484,6 +490,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         std::lock_guard<std::mutex> guard(p.get_lock());
         if (p.get_next_log_idx() == 0L) {
             p.set_next_log_idx(cur_nxt_idx);
+            p.reset_cnt_backward_log_probe();
         }
 
         if (custom_last_log_idx > 0) {
@@ -508,14 +515,39 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     // last_log_idx: last log index of replica (follower).
     // end_idx: if (cur_nxt_idx - last_log_idx) > max_append_size, limit it.
 
-    p_tr("last_log_idx: %" PRIu64 ", starting_idx: %" PRIu64
+    p_ts("last_log_idx: %" PRIu64 ", starting_idx: %" PRIu64
          ", cur_nxt_idx: %" PRIu64 "\n",
          last_log_idx, starting_idx, cur_nxt_idx);
 
     // Verify log index range.
     bool entries_valid = (last_log_idx + 1 >= starting_idx);
     if (entries_valid && pp->is_snapshot_sync_needed()) {
-        entries_valid = false;
+        // Check if the peer has already caught up past the snapshot.
+        // If so, clear the stale flag and proceed with normal log
+        // replication instead of incorrectly forcing entries_valid
+        // to false (which would send an erroneous out_of_log_range
+        // warning to the follower, blocking its election timer).
+        ptr<snapshot> snp_local = get_last_snapshot();
+        if (!snp_local || last_log_idx >= snp_local->get_last_log_idx()) {
+            // Either no snapshot exists (flag is stale — nothing to sync)
+            // or the peer has caught up past the snapshot. In both cases,
+            // clear the flag and proceed with normal log replication.
+            if (snp_local) {
+                p_in("peer %d log idx %" PRIu64 " has caught up past "
+                     "snapshot %" PRIu64 ", clearing stale snapshot sync "
+                     "flag before log replication",
+                     p.get_id(), last_log_idx,
+                     snp_local->get_last_log_idx());
+            } else {
+                p_in("peer %d log idx %" PRIu64 ", no snapshot exists, "
+                     "clearing stale snapshot sync flag",
+                     p.get_id(), last_log_idx);
+            }
+            clear_snapshot_sync_ctx(p);
+            pp->set_snapshot_sync_is_needed(false);
+        } else {
+            entries_valid = false;
+        }
     }
 
     // Read log entries. The underlying log store may have removed some log entries
@@ -533,23 +565,40 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     if ( last_log_idx + 1 == peer_last_sent_idx &&
          last_log_idx + 2 < end_idx ) {
         int32 cur_cnt = p.inc_cnt_not_applied();
-        p_db("last sent log (%" PRIu64 ") to peer %d is not applied, cnt %d",
+        p_ts("last sent log (%" PRIu64 ") to peer %d is not applied, cnt %d",
              peer_last_sent_idx, p.get_id(), cur_cnt);
-        if (cur_cnt >= 5) {
+        if (cur_cnt >= APPEND_ENTRIES_SAME_START_THROTTLE_THRESHOLD) {
             ulong prev_end_idx = end_idx;
             end_idx = std::min( cur_nxt_idx, last_log_idx + 1 + 1 );
-            p_db("reduce end_idx %" PRIu64 " -> %" PRIu64, prev_end_idx, end_idx);
+            p_ts("reduce end_idx %" PRIu64 " -> %" PRIu64, prev_end_idx, end_idx);
         }
     } else {
         p.reset_cnt_not_applied();
+    }
+
+    int32 backward_probe_cnt = p.get_cnt_backward_log_probe();
+    int32 backward_probe_threshold =
+        params->append_entries_backward_probe_throttle_threshold_;
+    if ( backward_probe_threshold > 0 &&
+         backward_probe_cnt >= backward_probe_threshold &&
+         last_log_idx + 2 < end_idx ) {
+        ulong prev_end_idx = end_idx;
+        end_idx = std::min( cur_nxt_idx, last_log_idx + 1 + 1 );
+        p_ts("reduce end_idx %" PRIu64 " -> %" PRIu64
+             " for peer %d after %d backward log probes",
+             prev_end_idx, end_idx, p.get_id(), backward_probe_cnt);
     }
 
     ptr<std::vector<ptr<log_entry>>> log_entries;
     if ((last_log_idx + 1) >= cur_nxt_idx) {
         log_entries = ptr<std::vector<ptr<log_entry>>>();
     } else if (entries_valid) {
+        int64 batch_size_hint = p.get_next_batch_size_hint_in_bytes() == 0
+                                    ? params->max_append_size_bytes_
+                                    : std::min(params->max_append_size_bytes_,
+                                               p.get_next_batch_size_hint_in_bytes());
         log_entries = log_store_->log_entries_ext(last_log_idx + 1, end_idx,
-                                                  p.get_next_batch_size_hint_in_bytes());
+                                                  batch_size_hint);
         if (log_entries == nullptr) {
             p_wn("failed to retrieve log entries: %" PRIu64 " - %" PRIu64,
                  last_log_idx + 1, end_idx);
@@ -570,18 +619,32 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              ( pp->is_snapshot_sync_needed() ||
                ( last_log_idx < starting_idx &&
                 last_log_idx < snp_local->get_last_log_idx() ) ) ) {
-            p_db( "send snapshot peer %d, peer log idx: %" PRIu64
-                  ", my starting idx: %" PRIu64 ", "
-                  "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
-                  ", snapshot sync needed: %d",
-                  p.get_id(),
-                  last_log_idx, starting_idx, cur_nxt_idx,
-                  snp_local->get_last_log_idx(),
-                  pp->is_snapshot_sync_needed() );
+            // If peer has advanced past our snapshot, it doesn't need
+            // snapshot sync anymore — clear the flag and fall through
+            // to normal log replication or out-of-log-range handling.
+            if ( last_log_idx >= snp_local->get_last_log_idx() &&
+                 pp->is_snapshot_sync_needed() ) {
+                p_in( "peer %d log idx %" PRIu64 " has caught up past "
+                      "snapshot %" PRIu64 ", clearing snapshot sync flag",
+                      p.get_id(), last_log_idx,
+                      snp_local->get_last_log_idx() );
+                clear_snapshot_sync_ctx(p);
+                pp->set_snapshot_sync_is_needed(false);
+                // Fall through to log-based replication or OOL handling.
+            } else {
+                p_db( "send snapshot peer %d, peer log idx: %" PRIu64
+                      ", my starting idx: %" PRIu64 ", "
+                      "my log idx: %" PRIu64 ", last_snapshot_log_idx: %" PRIu64
+                      ", snapshot sync needed: %d",
+                      p.get_id(),
+                      last_log_idx, starting_idx, cur_nxt_idx,
+                      snp_local->get_last_log_idx(),
+                      pp->is_snapshot_sync_needed() );
 
-            bool succeeded_out = false;
-            return create_sync_snapshot_req( pp, last_log_idx, term,
-                                             commit_idx, succeeded_out );
+                bool succeeded_out = false;
+                return create_sync_snapshot_req( pp, last_log_idx, term,
+                                                 commit_idx, succeeded_out );
+            }
         }
 
         // Cannot recover using snapshot. Return here to protect the leader.
@@ -612,6 +675,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
             cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
 
         req->log_entries().push_back(custom_noti_le);
+        p.reset_cnt_backward_log_probe();
         return req;
     }
 
@@ -630,11 +694,11 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
           ( log_entries ? log_entries->size() : 0 ), commit_idx, term,
           peer_last_sent_idx );
     if (last_log_idx+1 == adjusted_end_idx) {
-        p_tr( "EMPTY PAYLOAD" );
+        p_ts( "EMPTY PAYLOAD" );
     } else if (last_log_idx+1 + 1 == adjusted_end_idx) {
-        p_db( "idx: %" PRIu64, last_log_idx+1 );
+        p_ts( "idx: %" PRIu64, last_log_idx+1 );
     } else {
-        p_db( "idx range: %" PRIu64 "-%" PRIu64, last_log_idx+1, adjusted_end_idx-1 );
+        p_ts( "idx range: %" PRIu64 "-%" PRIu64, last_log_idx+1, adjusted_end_idx-1 );
     }
 
     ptr<req_msg> req
@@ -660,6 +724,13 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
             req->set_extra_flags(
                 req->get_extra_flags() | req_msg::EXCLUDED_FROM_THE_QUORUM);
         }
+    }
+
+    if (params->max_log_gap_in_stream_ > 0) {
+        // Streaming mode: let the follower pipeline the next request
+        // while this one's response is still pending.
+        req->set_extra_flags(
+            req->get_extra_flags() | req_msg::ALLOW_ASYNC_LOG_APPENDING);
     }
 
     return req;
@@ -724,7 +795,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     } _s_req(&serving_req_);
     timer_helper tt;
 
-    p_tr("from peer %d, req type: %d, req term: %" PRIu64 ", "
+    p_ts("from peer %d, req type: %d, req term: %" PRIu64 ", "
          "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
          "my term: %" PRIu64 ", my role: %d\n",
          req.get_src(), (int)req.get_type(), req.get_term(),
@@ -767,14 +838,6 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     //   req.get_last_log_idx() == lastSnapshot.get_last_log_idx() &&
     //   req.get_last_log_term() == lastSnapshot.get_last_log_term()
     //
-    // In not accepted case, we will return log_store_->next_slot() for
-    // the leader to quick jump to the index that might aligned.
-    ptr<resp_msg> resp = cs_new<resp_msg>( state_->get_term(),
-                                           msg_type::append_entries_response,
-                                           id_,
-                                           req.get_src(),
-                                           log_store_->next_slot() );
-
     ptr<snapshot> local_snp = get_last_snapshot();
     ulong log_term = 0;
     if (req.get_last_log_idx() < log_store_->next_slot()) {
@@ -788,6 +851,26 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
               local_snp->get_last_log_idx() == req.get_last_log_idx() &&
               local_snp->get_last_log_term() == req.get_last_log_term() );
 
+    // In not accepted case, we will return log_store_->next_slot() for
+    // the leader to quick jump to the index that might aligned.
+    ulong response_next_idx = log_store_->next_slot();
+    bool compacted_snapshot_boundary =
+        req.get_term() == state_->get_term() &&
+        !state_->is_receiving_snapshot() &&
+        local_snp &&
+        !log_okay &&
+        req.get_last_log_idx() < log_store_->start_index() &&
+        req.get_last_log_idx() < local_snp->get_last_log_idx();
+    if (compacted_snapshot_boundary) {
+        response_next_idx = local_snp->get_last_log_idx() + 1;
+    }
+
+    ptr<resp_msg> resp = cs_new<resp_msg>( state_->get_term(),
+                                           msg_type::append_entries_response,
+                                           id_,
+                                           req.get_src(),
+                                           response_next_idx );
+
     int log_lv = log_okay ? L_TRACE : (supp_exp_warning ? L_INFO : L_WARN);
     static timer_helper log_timer(500*1000, true);
     if (log_lv == L_WARN) {
@@ -796,16 +879,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             log_lv = L_TRACE;
         }
     }
-    p_lv( log_lv,
-          "[LOG %s] req log idx: %" PRIu64 ", req log term: %" PRIu64
-          ", my last log idx: %" PRIu64 ", "
-          "my log (%" PRIu64 ") term: %" PRIu64,
-          (log_okay ? "OK" : "XX"),
-          req.get_last_log_idx(),
-          req.get_last_log_term(),
-          log_store_->next_slot() - 1,
-          req.get_last_log_idx(),
-          log_term );
+
+    if (!log_okay)
+        p_lv( log_lv,
+            "[LOG %s] req log idx: %" PRIu64 ", req log term: %" PRIu64
+            ", my last log idx: %" PRIu64 ", "
+            "my log (%" PRIu64 ") term: %" PRIu64,
+            (log_okay ? "OK" : "XX"),
+            req.get_last_log_idx(),
+            req.get_last_log_term(),
+            log_store_->next_slot() - 1,
+            req.get_last_log_idx(),
+            log_term );
 
     if ( req.get_term() < state_->get_term() ||
          log_okay == false ||
@@ -828,6 +913,12 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             // this node's status. We should send an additional hint.
             resp_appendix appendix;
             appendix.extra_order_ = resp_appendix::RECEIVING_SNAPSHOT;
+            resp->set_ctx( appendix.serialize() );
+            p_lv(log_lv, "appended extra order %s",
+                 resp_appendix::extra_order_msg(appendix.extra_order_));
+        } else if (compacted_snapshot_boundary) {
+            resp_appendix appendix;
+            appendix.extra_order_ = resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY;
             resp->set_ctx( appendix.serialize() );
             p_lv(log_lv, "appended extra order %s",
                  resp_appendix::extra_order_msg(appendix.extra_order_));
@@ -883,6 +974,12 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     // Reset timer.
     last_rcvd_valid_append_entries_req_.reset();
 
+    // Pipelined processing requires both sides to opt in. Old NuRaft on
+    // either side falls back to the blocking path.
+    bool async_log_appending =
+        params->parallel_log_appending_ &&
+        (req.get_extra_flags() & req_msg::ALLOW_ASYNC_LOG_APPENDING);
+
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
 
@@ -931,6 +1028,23 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                   req.log_entries().size(),
                   cnt );
             rollback_in_progress = true;
+
+            // Fail any pending async append_entries requests: any entries they refer to
+            // are likely being rolled back, and leader term has changed.
+            {
+                auto_lock(pending_follower_resps_lock_);
+                if (!pending_follower_resps_.empty()) {
+                    p_in( "rollback: discarding %zu pending pipelined responses",
+                        pending_follower_resps_.size() );
+                    for (pending_follower_resp& resp: pending_follower_resps_) {
+                        ptr<buffer> empty_buf;
+                        ptr<std::exception> no_err;
+                        resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+                    }
+                    pending_follower_resps_.clear();
+                }
+            }
+
             // If rollback point is smaller than commit index,
             // should rollback commit index as well
             // (should not happen in Raft though).
@@ -975,7 +1089,13 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 cnt < req.log_entries().size() )
         {
             ptr<log_entry> entry = req.log_entries().at(cnt);
+
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::PreAppendLogFollower, &param);
+            if (rc == CbReturnCode::ReturnNull) return resp;
+
             p_in("overwrite at %" PRIu64 ", term %" PRIu64 ", timestamp %" PRIu64 "\n",
+
                  log_idx, entry->get_term(), entry->get_timestamp());
             store_log_entry(entry, log_idx);
 
@@ -1005,8 +1125,13 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         // Append new log entries
         while (cnt < req.log_entries().size()) {
             ptr<log_entry> entry = req.log_entries().at( cnt++ );
-            p_tr("append at %" PRIu64 ", term %" PRIu64 ", timestamp %" PRIu64 "\n",
-                 log_store_->next_slot(), entry->get_term(), entry->get_timestamp());
+
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::PreAppendLogFollower, &param);
+            if (rc == CbReturnCode::ReturnNull) return resp;
+
+            p_tr("append at %" PRIu64 ", term %" PRIu64 "\n",
+                 log_store_->next_slot(), entry->get_term());
             ulong idx_for_entry = store_log_entry(entry);
             if (entry->get_val_type() == log_val_type::conf) {
                 p_in( "receive a config change from leader at %" PRIu64,
@@ -1028,20 +1153,70 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                                          req.log_entries().size() );
 
         if (params->parallel_log_appending_) {
+            ulong required_durable =
+                req.get_last_log_idx() + req.log_entries().size();
+
+            if (async_log_appending) {
+                // Pipelined mode (streaming + parallel log appending):
+                // defer the response until entries become durable.
+                // Unblock this thread to allow processing more appends
+                // while waiting for durability (typically fsync, slow).
+                // `notify_log_append_completion` will fulfill the promise.
+
+                auto_lock(pending_follower_resps_lock_);
+
+                // Read last_durable_index after locking pending_follower_resps_lock_
+                // to avoid missing a notification if notify_log_append_completion
+                // happens after we check last_durable_index but before we add to
+                // pending_follower_resps_.
+                uint64_t last_durable_index = log_store_->last_durable_index();
+                p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                        ", deferring response (pipelined)",
+                        last_durable_index, required_durable );
+                if (last_durable_index < required_durable) {
+                    auto promise = cs_new<cmd_result<ptr<buffer>>>();
+                    pending_follower_resps_.push_back(
+                        {required_durable, req.log_entries().back()->get_term(), promise});
+                    resp->set_async_cb([promise]() { return promise; });
+                }
+            } else {
+                uint64_t last_durable_index = log_store_->last_durable_index();
+                while ( last_durable_index < required_durable ) {
+                    if (stopping_) return resp;
+
+                    // Some logs are not durable yet, wait here and block the thread.
+                    p_ts( "durable index %" PRIu64
+                        ", sleep and wait for log appending completion",
+                        last_durable_index );
+                    ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
+
+                    // --- `notify_log_append_completion` API will wake it up. ---
+
+                    ea_follower_log_append_->reset();
+                    last_durable_index = log_store_->last_durable_index();
+                    p_tr( "wake up, durable index %" PRIu64, last_durable_index );
+                }
+            }
+        }
+    } else if (async_log_appending) {
+        // Previous handle_append_entries calls may have appended some
+        // log entries without waiting for durability.
+        // We should wait for those entries to become durable before
+        // sending response with `next_log_idx = target_precommit_index + 1`,
+        // even if this request had no new entries.
+        auto_lock(pending_follower_resps_lock_);
+        if (!pending_follower_resps_.empty()) {
             uint64_t last_durable_index = log_store_->last_durable_index();
-            while ( last_durable_index <
-                    req.get_last_log_idx() + req.log_entries().size() ) {
-                // Some logs are not durable yet, wait here and block the thread.
-                p_tr( "durable index %" PRIu64
-                      ", sleep and wait for log appending completion",
-                      last_durable_index );
-                ea_follower_log_append_->wait_ms(params->heart_beat_interval_);
-
-                // --- `notify_log_append_completion` API will wake it up. ---
-
-                ea_follower_log_append_->reset();
-                last_durable_index = log_store_->last_durable_index();
-                p_tr( "wake up, durable index %" PRIu64, last_durable_index );
+            ulong required_durable =
+                req.get_last_log_idx() + req.log_entries().size();
+            if (last_durable_index < required_durable) {
+                p_ts( "durable index %" PRIu64 ", required %" PRIu64
+                        ", deferring response (pipelined)",
+                        last_durable_index, required_durable );
+                auto promise = cs_new<cmd_result<ptr<buffer>>>();
+                pending_follower_resps_.push_back(
+                    {required_durable, /*last_entry_term=*/ 0, promise});
+                resp->set_async_cb([promise]() { return promise; });
             }
         }
     }
@@ -1122,8 +1297,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             resp->get_extra_flags() | resp_msg::SELF_MARK_DOWN
         );
     }
-
-    if (ctx_->get_params()->track_peers_sm_commit_idx_) {
+    if (ctx_->get_params()->track_peers_sm_commit_idx_ && !resp->get_ctx()) {
         // If peer track mode is enabled, we should send
         // the current SM committed index to the leader.
         resp_appendix appendix;
@@ -1135,7 +1309,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
              appendix.sm_committed_idx_);
     }
 
-    p_tr("batch size hint: %" PRId64 " bytes, flags: %" PRIx64,
+    p_ts("batch size hint: %" PRId64 " bytes, flags: %" PRIx64,
          bs_hint, resp->get_extra_flags());
 
     out_of_log_range_ = false;
@@ -1193,11 +1367,11 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     bool need_to_catchup = true;
 
     ptr<peer> p = it->second;
-    p_tr("handle append entries resp (from %d), resp.get_next_idx(): %" PRIu64,
+    p_ts("handle append entries resp (from %d), resp.get_next_idx(): %" PRIu64,
          (int)p->get_id(), resp.get_next_idx());
 
     int64 bs_hint = resp.get_next_batch_size_hint_in_bytes();
-    p_tr("peer %d batch size hint: %" PRId64 " bytes, in-flight: %" PRId64 " bytes",
+    p_ts("peer %d batch size hint: %" PRId64 " bytes, in-flight: %" PRId64 " bytes",
          p->get_id(), bs_hint, p->get_bytes_in_flight());
     p->set_next_batch_size_hint_in_bytes(bs_hint);
 
@@ -1219,10 +1393,14 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         {
             std::lock_guard<std::mutex> l(p->get_lock());
             p->set_next_log_idx(resp.get_next_idx());
+            p->reset_cnt_backward_log_probe();
             prev_matched_idx = p->get_matched_idx();
             new_matched_idx = resp.get_next_idx() - 1;
-            p_tr("peer %d, prev matched idx: %" PRIu64 ", new matched idx: %" PRIu64,
-                 p->get_id(), prev_matched_idx, new_matched_idx);
+
+            if (prev_matched_idx != new_matched_idx)
+                p_tr("peer %d, prev matched idx: %" PRIu64 ", new matched idx: %" PRIu64,
+                    p->get_id(), prev_matched_idx, new_matched_idx);
+
             p->set_matched_idx(new_matched_idx);
             p->set_last_accepted_log_idx(new_matched_idx);
         }
@@ -1333,32 +1511,117 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     } else {
         std::lock_guard<std::mutex> guard(p->get_lock());
         ulong prev_next_log = p->get_next_log_idx();
-        if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
-            // fast move for the peer to catch up
-            p->set_next_log_idx(resp.get_next_idx());
-        } else {
-            bool do_log_rewind = true;
-            // If not, check an extra order exists.
-            if (resp.get_ctx()) {
-                ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
-                if (appendix->extra_order_ == resp_appendix::DO_NOT_REWIND) {
-                    do_log_rewind = false;
-                } else if (appendix->extra_order_ == resp_appendix::RECEIVING_SNAPSHOT) {
-                    p->set_snapshot_sync_is_needed(true);
-                    p_in("peer %d was in snapshot sync mode, re-sending a snapshot. "
-                         "peers next log idx: %" PRIu64 ", resp next idx: %" PRIu64,
-                         p->get_id(), prev_next_log, resp.get_next_idx());
-                }
+        resp_appendix::extra_order extra_order = resp_appendix::NONE;
+        if (resp.get_ctx()) {
+            ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
+            extra_order = appendix->extra_order_;
 
-                static timer_helper extra_order_timer(1000 * 1000, true);
-                int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
-                p_lv(log_lv, "received extra order: %s",
-                     resp_appendix::extra_order_msg(appendix->extra_order_));
+            static timer_helper extra_order_timer(1000 * 1000, true);
+            int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
+            p_lv(log_lv, "received extra order: %s",
+                 resp_appendix::extra_order_msg(appendix->extra_order_));
+            if (extra_order == resp_appendix::NOTIFYING_SM_COMMITTED_INDEX) {
+                extra_order = resp_appendix::NONE;
             }
-            // if not, move one log backward.
-            // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
-            if (do_log_rewind && prev_next_log) {
-                p->set_next_log_idx(prev_next_log - 1);
+        }
+
+        bool current_term_log_probe =
+            extra_order == resp_appendix::NONE &&
+            resp.get_term() == state_->get_term();
+        bool stale_term_log_probe =
+            extra_order == resp_appendix::NONE &&
+            resp.get_term() != state_->get_term();
+        bool unknown_extra_order =
+            extra_order != resp_appendix::NONE &&
+            extra_order != resp_appendix::DO_NOT_REWIND &&
+            extra_order != resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY &&
+            extra_order != resp_appendix::RECEIVING_SNAPSHOT;
+
+        if (extra_order == resp_appendix::DO_NOT_REWIND) {
+            // Application-level rejection. Keep peer progress unchanged.
+            p->reset_cnt_backward_log_probe();
+        } else if (extra_order == resp_appendix::COMPACTED_SNAPSHOT_BOUNDARY) {
+            p->reset_cnt_backward_log_probe();
+            ulong floor = p->get_next_log_idx_floor();
+            ulong target = std::max(resp.get_next_idx(), floor);
+            ulong max_next_idx = precommit_index_ + 1;
+            ulong matched_idx = p->get_matched_idx();
+            ulong last_accepted_log_idx = p->get_last_accepted_log_idx();
+            if ( resp.get_term() == state_->get_term() &&
+                 resp.get_next_idx() > 0 &&
+                 target > matched_idx &&
+                 target > last_accepted_log_idx &&
+                 target <= max_next_idx ) {
+                p->set_next_log_idx(target);
+                p->set_next_log_idx_floor(target);
+                p_in("peer %d compacted snapshot boundary: "
+                     "resp next_idx %" PRIu64 ", floor %" PRIu64
+                     ", target %" PRIu64,
+                     p->get_id(), resp.get_next_idx(), floor, target);
+            } else {
+                p_wn("invalid compacted snapshot boundary from peer %d: "
+                     "resp term %" PRIu64 ", my term %" PRIu64
+                     ", resp next_idx %" PRIu64 ", floor %" PRIu64
+                     ", target %" PRIu64 ", matched idx %" PRIu64
+                     ", last accepted log idx %" PRIu64
+                     ", max next_idx %" PRIu64,
+                     p->get_id(), resp.get_term(), state_->get_term(),
+                     resp.get_next_idx(), floor, target, matched_idx,
+                     last_accepted_log_idx, max_next_idx);
+            }
+        } else {
+            if (unknown_extra_order) {
+                p->reset_cnt_backward_log_probe();
+                p_wn("unknown append response extra order from peer %d: %d",
+                     p->get_id(), (int)extra_order);
+            }
+            if (extra_order == resp_appendix::RECEIVING_SNAPSHOT) {
+                p->reset_cnt_backward_log_probe();
+                p->set_snapshot_sync_is_needed(true);
+                p_in("peer %d was in snapshot sync mode, re-sending a snapshot",
+                     p->get_id());
+            }
+
+            if (resp.get_next_idx() > 0 && prev_next_log > resp.get_next_idx()) {
+                // fast move for the peer to catch up
+                ulong floor = p->get_next_log_idx_floor();
+                ulong target = std::max(resp.get_next_idx(), floor);
+                if (target != resp.get_next_idx()) {
+                    p_wn("fast-move clamped to snapshot floor: "
+                         "resp next_idx %" PRIu64 ", floor %" PRIu64,
+                         resp.get_next_idx(), floor);
+                }
+                p->set_next_log_idx(target);
+                p->reset_cnt_backward_log_probe();
+            } else {
+                // if not, move one log backward.
+                // WARNING: Make sure that `next_log_idx_` shouldn't be smaller than 0.
+                if (prev_next_log) {
+                    ulong floor = p->get_next_log_idx_floor();
+                    if (prev_next_log - 1 >= floor) {
+                        ulong new_next_log = prev_next_log - 1;
+                        p->set_next_log_idx(new_next_log);
+                        if (current_term_log_probe) {
+                            int32 probe_cnt = p->inc_cnt_backward_log_probe();
+                            p_tr("peer %d backward log probe: prev next idx %" PRIu64
+                                 ", new next idx %" PRIu64 ", cnt %d",
+                                 p->get_id(), prev_next_log, new_next_log, probe_cnt);
+                        } else if (stale_term_log_probe) {
+                            p->reset_cnt_backward_log_probe();
+                            p_tr("ignore stale-term backward log probe from peer %d: "
+                                 "resp term %" PRIu64 ", my term %" PRIu64,
+                                 p->get_id(), resp.get_term(), state_->get_term());
+                        }
+                    } else {
+                        p->reset_cnt_backward_log_probe();
+                        p_wn("skip log rewind: next_log_idx %" PRIu64
+                             " would go below snapshot floor %" PRIu64
+                             ", resp next_idx %" PRIu64,
+                             prev_next_log - 1, floor, resp.get_next_idx());
+                    }
+                } else if (current_term_log_probe || stale_term_log_probe) {
+                    p->reset_cnt_backward_log_probe();
+                }
             }
         }
         bool suppress = p->need_to_suppress_error();
@@ -1513,7 +1776,7 @@ uint64_t raft_server::get_current_leader_index() {
     if (params->parallel_log_appending_) {
         // For parallel appending, take the smaller one.
         uint64_t durable_index = log_store_->last_durable_index();
-        p_tr("last durable index %" PRIu64 ", precommit index %" PRIu64,
+        p_ts("last durable index %" PRIu64 ", precommit index %" PRIu64,
              durable_index, precommit_index_.load());
         leader_index = std::min(precommit_index_.load(), durable_index);
     }
@@ -1591,7 +1854,7 @@ ulong raft_server::get_expected_committed_log_idx() {
         }
     }
 
-    if (l_ && l_->get_level() >= 6) {
+    if (l_ && l_->get_level() >= 7) {
         std::string tmp_str = "[";
         for (size_t ii = 0; ii < matched_indexes.size(); ++ii) {
             tmp_str += std::to_string(matched_indexes[ii]);
@@ -1601,7 +1864,7 @@ ulong raft_server::get_expected_committed_log_idx() {
                 tmp_str += " ";
             }
         }
-        p_tr("quorum idx %zu, %s", quorum_idx, tmp_str.c_str());
+        p_ts("quorum idx %zu, %s", quorum_idx, tmp_str.c_str());
     }
 
     aci_params.current_commit_index_ = quick_commit_index_;
@@ -1615,21 +1878,33 @@ ulong raft_server::get_expected_committed_log_idx() {
 }
 
 void raft_server::notify_log_append_completion(bool ok) {
-    p_tr("got log append completion notification: %s", ok ? "OK" : "FAILED");
+    if (stopping_) {
+        // Send errors for pending async append_entries requests.
+        auto_lock(pending_follower_resps_lock_);
+        if (!pending_follower_resps_.empty()) {
+            p_in( "discarding %zu pending pipelined responses",
+                  pending_follower_resps_.size() );
+            for (pending_follower_resp& resp: pending_follower_resps_) {
+                ptr<buffer> empty_buf;
+                ptr<std::exception> no_err;
+                resp.promise->set_result(empty_buf, no_err, cmd_result_code::CANCELLED);
+            }
+            pending_follower_resps_.clear();
+        }
+        return;
+    }
+
+    if (!ok) {
+        // If log appending fails for follower, there is no way to proceed it.
+        // We should stop the server immediately.
+        p_ft("log appending failed, stop this server");
+        stopping_ = true;
+        ctx_->state_mgr_->system_exit(N21_log_flush_failed);
+        return;
+    }
 
     if (role_ == srv_role::leader) {
         recur_lock(lock_);
-        if (!ok) {
-            // If log appending fails, leader should resign immediately.
-            p_er("log appending failed, resign immediately");
-            leader_ = -1;
-            become_follower();
-
-            // Clear this flag to avoid pre-vote rejection.
-            hb_alive_ = false;
-            return;
-        }
-
         // Leader: commit the log and send append_entries request, if needed.
         uint64_t prev_committed_index = quick_commit_index_.load();
         uint64_t committed_index = get_expected_committed_log_idx();
@@ -1641,19 +1916,51 @@ void raft_server::notify_log_append_completion(bool ok) {
             request_append_entries_for_all();
         }
     } else {
-        if (!ok) {
-            // If log appending fails for follower, there is no way to proceed it.
-            // We should stop the server immediately.
-            recur_lock(lock_);
-            p_ft("log appending failed, stop this server");
-            ctx_->state_mgr_->system_exit(N21_log_flush_failed);
-            return;
+        ptr<raft_params> params = ctx_->get_params();
+        if (params->parallel_log_appending_) {
+            // Send responses for pipelined append_entries requests whose
+            // entries are now durable.
+            std::vector<std::pair<ptr<cmd_result<ptr<buffer>>>, cmd_result_code>> resps;
+            {
+                auto_lock(pending_follower_resps_lock_);
+                if (!pending_follower_resps_.empty()) {
+                    uint64_t durable_idx = log_store_->last_durable_index();
+                    while ( !pending_follower_resps_.empty() &&
+                            pending_follower_resps_.front().last_entry_idx <= durable_idx ) {
+                        pending_follower_resp& entry = pending_follower_resps_.front();
+
+                        // Redundant check that the entries that became durable are the ones we wrote.
+                        ulong term_in_log_store = log_store_->term_at(entry.last_entry_idx);
+                        if (entry.last_entry_term == 0 || term_in_log_store == entry.last_entry_term) {
+                            resps.emplace_back(std::move(entry.promise), cmd_result_code::OK);
+                        } else {
+                            // This should be impossible because we clear pending_follower_resps_
+                            // when doing log_store_ rollback.
+                            p_er( "term mismatch in async append_entries: "
+                                  "appended entry with idx %" PRIu64 " "
+                                  "term %" PRIu64 ", durable entry has "
+                                  "term %" PRIu64,
+                                  entry.last_entry_idx,
+                                  entry.last_entry_term,
+                                  term_in_log_store);
+                            resps.emplace_back(std::move(entry.promise), cmd_result_code::TERM_MISMATCH);
+                        }
+                        pending_follower_resps_.pop_front();
+                    }
+                }
+            }
+
+            ptr<buffer> empty_buf;
+            ptr<std::exception> no_err;
+            for (auto& p: resps) {
+                p.first->set_result(empty_buf, no_err, p.second);
+            }
         }
 
-        // Follower: wake up the waiting thread.
+        // Wake the blocking-path waiter in `handle_append_entries`.
+        // No-op if nothing waits.
         ea_follower_log_append_->invoke();
     }
 }
 
 } // namespace nuraft;
-

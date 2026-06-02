@@ -30,7 +30,7 @@ limitations under the License.
 #include "tracer.hxx"
 
 #include <cassert>
-#include <set>
+#include <map>
 #include <sstream>
 
 namespace nuraft {
@@ -170,10 +170,10 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     if (cur_config->get_servers().size() > 1) {
         // This server is already in a cluster.
         // Validate that the request is from the same cluster by comparing
-        // cluster configurations. The request should be accepted only if:
-        // req->cluster_config == this->cluster_config - this_server
+        // cluster configurations. The request may proceed only if:
+        // req->cluster_config - this_server == this->cluster_config - this_server
 
-        // Build a set of server IDs from the request's cluster config,
+        // Build a server ID -> endpoint map from the request's cluster config,
         // excluding the server itself.
         ptr<cluster_config> req_config =
             cluster_config::deserialize(entries[0]->get_buf());
@@ -198,19 +198,15 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
 
         // Compare the two maps.
         if (server_ids_from_req == server_ids_of_mine) {
-            // If two configs are the same, probably this is a duplicate
-            // request. Accept it again.
-            p_in("this server is already in the cluster and request is from the same "
-                 "cluster, accepting");
-            resp->accept(quick_commit_index_.load() + 1);
+            p_in("this server already has a multi-server config and request is "
+                 "from the same cluster, continue join handling");
+        } else {
+            // Otherwise, the join request came from a different cluster.
+            // Such request should never be accepted.
+            p_in("this server is already in a cluster and request is from a different "
+                 "cluster, rejecting");
             return resp;
         }
-
-        // Otherwise, the join request came from a different cluster.
-        // Such request should never be accepted.
-        p_in("this server is already in a cluster and request is from a different "
-             "cluster, rejecting");
-        return resp;
     }
 
     // Handle Race Condition: Simultaneous Add Server
@@ -707,4 +703,3 @@ void raft_server::reset_srv_to_leave() {
 }
 
 } // namespace nuraft;
-

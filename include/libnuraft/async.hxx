@@ -172,8 +172,8 @@ public:
      */
     void set_result(T& result, TE& err, cmd_result_code code = cmd_result_code::OK) {
         bool call_handler = false;
-        code_ = code;
         {   std::lock_guard<std::mutex> guard(lock_);
+            code_ = code;
             result_ = result;
             err_ = err;
             has_result_ = true;
@@ -287,20 +287,12 @@ public:
      */
     T& get() {
         std::unique_lock<std::mutex> lock(lock_);
-        if (has_result_) {
-            if (err_ == nullptr) {
-                return result_;
-            }
-            // Return empty result rather than throw exception.
-            // Caller should handle it properly.
-            return empty_result_;
-        }
-
-        cv_.wait(lock, [this]{ return (err_ != nullptr || has_result_); } );
+        cv_.wait(lock, [&] { return has_result_; });
         if (err_ == nullptr) {
             return result_;
         }
-
+        // Return empty result rather than throw exception.
+        // Caller should handle it properly.
         return empty_result_;
     }
 

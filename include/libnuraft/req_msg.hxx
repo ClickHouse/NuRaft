@@ -28,11 +28,26 @@ limitations under the License.
 
 namespace nuraft {
 
+// For msg_type::client_request, a non-zero `term` (from msg_base) is
+// treated as `ext_params.expected_term_`.
 class req_msg : public msg_base {
 public:
     // If set, the receiver of this request is not in the quorum.
     // This flag is used only when full consensus mode is enabled.
     static constexpr uint64_t EXCLUDED_FROM_THE_QUORUM = 0x1;
+
+    // If set, the receiver may start processing the next request from the
+    // same connection before sending the response to this one (responses
+    // are still in order). Set by leaders that use streaming mode
+    // (`raft_params::max_log_gap_in_stream_ > 0`); honored by followers
+    // with `raft_params::parallel_log_appending_` enabled.
+    static constexpr uint64_t ALLOW_ASYNC_LOG_APPENDING = 0x2;
+
+    // If set, the server closes the connection if this request fails.
+    // Doesn't work for pipelined requests (streaming_mode_ == true,
+    // process_req returns async_cb, e.g. append_entries request).
+    // Used by `client_req_stream` to preserve its no-skipping guarantee.
+    static constexpr uint64_t CLOSE_ON_ERROR = 0x4;
 
     req_msg(ulong term,
             msg_type type,

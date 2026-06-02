@@ -32,8 +32,16 @@ limitations under the License.
 namespace nuraft {
 
 void raft_server::enable_hb_for_peer(peer& p) {
-    p.enable_hb(true);
     p.resume_hb_speed();
+    if (p.is_abandoned()) {
+        timer_task<int32>::executor exec =
+        (timer_task<int32>::executor)
+        std::bind( &raft_server::handle_hb_timeout,
+                    this,
+                    std::placeholders::_1 );
+        p.reopen(*ctx_, exec);
+    }
+    p.enable_hb(true);
     p_tr("peer %d, interval: %d\n", p.get_id(), p.get_current_hb_interval());
     schedule_task(p.get_hb_task(), p.get_current_hb_interval());
 }
@@ -139,7 +147,7 @@ void raft_server::handle_hb_timeout(int32 srv_id) {
 
     if (!check_leadership_validity()) return;
 
-    p_db("heartbeat timeout for %d", p->get_id());
+    p_ts("heartbeat timeout for %d", p->get_id());
     if (role_ == srv_role::leader) {
         update_target_priority();
         request_append_entries(p);
@@ -174,7 +182,7 @@ void raft_server::restart_election_timer() {
     }
 
     if (election_task_) {
-        p_tr("cancel existing timer");
+        p_ts("cancel existing timer");
         cancel_task(election_task_);
     } else {
         election_task_ = cs_new< timer_task<void> >
@@ -182,7 +190,7 @@ void raft_server::restart_election_timer() {
                                  timer_task_type::election_timer );
     }
 
-    p_tr("re-schedule election timer");
+    p_ts("re-schedule election timer");
     last_election_timer_reset_.reset();
 
     schedule_task(election_task_, rand_timeout_());
@@ -343,6 +351,7 @@ void raft_server::cancel_schedulers() {
             cancel_task(p->get_hb_task());
         }
         // Shutdown peer to cut off smart pointers.
+        p_tr("cancel_schedulers shutdown peer: %d", p->get_id());
         p->shutdown();
 
         // Free user context of snapshot if exists.

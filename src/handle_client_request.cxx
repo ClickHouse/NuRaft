@@ -35,6 +35,44 @@ limitations under the License.
 
 namespace nuraft {
 
+ptr<resp_msg> raft_server::handle_leader_status_req(req_msg& req) {
+    const auto get_leader_status = [&, this] {
+        ulong cur_term = state_->get_term();
+
+        auto resp = cs_new<resp_msg>( cur_term,
+                                 msg_type::leader_status_response,
+                                 id_,
+                                 req.get_src(),
+                                 0,
+                                 true );
+        if (role_ != srv_role::leader || write_paused_) {
+            resp->set_result_code( cmd_result_code::NOT_LEADER );
+            return resp;
+        }
+
+        auto ctx = buffer::alloc(8 + 8);
+        ctx->put(cur_term);
+        ctx->put(sm_commit_index_.load());
+        ctx->pos(0);
+        resp->set_ctx(std::move(ctx));
+        return resp;
+    };
+
+    ptr<raft_params> params = ctx_->get_params();
+    switch (params->locking_method_type_) {
+        case raft_params::single_mutex: {
+            recur_lock(lock_);
+            return get_leader_status();
+        }
+        case raft_params::dual_mutex:
+        default: {
+            // TODO: Use RW lock here.
+            recur_lock(cli_lock_);
+            return get_leader_status();
+        }
+    }
+}
+
 ptr<resp_msg> raft_server::handle_cli_req_prelock(req_msg& req,
                                                   const req_ext_params& ext_params)
 {
@@ -102,28 +140,74 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         return resp;
     }
 
-    if (ext_params.expected_term_) {
-        // If expected term is given, check the current term.
-        if (ext_params.expected_term_ != cur_term) {
+    ulong expected_term = ext_params.expected_term_
+                          ? ext_params.expected_term_
+                          : req.get_term();
+    if (expected_term) {
+        // Optional term fence. A non-zero req.term (stamped by client_req_stream)
+        // makes the leader reject after any term change — preventing reordering
+        // of a stream's requests across a re-election. Regular callers pass 0.
+        if (expected_term != cur_term) {
             resp->set_result_code( cmd_result_code::TERM_MISMATCH );
             return resp;
         }
     }
 
     std::vector< ptr<log_entry> >& entries = req.log_entries();
+
+    uint64_t current_entries = 0;
+    uint64_t request_entries = 0;
+    uint64_t max_entries = 0;
+    if (should_reject_client_request_by_uncommitted_log_entries(entries,
+                                                                params->max_uncommitted_log_entries_,
+                                                                current_entries,
+                                                                request_entries,
+                                                                max_entries)) {
+        resp->set_result_code(cmd_result_code::TIMEOUT);
+        log_uncommitted_log_entry_limit_rejection(current_entries, request_entries, max_entries);
+        return resp;
+    }
+
     size_t num_entries = entries.size();
 
     for (size_t i = 0; i < num_entries; ++i) {
-        // force the log's term to current term
-        entries.at(i)->set_term(cur_term);
-        entries.at(i)->set_timestamp(timestamp_us);
+        auto & entry = entries.at(i);
 
-        ulong next_slot = store_log_entry(entries.at(i));
-        p_tr("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
-             next_slot, timestamp_us);
+        // force the log's term to current term
+        entry->set_term(cur_term);
+        entry->set_timestamp(timestamp_us);
+        ulong next_slot = 0;
+
+        try
+        {
+            cb_func::Param param(id_, leader_);
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::PreAppendLogLeader, &param);
+            if (rc == CbReturnCode::ReturnNull) return nullptr;
+
+            // force the log's term to current term
+            entry->set_term(cur_term);
+
+            next_slot = store_log_entry(entry);
+            p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
+                 next_slot, timestamp_us);
+        }
+        catch (const std::exception & e)
+        {
+            p_er("failed to append entry: %s\n", e.what());
+            try_update_precommit_index(last_idx);
+
+            cb_func::Param param(id_, leader_);
+            param.ctx = &entry;
+            CbReturnCode rc = ctx_->cb_func_.call(cb_func::AppendLogFailed, &param);
+            if (rc == CbReturnCode::ReturnNull) return nullptr;
+
+            throw;
+        }
+
         last_idx = next_slot;
 
-        ptr<buffer> buf = entries.at(i)->get_buf_ptr();
+        ptr<buffer> buf = entry->get_buf_ptr();
         buf->pos(0);
         ret_value = state_machine_->pre_commit_ext
                     ( state_machine::ext_op_params( last_idx, buf ) );
@@ -205,6 +289,51 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
 
     resp->accept(resp_idx);
     return resp;
+}
+
+bool raft_server::should_reject_client_request_by_uncommitted_log_entries(const std::vector<ptr<log_entry>>& entries,
+                                                                         uint64_t configured_max_entries,
+                                                                         uint64_t& current_entries,
+                                                                         uint64_t& request_entries,
+                                                                         uint64_t& max_entries) const
+{
+    current_entries = 0;
+    request_entries = 0;
+
+    max_entries = configured_max_entries;
+    if (!max_entries || entries.empty()) {
+        return false;
+    }
+
+    uint64_t committed = sm_commit_index_.load();
+    uint64_t next = log_store_->next_slot();
+    if (next > committed && next - committed > 1) {
+        current_entries = next - committed - 1;
+    }
+    request_entries = entries.size();
+
+    if (current_entries >= max_entries) {
+        return true;
+    }
+    return request_entries > max_entries - current_entries;
+}
+
+void raft_server::log_uncommitted_log_entry_limit_rejection(uint64_t current_entries,
+                                                            uint64_t request_entries,
+                                                            uint64_t max_entries) const
+{
+    uint64_t now = timer_helper::get_timeofday_us();
+    uint64_t last = last_uncommitted_limit_log_us_.load();
+    if (now - last < 1000000 ||
+        !last_uncommitted_limit_log_us_.compare_exchange_strong(last, now)) {
+        return;
+    }
+
+    p_wn("reject client request by uncommitted log entry limit: "
+         "current entries %" PRIu64 ", request entries %" PRIu64 ", max entries %" PRIu64,
+         current_entries,
+         request_entries,
+         max_entries);
 }
 
 ptr<resp_msg> raft_server::handle_cli_req_callback(ptr<commit_ret_elem> elem,
@@ -374,4 +503,3 @@ ptr<cmd_result<bool>> raft_server::wait_for_state_machine_commit(uint64_t target
 }
 
 } // namespace nuraft;
-

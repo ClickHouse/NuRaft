@@ -69,6 +69,7 @@ void raft_server::clear_snapshot_sync_ctx(peer& pp) {
         destroy_user_snp_ctx(snp_ctx);
         p_tr("destroy snapshot sync ctx %p", snp_ctx.get());
     }
+    pp.reset_cnt_backward_log_probe();
     pp.set_snapshot_in_sync(nullptr);
 }
 
@@ -81,6 +82,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     peer& p = *pp;
     ptr<raft_params> params = ctx_->get_params();
     std::unique_lock<std::mutex> guard(p.get_lock());
+    p.reset_cnt_backward_log_probe();
     ptr<snapshot_sync_ctx> sync_ctx = p.get_snapshot_sync_ctx();
     ptr<snapshot> snp = nullptr;
     ulong prev_sync_snp_log_idx = 0;
@@ -112,22 +114,26 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     //        last_snapshot_->get_last_log_idx() > snp->get_last_log_idx() )*/ ) {
     if ( !snp || sync_ctx->get_offset() == 0 ) {
         snp = get_last_snapshot();
-        if ( snp == nilptr ||
-             last_log_idx > snp->get_last_log_idx() ) {
-            // LCOV_EXCL_START
-            p_er( "system is running into fatal errors, failed to find a "
-                  "snapshot for peer %d (snapshot null: %d, snapshot "
-                  "doesn't contais lastLogIndex: %d)",
-                  p.get_id(), snp == nilptr ? 1 : 0,
-                  last_log_idx > snp->get_last_log_idx() ? 1 : 0 );
-            if (snp) {
-                p_er("last log idx %" PRIu64 ", snp last log idx %" PRIu64,
-                     last_log_idx, snp->get_last_log_idx());
-            }
-            ctx_->state_mgr_->system_exit(raft_err::N16_snapshot_for_peer_not_found);
-            _sys_exit(-1);
+        if ( snp == nilptr ) {
+            static timer_helper msg_timer(5000000);
+            int log_lv = msg_timer.timeout_and_reset() ? L_WARN : L_TRACE;
+            p_lv( log_lv,
+                  "snapshot is not available for peer %d, will retry",
+                  p.get_id() );
+            clear_snapshot_sync_ctx(p);
             return ptr<req_msg>();
-            // LCOV_EXCL_STOP
+        }
+        if ( last_log_idx > snp->get_last_log_idx() ) {
+            p_wn( "peer %d's last log idx %" PRIu64 " is ahead of "
+                  "snapshot %" PRIu64 ", clearing snapshot sync state",
+                  p.get_id(), last_log_idx, snp->get_last_log_idx() );
+            // Peer has advanced past this snapshot — it doesn't need it.
+            // Clear sync state. If peer still needs catching up, the next
+            // call to request_append_entries will re-evaluate using the
+            // latest snapshot.
+            clear_snapshot_sync_ctx(p);
+            pp->set_snapshot_sync_is_needed(false);
+            return ptr<req_msg>();
         }
 
         if ( snp->get_type() == snapshot::raw_binary &&
@@ -337,6 +343,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
     ptr<peer> p = it->second;
     if (resp.get_accepted()) {
         std::lock_guard<std::mutex> guard(p->get_lock());
+        p->reset_cnt_backward_log_probe();
         ptr<snapshot_sync_ctx> sync_ctx = p->get_snapshot_sync_ctx();
         if (sync_ctx == nullptr) {
             p_in("no snapshot sync context for this peer, drop the response");
@@ -361,6 +368,8 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
                 p_db("snapshot sync is done (raw type)");
                 p->set_next_log_idx(sync_ctx->get_snapshot()->get_last_log_idx() + 1);
                 p->set_matched_idx(sync_ctx->get_snapshot()->get_last_log_idx());
+                p->set_next_log_idx_floor(
+                    sync_ctx->get_snapshot()->get_last_log_idx() + 1);
                 clear_snapshot_sync_ctx(*p);
 
                 if (p->is_snapshot_sync_needed()) {
@@ -385,6 +394,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
               "log_store_->next_slot(): %" PRIu64,
               p->get_id(), p->get_next_log_idx(), log_store_->next_slot() );
         p->set_next_log_idx(resp.get_next_idx());
+        p->set_next_log_idx_floor(0);
 
         // Added by Jung-Sang Ahn (Oct 11 2017)
         // Declining snapshot implies that the peer already has the up-to-date snapshot.
@@ -411,6 +421,7 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
         return;
     }
 
+    srv_to_join_->reset_cnt_backward_log_probe();
     if (!resp.get_accepted()) {
         p_wn("peer doesn't accept the snapshot installation request, "
              "next log idx %" PRIu64 ", "
@@ -462,6 +473,12 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
 }
 
 bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_lock<std::recursive_mutex>& guard) {
+ const auto handle_install_failure = [&]
+ {
+    ctx_->state_mgr_->system_exit(raft_err::N13_snapshot_install_failed);
+    _sys_exit(-1);
+ };
+
  try {
     // if offset == 0, it is the first object.
     bool is_first_obj = (req.get_offset()) ? false : true;
@@ -536,6 +553,7 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
             p_in("waiting for state machine pause before applying snapshot: count %zu",
                  ++wait_count);
         }
+        
         guard.lock();
 
         struct ExecAutoResume {
@@ -626,11 +644,16 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
         }
     }
 
+ } catch (const std::exception & e) {
+    // LCOV_EXCL_START
+    p_er("failed to handle snapshot installation due to error: %s", e.what());
+    handle_install_failure();
+    return false;
+    // LCOV_EXCL_STOP
  } catch (...) {
     // LCOV_EXCL_START
     p_er("failed to handle snapshot installation due to system errors");
-    ctx_->state_mgr_->system_exit(raft_err::N13_snapshot_install_failed);
-    _sys_exit(-1);
+    handle_install_failure();
     return false;
     // LCOV_EXCL_STOP
  }
@@ -639,4 +662,3 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
 }
 
 } // namespace nuraft;
-

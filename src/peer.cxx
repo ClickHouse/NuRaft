@@ -35,12 +35,12 @@ void peer::send_req( ptr<peer> myself,
 {
     if (abandoned_) {
         p_er("peer %d has been shut down, cannot send request",
-             config_->get_id());
+             get_config().get_id());
         return;
     }
 
     if (req) {
-        p_tr("send req %d -> %d, type %s",
+        p_ts("send req %d -> %d, type %s",
              req->get_src(),
              req->get_dst(),
              msg_type_to_string( req->get_type() ).c_str() );
@@ -52,7 +52,7 @@ void peer::send_req( ptr<peer> myself,
         if (!rpc_) {
             // Nothing will be sent, immediately free it
             // to serve next operation.
-            p_tr("rpc local is null");
+            p_ts("rpc local is null");
             set_free();
             return;
         }
@@ -70,7 +70,7 @@ void peer::send_req( ptr<peer> myself,
                     ( &peer::handle_rpc_result,
                       this,
                       myself,
-                      rpc_local,
+                      rpc_local->get_id(),
                       req,
                       pending,
                       streaming,
@@ -84,13 +84,18 @@ void peer::send_req( ptr<peer> myself,
 }
 
 // WARNING:
-//   We should have the shared pointer of itself (`myself`)
-//   and pointer to RPC client (`my_rpc_client`),
-//   for the case when
-//     1) this peer is removed before this callback function is invoked. OR
-//     2) RPC client has been reset and re-connected.
+//   We capture the shared pointer of `myself` so that this callback is
+//   safe to invoke even if the peer has been removed from `raft_server`'s
+//   `peers_` map before the response arrives.
+//
+//   For the case where the RPC client has been reset and re-connected
+//   while this request was in flight (so the response refers to a stale
+//   client), we identify the originating client by id (`my_rpc_client_id`).
+//   (We shouldn't capture `ptr<rpc_client>` here as that would create
+//    circular reference: the rpc_client would hold a callback function,
+//    which would hold a ptr<rpc_client>.)
 void peer::handle_rpc_result( ptr<peer> myself,
-                              ptr<rpc_client> my_rpc_client,
+                              uint64_t my_rpc_client_id,
                               ptr<req_msg>& req,
                               ptr<rpc_result>& pending_result,
                               bool streaming,
@@ -99,12 +104,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
                               ptr<rpc_exception>& err )
 {
     if (abandoned_) {
-        p_in("peer %d has been shut down, ignore response.", config_->get_id());
+        p_in("peer %d has been shut down, ignore response.", get_config().get_id());
         return;
     }
 
     if (req) {
-        p_tr( "resp of req %d -> %d, type %s, %s",
+        p_ts( "resp of req %d -> %d, type %s, %s",
               req->get_src(),
               req->get_dst(),
               msg_type_to_string( req->get_type() ).c_str(),
@@ -117,20 +122,17 @@ void peer::handle_rpc_result( ptr<peer> myself,
             // The same as below, freeing busy flag should be done
             // only if the RPC hasn't been changed.
             uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
-            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
-            if (cur_rpc_id != given_rpc_id) {
+            if (cur_rpc_id != my_rpc_client_id) {
                 int32_t stale_resps = inc_stale_rpc_responses();
                 int32_t limit = raft_server::get_raft_limits().response_limit_;
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] got stale RPC response from %d: "
-                          "current %p (%" PRIu64 "), from parameter %p (%" PRIu64 "). "
-                          "will ignore this response."
+                          "current id %" PRIu64 ", from id %" PRIu64 ". "
+                          "will ignore this response. "
                           "Currently, stale_resps: %d, response_limit: %d",
                           config_->get_id(),
-                          rpc_.get(),
                           cur_rpc_id,
-                          my_rpc_client.get(),
-                          given_rpc_id,
+                          my_rpc_client_id,
                           stale_resps,
                           limit );
                 } else if (stale_resps == limit) {
@@ -181,8 +183,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
         // Next append operation will create a new one.
         {   std::lock_guard<std::mutex> l(rpc_protector_);
             uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
-            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
-            if (cur_rpc_id == given_rpc_id) {
+            if (cur_rpc_id == my_rpc_client_id) {
                 rpc_.reset();
                 uint64_t last_streamed_log_idx = get_last_streamed_log_idx();
                 reset_stream();
@@ -198,6 +199,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 // The first request on the next connection will re-check
                 // the flag.
                 set_snapshot_sync_is_needed(false);
+                reset_cnt_backward_log_probe();
 
             } else {
                 // WARNING (MONSTOR-9378):
@@ -212,14 +214,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 int32_t limit = raft_server::get_raft_limits().response_limit_;
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] RPC for %d has been reset before "
-                          "returning error: current %p (%" PRIu64
-                          "), from parameter %p (%" PRIu64 ")."
+                          "returning error: current id %" PRIu64
+                          ", from id %" PRIu64 ". "
                           "Currently, stale_resps: %d, response_limit: %d",
                           config_->get_id(),
-                          rpc_.get(),
                           cur_rpc_id,
-                          my_rpc_client.get(),
-                          given_rpc_id,
+                          my_rpc_client_id,
                           stale_resps,
                           limit );
                 } else if (stale_resps == limit) {
@@ -293,7 +293,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reconn_backoff_.set_duration_ms(new_duration_ms);
 
         rpc_ = factory->create_client(config->get_endpoint());
-        p_tr("%p reconnect peer %d", rpc_.get(), config_->get_id());
+        p_ts("%p reconnect peer %d", rpc_.get(), get_config().get_id());
 
         // WARNING:
         //   A reconnection attempt should be treated as an activity,
@@ -304,15 +304,17 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reset_bytes_in_flight();
         set_free();
         set_manual_free();
+        reset_cnt_backward_log_probe();
         return true;
 
     } else {
-        p_tr("skip reconnect this time");
+        p_ts("skip reconnect this time");
     }
     return false;
 }
 
 void peer::shutdown() {
+    p_tr("peer %d shutdown", get_id());
     // Should set the flag to block all incoming requests.
     abandoned_ = true;
 
@@ -326,5 +328,18 @@ void peer::shutdown() {
     hb_task_.reset();
 }
 
-} // namespace nuraft;
 
+void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
+    p_tr("peer %d reopen", get_id());
+    abandoned_ = false;
+
+    scheduler_ = ctx.scheduler_;
+    hb_task_ = cs_new< timer_task<int32>,
+                            timer_task<int32>::executor&,
+                            int32 >
+                          ( hb_exec, config_->get_id(),
+                            timer_task_type::heartbeat_timer ) ;
+    p_tr("call peer %d reopen succeeded", get_id());
+}
+
+} // namespace nuraft;

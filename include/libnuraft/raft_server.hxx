@@ -31,8 +31,10 @@ limitations under the License.
 #include "srv_role.hxx"
 #include "srv_state.hxx"
 #include "timer_task.hxx"
+#include "thread.hxx"
 
 #include <list>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -43,6 +45,7 @@ namespace nuraft {
 
 using CbReturnCode = cb_func::ReturnCode;
 
+class client_req_stream;
 class cluster_config;
 class custom_notification_msg;
 class delayed_task_scheduler;
@@ -359,6 +362,25 @@ public:
         append_entries_ext(const std::vector< ptr<buffer> >& logs,
                            const req_ext_params& ext_params);
 
+    /**
+     * Open a pipelined forwarding stream to the current leader. See
+     * `client_req_stream.hxx` for the full contract.
+     *
+     * Returns nullptr if no leader is known, the local term is 0,
+     * or the `rpc_client` could not be created. Failure causes are
+     * logged. Caller owns retry and backoff:
+     *
+     *     ptr<client_req_stream> stream;
+     *     while (!(stream = server->open_client_req_stream(timeout_ms))) {
+     *         if (my_shutdown_requested) return;
+     *         std::this_thread::sleep_for(retry_backoff);
+     *     }
+     *
+     * Lifetime: the returned stream must not outlive this raft_server.
+     */
+    ptr<client_req_stream>
+        open_client_req_stream(uint64_t send_timeout_ms);
+
     enum class PrioritySetResult { SET, BROADCAST, IGNORED };
 
     /**
@@ -384,6 +406,17 @@ public:
     PrioritySetResult set_priority(const int srv_id,
                                    const int new_priority,
                                    bool broadcast_when_leader_exists = false);
+
+
+    /**
+     * A simplified version of `set_priority` with more clear logic and limited use cases.
+     * What are the differences from `set_priority`:
+     * - If we're not a leader and a leader exists and auto_forwarding is on -- forward request to the leader.
+     * - Doesn't allow to set leader priority to 0, if you want to do it you can do request_leadership first.
+     * - Don't broadcast priority change in any case.
+     */
+    bool set_priority_v2(const int srv_id,
+                         const int new_priority);
 
     /**
      * Broadcast the priority change of given server to all peers.
@@ -427,10 +460,13 @@ public:
      * Send a request to the current leader to yield its leadership,
      * and become the next leader.
      *
+     * @param successor_id The server ID of the successor. If it's -1 server will ask for itself, otherwise
+     *                     it will forward the request to the designated successor.
+     *
      * @return `true` on success. But it does not guarantee to become
      *         the next leader due to various failures.
      */
-    bool request_leadership();
+    bool request_leadership(int successor_id = -1);
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -1057,8 +1093,10 @@ protected:
     ptr<resp_msg> handle_join_cluster_req(req_msg& req);
     ptr<resp_msg> handle_leave_cluster_req(req_msg& req);
     ptr<resp_msg> handle_priority_change_req(req_msg& req);
+    ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
+    ptr<resp_msg> handle_leader_status_req(req_msg& req);
 
     void handle_join_cluster_resp(resp_msg& resp);
     void handle_log_sync_resp(resp_msg& resp);
@@ -1132,15 +1170,16 @@ protected:
     void on_retryable_req_err(ptr<peer>& p, ptr<req_msg>& req);
     ulong term_for_log(ulong log_idx);
 
-    void commit_in_bg();
-    bool commit_in_bg_exec(size_t timeout_ms = 0);
+    virtual void commit_in_bg();
+    bool commit_in_bg_exec(size_t timeout_ms = 0, bool initial_commit_exec = false);
 
-    void append_entries_in_bg();
+    virtual void append_entries_in_bg();
     void append_entries_in_bg_exec();
 
     void commit_app_log(ulong idx_to_commit,
                         ptr<log_entry>& le,
-                        bool need_to_handle_commit_elem);
+                        bool need_to_handle_commit_elem,
+                        bool initial_commit_exec);
     void commit_conf(ulong idx_to_commit, ptr<log_entry>& le);
 
     void scan_sm_commit_and_notify(uint64_t idx_upto);
@@ -1171,6 +1210,14 @@ protected:
     void set_last_snapshot(const ptr<snapshot>& new_snapshot);
 
     ulong store_log_entry(ptr<log_entry>& entry, ulong index = 0);
+    bool should_reject_client_request_by_uncommitted_log_entries(const std::vector<ptr<log_entry>>& entries,
+                                                                 uint64_t configured_max_entries,
+                                                                 uint64_t& current_entries,
+                                                                 uint64_t& request_entries,
+                                                                 uint64_t& max_entries) const;
+    void log_uncommitted_log_entry_limit_rejection(uint64_t current_entries,
+                                                   uint64_t request_entries,
+                                                   uint64_t max_entries) const;
 
     ptr<resp_msg> handle_out_of_log_msg(req_msg& req,
                                         ptr<custom_notification_msg> msg,
@@ -1181,6 +1228,10 @@ protected:
                                              ptr<resp_msg> resp);
 
     ptr<resp_msg> handle_resignation_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    ptr<resp_msg> handle_request_leadership_request(req_msg& req,
                                              ptr<custom_notification_msg> msg,
                                              ptr<resp_msg> resp);
 
@@ -1206,13 +1257,13 @@ protected:
      * (Read-only)
      * Background thread for commit and snapshot.
      */
-    std::thread bg_commit_thread_;
+    nuraft_thread bg_commit_thread_;
 
     /**
      * (Read-only)
      * Background thread for sending quick append entry request.
      */
-    std::thread bg_append_thread_;
+    nuraft_thread bg_append_thread_;
 
     /**
      * Condition variable to invoke append thread.
@@ -1286,6 +1337,11 @@ protected:
      * Actual commit index of state machine.
      */
     std::atomic<ulong> sm_commit_index_;
+
+    /**
+     * Last rate-limited warning timestamp for uncommitted limit rejections.
+     */
+    mutable std::atomic<uint64_t> last_uncommitted_limit_log_us_;
 
     /**
      * If `grace_period_of_lagging_state_machine_` option is enabled,
@@ -1702,6 +1758,13 @@ protected:
     std::atomic<ulong> vote_init_timer_term_;
 
     /**
+     * This flag is true only for the first execution of commit. Useful when we
+     * need to detect the case when we commiting log store to state-machine during
+     * server startup.
+     */
+    std::atomic<bool> initial_commit_exec_{true};
+
+    /**
      * (Experimental)
      * Used when `raft_params::parallel_log_appending_` is set.
      * Follower will wait for the asynchronous log appending using
@@ -1711,6 +1774,22 @@ protected:
      *          awaiter at a time, by the help of `lock_`.
      */
     EventAwaiter* ea_follower_log_append_;
+
+    /**
+     * Used when `raft_params::parallel_log_appending_` and streaming mode
+     * are both enabled. Instead of blocking in `handle_append_entries` waiting
+     * for log durability, the follower defers the response and queues a promise
+     * here. `notify_log_append_completion` fulfills promises once entries
+     * become durable, which triggers the ASIO layer to send the response.
+     */
+    struct pending_follower_resp
+    {
+        ulong last_entry_idx;
+        ulong last_entry_term;
+        ptr<cmd_result<ptr<buffer>>> promise;
+    };
+    std::mutex pending_follower_resps_lock_; // may be locked while holding lock_
+    std::deque<pending_follower_resp> pending_follower_resps_;
 
     /**
      * If `true`, test mode is enabled.
