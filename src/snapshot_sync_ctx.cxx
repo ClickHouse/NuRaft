@@ -27,6 +27,42 @@ namespace nuraft {
 
 class raft_server;
 
+class snapshot_io_mgr_singleton {
+public:
+    static snapshot_io_mgr_singleton& get_instance() {
+        static snapshot_io_mgr_singleton instance;
+        return instance;
+    }
+
+    snapshot_io_mgr& instance() {
+        std::lock_guard<std::mutex> lock(lock_);
+        if (!internal_) {
+            internal_ = new snapshot_io_mgr();
+        }
+        return *internal_;
+    }
+
+    void clear() {
+        snapshot_io_mgr* internal = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(lock_);
+            internal = internal_;
+            internal_ = nullptr;
+        }
+        delete internal;
+    }
+
+private:
+    snapshot_io_mgr_singleton() : internal_(nullptr) {}
+
+    ~snapshot_io_mgr_singleton() {
+        clear();
+    }
+
+    std::mutex lock_;
+    snapshot_io_mgr* internal_;
+};
+
 snapshot_sync_ctx::snapshot_sync_ctx(const ptr<snapshot>& s,
                                      int peer_id,
                                      ulong timeout_ms,
@@ -43,6 +79,10 @@ snapshot_sync_ctx::snapshot_sync_ctx(const ptr<snapshot>& s,
 void snapshot_sync_ctx::set_offset(ulong offset) {
     if (offset_ != offset) timer_.reset();
     offset_ = offset;
+}
+
+snapshot_io_mgr& snapshot_io_mgr::instance() {
+    return snapshot_io_mgr_singleton::get_instance().instance();
 }
 
 struct snapshot_io_mgr::io_queue_elem {
@@ -74,6 +114,10 @@ snapshot_io_mgr::snapshot_io_mgr()
 
 snapshot_io_mgr::~snapshot_io_mgr() {
     shutdown();
+}
+
+void snapshot_io_mgr::shutdown_instance() {
+    snapshot_io_mgr_singleton::get_instance().clear();
 }
 
 bool snapshot_io_mgr::push(ptr<snapshot_io_mgr::io_queue_elem>& elem) {
@@ -280,4 +324,3 @@ void snapshot_io_mgr::async_io_loop() {
 }
 
 }
-

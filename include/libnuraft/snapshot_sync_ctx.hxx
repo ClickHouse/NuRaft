@@ -102,10 +102,12 @@ private:
 // Singleton class.
 class snapshot_io_mgr {
 public:
-    static snapshot_io_mgr& instance() {
-        static snapshot_io_mgr mgr;
-        return mgr;
-    };
+    static snapshot_io_mgr& instance();
+
+    /**
+     * Shutdown the global snapshot IO manager if it was initialized.
+     */
+    static void shutdown_instance();
 
     /**
      * Push a snapshot read request to the queue.
@@ -146,6 +148,8 @@ public:
     void shutdown();
 
 private:
+    friend class snapshot_io_mgr_singleton;
+
     struct io_queue_elem;
 
     snapshot_io_mgr();

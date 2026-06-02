@@ -30,7 +30,6 @@ limitations under the License.
 #include "tracer.hxx"
 
 #include <cassert>
-#include <map>
 #include <sstream>
 
 namespace nuraft {
@@ -166,48 +165,13 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    ptr<cluster_config> cur_config = get_config();
-    if (cur_config->get_servers().size() > 1) {
-        // This server is already in a cluster.
-        // Validate that the request is from the same cluster by comparing
-        // cluster configurations. The request may proceed only if:
-        // req->cluster_config - this_server == this->cluster_config - this_server
-
-        // Build a server ID -> endpoint map from the request's cluster config,
-        // excluding the server itself.
-        ptr<cluster_config> req_config =
-            cluster_config::deserialize(entries[0]->get_buf());
-
-        // Key: server ID, value: endpoint.
-        // We should compare endpoint as well to avoid the case that two different
-        // clusters coincidentally have same server IDs.
-        std::map<int32, std::string> server_ids_from_req;
-        for (const auto& srv: req_config->get_servers()) {
-            if (srv->get_id() != id_) {
-                server_ids_from_req[srv->get_id()] = srv->get_endpoint();
-            }
-        }
-
-        // Do the same for this server's cluster config.
-        std::map<int32, std::string> server_ids_of_mine;
-        for (const auto& srv: cur_config->get_servers()) {
-            if (srv->get_id() != id_) {
-                server_ids_of_mine[srv->get_id()] = srv->get_endpoint();
-            }
-        }
-
-        // Compare the two maps.
-        if (server_ids_from_req == server_ids_of_mine) {
-            p_in("this server already has a multi-server config and request is "
-                 "from the same cluster, continue join handling");
-        } else {
-            // Otherwise, the join request came from a different cluster.
-            // Such request should never be accepted.
-            p_in("this server is already in a cluster and request is from a different "
-                 "cluster, rejecting");
-            return resp;
-        }
-    }
+    // Keeper will always start with a configuration defined in configuration files
+    // Until that is changed, this check would just not allow new server to join the cluster
+    //ptr<cluster_config> cur_config = get_config();
+    //if (cur_config->get_servers().size() > 1) {
+    //    p_in("this server is already in a cluster, ignore the request");
+    //    return resp;
+    //}
 
     // Handle Race Condition: Simultaneous Add Server
     // Problem: Two single-node clusters try to add each other at the same time.
