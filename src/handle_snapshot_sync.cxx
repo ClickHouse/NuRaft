@@ -562,6 +562,15 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
             std::function<void()> clean_func_;
         } exec_auto_resume([this](){ resume_state_machine_execution(); });
 
+        if (req.get_snapshot().get_last_log_idx() <= quick_commit_index_) {
+            p_wn( "snapshot (idx %" PRIu64 ", term %" PRIu64 ") is already "
+                  "covered by current commit idx %" PRIu64 ", skip applying it",
+                  req.get_snapshot().get_last_log_idx(),
+                  req.get_snapshot().get_last_log_term(),
+                  quick_commit_index_.load() );
+            return true;
+        }
+
         state_->set_receiving_snapshot(false);
         ctx_->state_mgr_->save_state(*state_);
         p_in("clear receiving snapshot flag");

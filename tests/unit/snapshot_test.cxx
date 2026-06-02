@@ -33,6 +33,22 @@ using raft_result = cmd_result< ptr<buffer> >;
 
 namespace snapshot_test {
 
+class StaleSnapshotTestServer : public raft_server {
+public:
+    StaleSnapshotTestServer(context* ctx, const init_options& opt)
+        : raft_server(ctx, opt)
+        {}
+
+    bool handle_stale_final_snapshot_as_leader(snapshot_sync_req& req) {
+        std::unique_lock<std::recursive_mutex> guard(lock_);
+        role_ = srv_role::leader;
+        quick_commit_index_ = req.get_snapshot().get_last_log_idx();
+        bool ret = handle_snapshot_sync_req(req, guard);
+        state_->set_receiving_snapshot(false);
+        return ret;
+    }
+};
+
 static ptr<buffer> make_test_msg(const std::string& test_msg) {
     ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
     msg->put(test_msg);
@@ -851,6 +867,50 @@ int snapshot_leader_switch_test() {
 
     f_base->destroy();
 
+    return 0;
+}
+
+int stale_snapshot_finalization_role_change_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    ptr<FakeNetwork> f_net = cs_new<FakeNetwork>(s1_addr, f_base);
+    f_base->addNetwork(f_net);
+
+    ptr<FakeTimer> f_timer = cs_new<FakeTimer>(s1_addr, f_base->getLogger());
+    ptr<TestMgr> s_mgr = cs_new<TestMgr>(1, s1_addr);
+    ptr<TestSm> sm = cs_new<TestSm>(f_base->getLogger());
+    ptr<logger_wrapper> log_wrapper = cs_new<logger_wrapper>("./srv1.log");
+    ptr<logger> my_log = log_wrapper;
+
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(5);
+    params.with_log_sync_stopping_gap(1);
+    params.use_bg_thread_for_urgent_commit_ = false;
+
+    context* ctx = new context( s_mgr, sm, {f_net}, my_log,
+                                f_net, f_timer, params );
+    ptr<StaleSnapshotTestServer> srv =
+        cs_new<StaleSnapshotTestServer>
+        ( ctx, raft_server::init_options(false, false, true) );
+
+    ptr<snapshot> stale_snp =
+        cs_new<snapshot>( 10, 3, s_mgr->load_config(), 0,
+                          snapshot::logical_object );
+    ptr<buffer> data = buffer::alloc(0);
+    snapshot_sync_req req(stale_snp, 0, data, true);
+
+    CHK_TRUE( srv->handle_stale_final_snapshot_as_leader(req) );
+    CHK_NULL( sm->last_snapshot().get() );
+
+    f_base->removeNetwork(s1_addr);
+    log_wrapper->destroy();
     return 0;
 }
 
@@ -2062,6 +2122,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot leader switch test",
                snapshot_leader_switch_test );
+
+    ts.doTest( "stale snapshot finalization role change test",
+               stale_snapshot_finalization_role_change_test );
 
     ts.doTest( "snapshot stale sync flag test",
                snapshot_stale_sync_flag_test );
