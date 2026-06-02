@@ -42,6 +42,14 @@ using namespace raft_functional_common;
 
 namespace custom_quorum_test {
 
+cmd_result< ptr<buffer> >::handler_type ignore_async_result() {
+    return std::bind( ::async_handler,
+                      static_cast<std::list<ulong>*>(nullptr),
+                      static_cast<std::mutex*>(nullptr),
+                      std::placeholders::_1,
+                      std::placeholders::_2 );
+}
+
 int auto_quorum_size_test() {
     reset_log_files();
 
@@ -290,11 +298,8 @@ int full_consensus_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&]() {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii=0; ii<NUM; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -303,11 +308,7 @@ int full_consensus_test() {
                 s1.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -384,11 +385,8 @@ int self_mark_down_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&]() {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii=0; ii<NUM; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -397,11 +395,7 @@ int self_mark_down_test() {
                 s1.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -491,11 +485,8 @@ int stop_term_incr_restart_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&]() {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii=0; ii<NUM; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -504,11 +495,7 @@ int stop_term_incr_restart_test() {
                 s1.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -602,11 +589,8 @@ int mark_down_by_log_index_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&]() {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii=0; ii<NUM; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -615,11 +599,7 @@ int mark_down_by_log_index_test() {
                 s1.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -759,11 +739,8 @@ int mark_down_after_leader_election_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&](RaftAsioPkg& ss, size_t num) {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii = 0; ii < num; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -772,11 +749,7 @@ int mark_down_after_leader_election_test() {
                 ss.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -914,11 +887,8 @@ int mark_down_without_advancing_heartbeats(bool streaming_mode) {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&](RaftAsioPkg& ss, size_t num) {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii = 0; ii < num; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -927,11 +897,7 @@ int mark_down_without_advancing_heartbeats(bool streaming_mode) {
                 ss.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -1052,11 +1018,8 @@ int slow_heartbeats(bool streaming_mode) {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&](RaftAsioPkg& ss, size_t num) {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii = 0; ii < num; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -1065,11 +1028,7 @@ int slow_heartbeats(bool streaming_mode) {
                 ss.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -1267,11 +1226,8 @@ int custom_commit_condition_test() {
     // Append messages asynchronously.
     const size_t NUM = 10;
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&]() {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii=0; ii<NUM; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -1280,11 +1236,7 @@ int custom_commit_condition_test() {
                 s1.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -1349,11 +1301,8 @@ int full_consensus_with_snapshot_transfer_test() {
 
     // Append messages asynchronously.
     std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
-    std::list<ulong> idx_list;
-    std::mutex idx_list_lock;
     auto do_async_append = [&](RaftAsioPkg& ss, size_t num) {
         handlers.clear();
-        idx_list.clear();
         for (size_t ii = 0; ii < num; ++ii) {
             std::string test_msg = "test" + std::to_string(ii);
             ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -1362,11 +1311,7 @@ int full_consensus_with_snapshot_transfer_test() {
                 ss.raftServer->append_entries( {msg} );
 
             cmd_result< ptr<buffer> >::handler_type my_handler =
-                std::bind( async_handler,
-                           &idx_list,
-                           &idx_list_lock,
-                           std::placeholders::_1,
-                           std::placeholders::_2 );
+                ignore_async_result();
             ret->when_ready( my_handler );
 
             handlers.push_back(ret);
@@ -1439,6 +1384,11 @@ int full_consensus_with_snapshot_transfer_test() {
     uint64_t commit_idx = leader->raftServer->get_committed_log_idx();
     do_async_append(*leader, 1);
     TestSuite::sleep_ms(RaftAsioPkg::HEARTBEAT_MS * 2, "wait for commit");
+    for (size_t ii = 0;
+         ii < 10 && leader->raftServer->get_committed_log_idx() <= commit_idx;
+         ++ii) {
+        TestSuite::sleep_ms(RaftAsioPkg::HEARTBEAT_MS);
+    }
 
     // It should be committed immediately (S1 + S2 form the quorum,
     // S3 is still installing snapshot so it should be excluded).
