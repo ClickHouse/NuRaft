@@ -47,6 +47,20 @@ static ptr<buffer> make_resp_appendix_ctx(uint8_t order) {
     return ctx;
 }
 
+static ptr<log_entry> make_conf_log_entry(ptr<cluster_config>& conf,
+                                          ulong term) {
+    ptr<buffer> conf_buf = conf->serialize();
+    return cs_new<log_entry>(term, conf_buf, log_val_type::conf);
+}
+
+static ptr<log_entry> make_u64_app_log_entry(ulong value,
+                                             ulong term) {
+    ptr<buffer> app_buf = buffer::alloc(8);
+    buffer_serializer bs(app_buf);
+    bs.put_u64(value);
+    return cs_new<log_entry>(term, app_buf, log_val_type::app_log);
+}
+
 static int append_and_replicate(RaftPkg& leader,
                                 const std::vector<RaftPkg*>& pkgs,
                                 size_t begin,
@@ -2028,6 +2042,65 @@ int snapshot_rewind_floor_test() {
     return 0;
 }
 
+int snapshot_stale_config_chain_uses_committed_config_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    RaftPkg s1(f_base, 1, s1_addr);
+
+    auto init_cb = [&](RaftPkg* pkg) {
+        ptr<cluster_config> conf1 = cs_new<cluster_config>();
+        conf1->get_servers().push_back(pkg->getTestMgr()->get_srv_config());
+        conf1->set_log_idx(1);
+
+        ptr<buffer> conf1_buf = conf1->serialize();
+        ptr<cluster_config> conf3 = cluster_config::deserialize(*conf1_buf);
+        conf3->set_log_idx(2);
+        conf3->set_log_idx(3);
+
+        ptr<inmem_log_store> log_store =
+            pkg->getTestMgr()->get_inmem_log_store();
+        ptr<log_entry> conf1_le = make_conf_log_entry(conf1, 1);
+        ptr<log_entry> app_le = make_u64_app_log_entry(42, 1);
+        ptr<log_entry> conf3_le = make_conf_log_entry(conf3, 1);
+        log_store->append(conf1_le);
+        log_store->append(app_le);
+        log_store->append(conf3_le);
+
+        pkg->sMgr->save_config(*conf3);
+
+        ptr<buffer> dummy = buffer::alloc(8);
+        buffer_serializer bs(dummy);
+        bs.put_u64(0);
+        pkg->getTestSm()->commit(2, *dummy);
+        pkg->getTestSm()->commit_config(1, conf1);
+    };
+
+    CHK_Z( launch_servers( {&s1}, nullptr, false, cb_default, init_cb ) );
+
+    CHK_EQ( 3, s1.raftServer->get_config()->get_log_idx() );
+    CHK_EQ( 2, s1.raftServer->get_config()->get_prev_log_idx() );
+    CHK_EQ( 2, s1.getTestSm()->last_commit_index() );
+    CHK_EQ( log_val_type::app_log,
+            s1.getTestMgr()->get_inmem_log_store()->entry_at(2)->get_val_type() );
+    CHK_EQ( 0, s1.getTestSm()->getNumSnapshotCreations() );
+
+    ulong snap_idx = s1.raftServer->create_snapshot();
+
+    CHK_EQ( 2, snap_idx );
+    CHK_EQ( 1, s1.getTestSm()->getNumSnapshotCreations() );
+    CHK_TRUE( s1.getTestSm()->last_snapshot() );
+    CHK_EQ( 2, s1.getTestSm()->last_snapshot()->get_last_log_idx() );
+    CHK_TRUE( s1.getTestSm()->last_snapshot()->get_last_config() );
+    CHK_EQ( 1, s1.getTestSm()->last_snapshot()->get_last_config()->get_log_idx() );
+
+    s1.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -2098,6 +2171,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot rewind floor test",
                snapshot_rewind_floor_test );
+
+    ts.doTest( "snapshot stale config chain uses committed config",
+               snapshot_stale_config_chain_uses_committed_config_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
