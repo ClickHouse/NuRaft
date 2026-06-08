@@ -1112,10 +1112,8 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
                 p_in("srv_to_leave_: %d", srv_to_leave_->get_id());
                 ptr<snapshot_sync_ctx> snp_ctx = srv_to_leave_->get_snapshot_sync_ctx();
                 if (snp_ctx) {
-                    void* user_ctx = snp_ctx->get_user_snp_ctx();
-                    p_in("srv_to_leave_ has snapshot context %p and user context %p, "
-                         "destroy them",
-                         snp_ctx.get(), user_ctx);
+                    p_in("srv_to_leave_ has snapshot context %p, destroy it",
+                         snp_ctx.get());
                     clear_snapshot_sync_ctx(*srv_to_leave_);
                 }
 

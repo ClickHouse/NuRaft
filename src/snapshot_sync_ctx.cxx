@@ -23,6 +23,8 @@ limitations under the License.
 #include "state_machine.hxx"
 #include "tracer.hxx"
 
+#include <cassert>
+
 namespace nuraft {
 
 class raft_server;
@@ -79,6 +81,109 @@ snapshot_sync_ctx::snapshot_sync_ctx(const ptr<snapshot>& s,
 void snapshot_sync_ctx::set_offset(ulong offset) {
     if (offset_ != offset) timer_.reset();
     offset_ = offset;
+}
+
+bool snapshot_sync_ctx::begin_user_snp_ctx_io()
+{
+    std::lock_guard<std::mutex> lock(user_snp_ctx_lock_);
+    if (user_snp_ctx_closed_)
+    {
+        return false;
+    }
+    if (user_snp_ctx_io_active_)
+    {
+        assert(false && "logical snapshot user context IO is already active");
+        return false;
+    }
+    user_snp_ctx_io_active_ = true;
+    return true;
+}
+
+bool snapshot_sync_ctx::finish_user_snp_ctx_io(state_machine& sm)
+{
+    void* ctx_to_free = nullptr;
+    bool closed = false;
+    {
+        std::lock_guard<std::mutex> lock(user_snp_ctx_lock_);
+        assert(user_snp_ctx_io_active_);
+        user_snp_ctx_io_active_ = false;
+        closed = user_snp_ctx_closed_;
+        if (closed && user_snp_ctx_)
+        {
+            ctx_to_free = user_snp_ctx_;
+            user_snp_ctx_ = nullptr;
+        }
+    }
+
+    if (ctx_to_free)
+    {
+        sm.free_user_snp_ctx(ctx_to_free);
+    }
+    return closed;
+}
+
+void snapshot_sync_ctx::close_user_snp_ctx(state_machine& sm)
+{
+    void* ctx_to_free = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(user_snp_ctx_lock_);
+        if (user_snp_ctx_closed_)
+        {
+            return;
+        }
+        user_snp_ctx_closed_ = true;
+        if (!user_snp_ctx_io_active_ && user_snp_ctx_)
+        {
+            ctx_to_free = user_snp_ctx_;
+            user_snp_ctx_ = nullptr;
+        }
+    }
+
+    if (ctx_to_free)
+    {
+        sm.free_user_snp_ctx(ctx_to_free);
+    }
+}
+
+snapshot_sync_ctx::user_snp_ctx_io_guard::user_snp_ctx_io_guard(snapshot_sync_ctx& ctx,
+                                                               state_machine& sm)
+    : ctx_(&ctx)
+    , sm_(&sm)
+    , active_(ctx.begin_user_snp_ctx_io())
+{
+}
+
+snapshot_sync_ctx::user_snp_ctx_io_guard::~user_snp_ctx_io_guard() noexcept
+{
+    if (!active_)
+    {
+        return;
+    }
+
+    try
+    {
+        finish();
+    }
+    catch (...)
+    {
+    }
+}
+
+void*& snapshot_sync_ctx::user_snp_ctx_io_guard::get()
+{
+    assert(active_);
+    return ctx_->user_snp_ctx_;
+}
+
+bool snapshot_sync_ctx::user_snp_ctx_io_guard::finish()
+{
+    if (!active_)
+    {
+        return false;
+    }
+
+    active_ = false;
+    return ctx_->finish_user_snp_ctx_io(*sm_);
 }
 
 snapshot_io_mgr& snapshot_io_mgr::instance() {
@@ -143,13 +248,32 @@ bool snapshot_io_mgr::push(ptr<raft_server> r,
                            ptr<peer> p,
                            std::function< void(ptr<resp_msg>&, ptr<rpc_exception>&) >& h)
 {
+    ptr<snapshot_sync_ctx> sync_ctx = p->get_snapshot_sync_ctx();
+    if (!sync_ctx)
+    {
+        logger* l_ = r->l_.get();
+        p_tr("cannot queue snapshot request for peer %d: no snapshot sync context",
+             p->get_id());
+        return false;
+    }
+
+    ptr<snapshot> snp = sync_ctx->get_snapshot();
+    if (!snp)
+    {
+        logger* l_ = r->l_.get();
+        p_tr("cannot queue snapshot request for peer %d: no snapshot",
+             p->get_id());
+        return false;
+    }
+
     ptr<io_queue_elem> elem =
         cs_new<io_queue_elem>( r,
-                               p->get_snapshot_sync_ctx()->get_snapshot(),
-                               p->get_snapshot_sync_ctx(),
+                               snp,
+                               sync_ctx,
                                p,
                                h );
-    return push(elem);
+    push(elem);
+    return true;
 }
 
 void snapshot_io_mgr::invoke() {
@@ -223,12 +347,20 @@ void snapshot_io_mgr::async_io_loop() {
             // ---- lock acquired
             logger* l_ = elem->raft_->l_.get();
             ulong obj_idx = elem->sync_ctx_->get_offset();
-            void*& user_snp_ctx = elem->sync_ctx_->get_user_snp_ctx();
-            p_db("peer: %d, obj_idx: %" PRIu64 ", user_snp_ctx %p",
-                 dst_id, obj_idx, user_snp_ctx);
-
             ulong snp_log_idx = elem->snapshot_->get_last_log_idx();
             ulong snp_log_term = elem->snapshot_->get_last_log_term();
+            snapshot_sync_ctx::user_snp_ctx_io_guard user_ctx_guard(
+                *elem->sync_ctx_, *elem->raft_->state_machine_);
+            p_db("peer: %d, obj_idx: %" PRIu64 ", snp idx %" PRIu64
+                 ", snp term %" PRIu64,
+                 dst_id, obj_idx, snp_log_idx, snp_log_term);
+            if (!user_ctx_guard)
+            {
+                p_tr("drop stale snapshot request for peer %d, object %" PRIu64
+                     ", snapshot idx %" PRIu64 ", term %" PRIu64,
+                     dst_id, obj_idx, snp_log_idx, snp_log_term);
+                continue;
+            }
             // ---- lock released
             lock.unlock();
 
@@ -236,8 +368,16 @@ void snapshot_io_mgr::async_io_loop() {
             bool is_last_request = false;
 
             int rc = elem->raft_->state_machine_->read_logical_snp_obj
-                     ( *elem->snapshot_, user_snp_ctx, obj_idx,
+                     ( *elem->snapshot_, user_ctx_guard.get(), obj_idx,
                        data, is_last_request );
+            const bool closed = user_ctx_guard.finish();
+            if (closed)
+            {
+                p_tr("drop snapshot data for closed context, peer %d, object %" PRIu64
+                     ", snapshot idx %" PRIu64 ", term %" PRIu64,
+                     dst_id, obj_idx, snp_log_idx, snp_log_term);
+                continue;
+            }
             if (rc < 0) {
                 // Snapshot read failed.
                 p_wn( "reading snapshot (idx %" PRIu64 ", term %" PRIu64

@@ -22,9 +22,12 @@ limitations under the License.
 
 #include "event_awaiter.hxx"
 #include "raft_params.hxx"
+#include "snapshot_sync_ctx.hxx"
 #include "test_common.h"
 
+#include <atomic>
 #include <stdio.h>
+#include <thread>
 
 using namespace nuraft;
 using namespace raft_functional_common;
@@ -46,6 +49,37 @@ public:
         bool ret = handle_snapshot_sync_req(req, guard);
         state_->set_receiving_snapshot(false);
         return ret;
+    }
+};
+
+class BlockingUserCtxSm : public raft_functional_common::TestSm
+{
+public:
+    nuraft::EventAwaiter read_started;
+    nuraft::EventAwaiter release_read;
+    std::atomic<size_t> free_count{0};
+
+    int read_logical_snp_obj(snapshot& s,
+                             void*& user_snp_ctx,
+                             ulong obj_id,
+                             ptr<buffer>& data_out,
+                             bool& is_last_obj) override
+    {
+        int rc = raft_functional_common::TestSm::read_logical_snp_obj(
+            s, user_snp_ctx, obj_id, data_out, is_last_obj);
+        read_started.invoke();
+        release_read.wait();
+        return rc;
+    }
+
+    void free_user_snp_ctx(void*& user_snp_ctx) override
+    {
+        if (user_snp_ctx)
+        {
+            free_count.fetch_add(1);
+        }
+        raft_functional_common::TestSm::free_user_snp_ctx(user_snp_ctx);
+        user_snp_ctx = nullptr;
     }
 };
 
@@ -2088,6 +2122,64 @@ int snapshot_rewind_floor_test() {
     return 0;
 }
 
+int snapshot_user_ctx_deferred_free_test()
+{
+    BlockingUserCtxSm sm;
+    ptr<cluster_config> config = cs_new<cluster_config>();
+    ptr<snapshot> snp = cs_new<snapshot>(10, 3, config, 0, snapshot::logical_object);
+    ptr<snapshot_sync_ctx> sync_ctx = cs_new<snapshot_sync_ctx>(snp, 2, 1000000);
+    std::atomic<int> reader_result{0};
+
+    std::thread reader([&sm, &sync_ctx, &snp, &reader_result]()
+    {
+        try
+        {
+            ptr<buffer> data;
+            bool is_last_obj = false;
+            snapshot_sync_ctx::user_snp_ctx_io_guard guard(*sync_ctx, sm);
+            if (!guard)
+            {
+                reader_result = 1;
+                return;
+            }
+
+            int rc = sm.read_logical_snp_obj(*snp, guard.get(), 0, data, is_last_obj);
+            bool closed = guard.finish();
+            if (rc != 0 || !closed)
+            {
+                reader_result = 2;
+            }
+        }
+        catch (...)
+        {
+            reader_result = 3;
+        }
+    });
+
+    sm.read_started.wait();
+    sync_ctx->close_user_snp_ctx(sm);
+    CHK_EQ((size_t)0, sm.free_count.load());
+    sm.release_read.invoke();
+    reader.join();
+
+    CHK_Z(reader_result.load());
+    CHK_EQ((size_t)1, sm.free_count.load());
+    CHK_Z(sm.getNumOpenedUserCtxs());
+
+    snapshot_sync_ctx::user_snp_ctx_io_guard closed_guard(*sync_ctx, sm);
+    CHK_FALSE(closed_guard);
+
+    ptr<snapshot_sync_ctx> closed_before_read_ctx =
+        cs_new<snapshot_sync_ctx>(snp, 2, 1000000);
+    closed_before_read_ctx->close_user_snp_ctx(sm);
+    snapshot_sync_ctx::user_snp_ctx_io_guard closed_before_read_guard(
+        *closed_before_read_ctx, sm);
+    CHK_FALSE(closed_before_read_guard);
+    CHK_EQ((size_t)1, sm.free_count.load());
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -2161,6 +2253,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot rewind floor test",
                snapshot_rewind_floor_test );
+
+    ts.doTest( "snapshot user ctx deferred free test",
+               snapshot_user_ctx_deferred_free_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
