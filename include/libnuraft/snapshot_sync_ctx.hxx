@@ -44,6 +44,7 @@ class raft_server;
 class resp_msg;
 class rpc_exception;
 class snapshot;
+class state_machine;
 class snapshot_sync_ctx {
 public:
     snapshot_sync_ctx(const ptr<snapshot>& s,
@@ -57,16 +58,48 @@ public:
     const ptr<snapshot>& get_snapshot() const { return snapshot_; }
     ulong get_offset() const { return offset_; }
     ulong get_obj_idx() const { return obj_idx_; }
+    // Logical snapshot context lifecycle must use `user_snp_ctx_io_guard`
+    // and `close_user_snp_ctx`; this raw accessor is not lifetime-safe.
     void*& get_user_snp_ctx() { return user_snp_ctx_; }
+
+    class user_snp_ctx_io_guard
+    {
+    public:
+        user_snp_ctx_io_guard(snapshot_sync_ctx& ctx, state_machine& sm);
+        ~user_snp_ctx_io_guard() noexcept;
+
+        user_snp_ctx_io_guard(const user_snp_ctx_io_guard&) = delete;
+        user_snp_ctx_io_guard& operator=(const user_snp_ctx_io_guard&) = delete;
+        user_snp_ctx_io_guard(user_snp_ctx_io_guard&&) = delete;
+        user_snp_ctx_io_guard& operator=(user_snp_ctx_io_guard&&) = delete;
+
+        explicit operator bool() const
+        {
+            return active_;
+        }
+        void*& get();
+        bool finish();
+
+    private:
+        snapshot_sync_ctx* ctx_;
+        state_machine* sm_;
+        bool active_;
+    };
+
+    void close_user_snp_ctx(state_machine& sm);
 
     void set_offset(ulong offset);
     void set_obj_idx(ulong obj_idx) { obj_idx_ = obj_idx; }
+    // Logical snapshot context lifecycle must use `user_snp_ctx_io_guard`
+    // and `close_user_snp_ctx`; this raw setter is not lifetime-safe.
     void set_user_snp_ctx(void* _user_snp_ctx) { user_snp_ctx_ = _user_snp_ctx; }
 
     timer_helper& get_timer() { return timer_; }
 
 private:
     void io_thread_loop();
+    bool begin_user_snp_ctx_io();
+    bool finish_user_snp_ctx_io(state_machine& sm);
 
     /**
      * Destination peer ID.
@@ -94,6 +127,14 @@ private:
     void* user_snp_ctx_;
 
     /**
+     * Leaf mutex protecting the logical user snapshot context lifecycle.
+     */
+    std::mutex user_snp_ctx_lock_;
+
+    bool user_snp_ctx_io_active_ = false;
+    bool user_snp_ctx_closed_ = false;
+
+    /**
      * Timer to check snapshot transfer timeout.
      */
     timer_helper timer_;
@@ -102,10 +143,12 @@ private:
 // Singleton class.
 class snapshot_io_mgr {
 public:
-    static snapshot_io_mgr& instance() {
-        static snapshot_io_mgr mgr;
-        return mgr;
-    };
+    static snapshot_io_mgr& instance();
+
+    /**
+     * Shutdown the global snapshot IO manager if it was initialized.
+     */
+    static void shutdown_instance();
 
     /**
      * Push a snapshot read request to the queue.
@@ -113,7 +156,8 @@ public:
      * @param r Raft server instance.
      * @param p Peer instance.
      * @param h Response handler.
-     * @return `true` if succeeds (when there is no pending request for the same peer).
+     * @return `true` if a request was queued or already pending. `false` if no
+     *         safe current snapshot sync context and snapshot could be captured.
      */
     bool push(ptr<raft_server> r,
               ptr<peer> p,
@@ -146,6 +190,8 @@ public:
     void shutdown();
 
 private:
+    friend class snapshot_io_mgr_singleton;
+
     struct io_queue_elem;
 
     snapshot_io_mgr();

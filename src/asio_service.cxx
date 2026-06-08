@@ -189,28 +189,58 @@ struct pending_req_pkg {
     uint64_t timeout_ms_;
 };
 
+// NOTE:
+//   When ssl is enabled, asio::async_write() and asio::async_read() on same
+//   asio::ssl::stream<asio::ip::tcp::socket&> object are not thread safe.
+//
+//   Without restriction, streaming mode can lead to concurrent async_write()/
+//   async_read() calls on same ssl stream object.
+//
+//   To avoid the concurrency, when ssl and steaming mode are both enabled,
+//   asio::strand<asio::io_context::executor_type> is used to serialize
+//   async_write() and async_read() calls on same ssl stream object.
+//
+//   Application has the right to decide whether use streaming mode when ssl is enabled.
 class aa {
 public:
-    template<typename BB, typename FF>
+    template<typename BB, typename FF, typename Strand = void>
     static void write(bool is_ssl,
                       ssl_socket& _ssl_socket,
                       asio::ip::tcp::socket& tcp_socket,
                       const BB& buffer,
-                      FF func)
+                      FF func,
+                      Strand* strand = nullptr)
     {
-        if (is_ssl) asio::async_write(_ssl_socket, buffer, func);
-        else        asio::async_write(tcp_socket, buffer, func);
+        if (is_ssl && strand) {
+            asio::post(*strand, [&_ssl_socket, buffer, func, strand]() mutable {
+                asio::async_write(_ssl_socket, buffer,
+                    asio::bind_executor(*strand, func));
+            });
+        } else if (is_ssl) {
+            asio::async_write(_ssl_socket, buffer, func);
+        } else {
+            asio::async_write(tcp_socket, buffer, func);
+        }
     }
 
-    template<typename BB, typename FF>
+    template<typename BB, typename FF, typename Strand = void>
     static void read(bool is_ssl,
                      ssl_socket& _ssl_socket,
                      asio::ip::tcp::socket& tcp_socket,
                      const BB& buffer,
-                     FF func)
+                     FF func,
+                     Strand* strand = nullptr)
     {
-        if (is_ssl) asio::async_read(_ssl_socket, buffer, func);
-        else        asio::async_read(tcp_socket, buffer, func);
+        if (is_ssl && strand) {
+            asio::post(*strand, [&_ssl_socket, buffer, func, strand]() mutable {
+                asio::async_read(_ssl_socket, buffer,
+                    asio::bind_executor(*strand, func));
+            });
+        } else if (is_ssl) {
+            asio::async_read(_ssl_socket, buffer, func);
+        } else {
+            asio::async_read(tcp_socket, buffer, func);
+        }
     }
 };
 
@@ -280,6 +310,8 @@ public:
         , socket_(io)
         , ssl_socket_(socket_, ssl_ctx)
         , ssl_enabled_(_enable_ssl)
+        , ssl_strand_(io.get_executor())
+        , use_strand_(ssl_enabled_ && impl_->get_options().streaming_mode_)
         , flags_(0x0)
         , log_data_()
         , header_(buffer::alloc(RPC_REQ_HEADER_SIZE))
@@ -291,7 +323,9 @@ public:
         , crc_header_(0)
         , crc_from_msg_(0)
     {
-        p_tr("asio rpc session created: %p", this);
+        p_tr( "asio rpc session created: %p. %s",
+              this,
+              ssl_enabled_ ? "SSL ENABLED" : "UNSECURED" );
     }
 
     __nocopy__(rpc_session);
@@ -492,9 +526,11 @@ public:
                                      self,
                                      log_ctx,
                                      std::placeholders::_1,
-                                     std::placeholders::_2 ) );
+                                     std::placeholders::_2 ),
+                          use_strand_ ? &ssl_strand_ : nullptr );
             }
-        } );
+        },
+                   use_strand_ ? &ssl_strand_ : nullptr );
     }
 
     ssl_socket::lowest_layer_type& socket() {
@@ -1035,12 +1071,14 @@ private:
                 }
             } else {
                 p_er( "session %" PRIu64 " failed to send response to peer due "
-                      "to error %d",
+                      "to error %d, reason: %s",
                       session_id_,
-                      err_code.value() );
+                      err_code.value(),
+                      err_code.message().c_str() );
                 this->request_stop();
             }
-        } );
+        },
+                   use_strand_ ? &ssl_strand_ : nullptr );
 
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to process request message "
@@ -1102,7 +1140,8 @@ private:
 
                 this->stop();
             }
-        } );
+        },
+                   use_strand_ ? &ssl_strand_ : nullptr );
 
        } catch (std::exception& ex) {
         p_er( "session %" PRIu64 " failed to send pipelined response "
@@ -1120,6 +1159,8 @@ private:
     asio::ip::tcp::socket socket_;
     ssl_socket ssl_socket_;
     bool ssl_enabled_;
+    asio::strand<asio::io_context::executor_type> ssl_strand_;
+    bool use_strand_;
     uint32_t flags_;
     ptr<buffer> log_data_;
     ptr<buffer> header_;
@@ -1373,6 +1414,8 @@ public:
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
+        , ssl_strand_(io_svc.get_executor())
+        , use_strand_(ssl_enabled_ && impl_->get_options().streaming_mode_)
         , l_(l)
         , send_timer_(io_svc)
         , receive_timer_(io_svc)
@@ -1395,7 +1438,8 @@ public:
                                      std::placeholders::_2 ) );
 #endif
         }
-        p_ts("asio client created: %p id %" PRIu64, this, client_id_);
+        p_ts("asio client created: %p id %" PRIu64 ". %s",
+             this, client_id_, ssl_enabled_ ? "SSL enabled" : "unsecured");
     }
 
     virtual ~asio_rpc_client() {
@@ -1690,7 +1734,8 @@ public:
                               when_done,
                               send_timeout_ms,
                               std::placeholders::_1,
-                              std::placeholders::_2 ) );
+                              std::placeholders::_2 ),
+                   use_strand_ ? &ssl_strand_ : nullptr );
     }
 private:
     void execute_resolver(ptr<asio_rpc_client> self,
@@ -2023,7 +2068,8 @@ private:
                              when_done,
                              resp_buf,
                              std::placeholders::_1,
-                             std::placeholders::_2 ) );
+                             std::placeholders::_2 ),
+                  use_strand_ ? &ssl_strand_ : nullptr );
     }
 
     void response_read(ptr<req_msg>& req,
@@ -2107,7 +2153,8 @@ private:
                                  ctx_buf,
                                  flags,
                                  std::placeholders::_1,
-                                 std::placeholders::_2 ) );
+                                 std::placeholders::_2 ),
+                      use_strand_ ? &ssl_strand_ : nullptr );
         } else {
             post_read(req, rsp, when_done);
         }
@@ -2285,6 +2332,8 @@ private:
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
+    asio::strand<asio::io_context::executor_type> ssl_strand_;
+    bool use_strand_;
     uint64_t client_id_;
     ptr<logger> l_;
 

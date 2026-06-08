@@ -114,7 +114,17 @@ raft_server::raft_server(context* ctx, const init_options& opt)
     , test_mode_flag_(opt.test_mode_flag_)
     , self_mark_down_(false)
     , excluded_from_the_quorum_(false)
+    , sm_commit_notifier_target_idx_(0)
+    , sm_commit_notifier_notified_idx_(0)
 {
+    // Reset it with sufficiently big negative offset, so as not to
+    // incorrectly consider it as up-to-date.
+    last_rcvd_valid_append_entries_req_.reset(
+        -1 * ctx_->get_params()->heart_beat_interval_ *
+        std::max(100, raft_limits_.full_consensus_follower_limit_.load()));
+    p_in("last_rcvd_valid_append_entries_req_ get ms: %lu",
+         last_rcvd_valid_append_entries_req_.get_ms());
+
     if (opt.raft_callback_) {
         ctx->set_cb_func(opt.raft_callback_);
     }
@@ -272,6 +282,8 @@ raft_server::raft_server(context* ctx, const init_options& opt)
 void raft_server::start_server(bool skip_initial_election_timeout)
 {
     ptr<raft_params> params = ctx_->get_params();
+    sm_commit_notifier_target_idx_ = 0;
+    sm_commit_notifier_notified_idx_ = 0;
     global_mgr* mgr = get_global_mgr();
     if (mgr) {
         p_in("global manager is detected. will use shared thread pool");
@@ -316,7 +328,7 @@ void raft_server::start_server(bool skip_initial_election_timeout)
     priority_change_timer_.reset();
     vote_init_timer_.set_duration_ms(params->grace_period_of_lagging_state_machine_);
     vote_init_timer_.reset();
-    self_mark_down_ = excluded_from_the_quorum_ = false;
+    self_mark_down_ = excluded_from_the_quorum_ = stopping_ = false;
     p_db("server %d started", id_);
 }
 
@@ -409,6 +421,8 @@ void raft_server::apply_and_log_current_params() {
           "snapshot IO: %s, "
           "parallel log appending: %s, "
           "streaming mode max log gap %d, max bytes %" PRIu64 ", "
+          "full consensus mode: %s, "
+          "tracking peer sm committed index: %s, "
           "max uncommitted log entries %" PRIu64,
           params->election_timeout_lower_bound_,
           params->election_timeout_upper_bound_,
@@ -434,7 +448,10 @@ void raft_server::apply_and_log_current_params() {
           params->parallel_log_appending_ ? "on" : "off",
           params->max_log_gap_in_stream_,
           params->max_bytes_in_flight_in_stream_,
-          params->max_uncommitted_log_entries_ );
+          params->use_full_consensus_among_healthy_members_ ? "ON" : "OFF",
+          params->track_peers_sm_commit_idx_ ? "ON" : "OFF",
+          params->max_uncommitted_log_entries_
+        );
 
     status_check_timer_.set_duration_ms(params->heart_beat_interval_);
     status_check_timer_.reset();
@@ -452,6 +469,9 @@ void raft_server::stop_server() {
 
     // Cancel all awaiting client requests.
     drop_all_pending_commit_elems();
+
+    // Cancel all sm watchers.
+    drop_all_sm_watcher_elems();
 }
 
 void raft_server::cancel_global_requests() {
@@ -502,6 +522,10 @@ void raft_server::shutdown() {
     drop_all_pending_commit_elems();
 
     p_in("all pending commit elements dropped.");
+
+    drop_all_sm_watcher_elems();
+
+    p_in("all state machine watchers dropped.");
 
     // Clear shared_ptrs that the current server is holding.
     {   std::lock_guard<std::mutex> l(ctx_->ctx_lock_);
@@ -645,6 +669,43 @@ std::list<ptr<peer>> raft_server::get_not_responding_peers(int expiry) {
     return rs;
 }
 
+bool raft_server::is_excluded_from_quorum(const peer& pp,
+                                          int32_t resp_elapsed_ms,
+                                          int32_t expiry,
+                                          uint64_t required_log_idx,
+                                          bool include_self_mark_down)
+{
+    bool excluded = false;
+    if (resp_elapsed_ms <= expiry) {
+        // Response time is within the expiry time.
+
+        if (required_log_idx &&
+            ((pp.get_matched_idx() &&
+              pp.get_matched_idx() < required_log_idx) ||
+             pp.get_snapshot_sync_ctx().get())) {
+            // If the peer's matched index is less than the required log index,
+            // it is considered as not responding for full consensus.
+            //
+            // WARNING: Should make exception for matched_idx = 0,
+            //          which means the peer has not responded yet right after
+            //          the new connection.
+            //
+            // WARNING: member receiving snapshot is also considered as not
+            //          responding for full consensus. It's matched_idx may be 0.
+            excluded = true;
+        }
+
+        if (include_self_mark_down && pp.is_self_mark_down()) {
+            // If the peer marks itself down, count it too.
+            excluded = true;
+        }
+
+    } else {
+        excluded = true;
+    }
+    return excluded;
+}
+
 size_t raft_server::get_not_responding_peers_count(
     int expiry, uint64_t required_log_idx)
 {
@@ -660,26 +721,10 @@ size_t raft_server::get_not_responding_peers_count(
     auto cb = [&num_not_resp_nodes, required_log_idx, expiry]
         (const ptr<peer>& pp, int32_t resp_elapsed_ms)
     {
-        bool conditions_met = false;
-        if (resp_elapsed_ms <= expiry) {
-            // Response time is within the expiry time.
+        bool non_responding_peer =
+            is_excluded_from_quorum(*pp, resp_elapsed_ms, expiry, required_log_idx);
 
-            if (required_log_idx && pp->get_matched_idx() < required_log_idx) {
-                // If the peer's matched index is less than the required log index,
-                // it is considered as not responding for full consensus.
-                conditions_met = true;
-            }
-
-            if (pp->is_self_mark_down()) {
-                // If the peer marks itself down, count it too.
-                conditions_met = true;
-            }
-
-        } else {
-            conditions_met = true;
-        }
-
-        if (conditions_met) {
+        if (non_responding_peer) {
             ++num_not_resp_nodes;
         }
     };
@@ -789,12 +834,20 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
     if (req.get_type() == msg_type::append_entries_request) {
         {
             cb_func::Param param(id_, leader_, req.get_src(), &req);
-            ctx_->cb_func_.call(cb_func::ReceivedAppendEntriesReq, &param);
+            cb_func::ReturnCode rc =
+                ctx_->cb_func_.call(cb_func::ReceivedAppendEntriesReq, &param);
+            if (rc != cb_func::ReturnCode::Ok) {
+                return nullptr;
+            }
         }
         resp = handle_append_entries(req);
         {
             cb_func::Param param(id_, leader_, req.get_src(), resp.get());
-            ctx_->cb_func_.call(cb_func::SentAppendEntriesResp, &param);
+            cb_func::ReturnCode rc =
+                ctx_->cb_func_.call(cb_func::SentAppendEntriesResp, &param);
+            if (rc != cb_func::ReturnCode::Ok) {
+                return nullptr;
+            }
         }
 
     } else if (req.get_type() == msg_type::request_vote_request) {
@@ -1094,7 +1147,7 @@ void raft_server::become_leader() {
     {   recur_lock(cli_lock_);
         role_ = srv_role::leader;
         leader_ = id_;
-        self_mark_down_ = false;
+        self_mark_down_ = excluded_from_the_quorum_ = false;
         srv_to_join_.reset();
         leadership_transfer_timer_.set_duration_ms
             (params->leadership_transfer_min_wait_time_);
@@ -1122,6 +1175,11 @@ void raft_server::become_leader() {
             enable_hb_for_peer(*pp);
             pp->set_recovered();
             pp->set_snapshot_sync_is_needed(false);
+            if (params->use_full_consensus_among_healthy_members_) {
+                // We should reset response timer here
+                // so as not to disrupt full consensus.
+                pp->reset_resp_timer();
+            }
         }
 
         // If there are uncommitted logs, search if conf log exists.
@@ -1219,7 +1277,11 @@ bool raft_server::check_leadership_validity() {
              min_quorum_size);
 
         const auto nr_peers_list = get_not_responding_peers();
-        assert(nr_peers_list.size() == static_cast<std::size_t>(nr_peers));
+
+        // NOTE:
+        //   `nr_peers` and `nr_peers_list.size()` may not be the same,
+        //   since it is based on timer.
+        // assert(nr_peers_list.size() == static_cast<std::size_t>(nr_peers));
         for (auto& peer : nr_peers_list) {
             if (peer->is_lost()) {
                 continue;
@@ -1405,18 +1467,28 @@ void raft_server::yield_leadership(bool immediate_yield,
         p_in("got graceful re-elect request, pause write from now");
     }
 
+    // Pause write.
+    write_paused_ = true;
+
     if (candidate_id > -1) {
         p_in("next leader candidate: id %d endpoint %s priority %d "
              "last response %" PRIu64 " ms ago",
              candidate_id, candidate_endpoint.c_str(), max_priority,
              last_resp_ms);
         next_leader_candidate_ = candidate_id;;
+
+        // Send a dummy append entries request to the candidate to trigger its election.
+        auto pit = peers_.find(candidate_id);
+        if (pit != peers_.end()) {
+            p_in("send dummy append entries request to candidate %d", candidate_id);
+            request_append_entries(pit->second);
+        } else {
+            p_wn("could not find candidate %d in peers", candidate_id);
+        }
+
     } else {
         p_wn("cannot find valid candidate for next leader, will proceed anyway");
     }
-
-    // Reset reelection timer, and pause write.
-    write_paused_ = true;
 
     // Wait until election timeout upper bound.
     reelection_timer_.set_duration_ms
@@ -1536,6 +1608,9 @@ void raft_server::become_follower() {
 
         // Drain all pending callback functions.
         drop_all_pending_commit_elems();
+
+        // NOTE: sm watchers are not reset here, as state machine commit can be
+        //       executed regardless of the role.
     }
 
     restart_election_timer();
@@ -2035,11 +2110,39 @@ bool raft_server::set_self_mark_down(bool to) {
 }
 
 bool raft_server::is_part_of_full_consensus() {
-    if (self_mark_down_ || excluded_from_the_quorum_) {
+    if (self_mark_down_ ||
+        excluded_from_the_quorum_ ||
+        !initialized_ ||
+        stopping_) {
         return false;
     }
     const auto& params = get_current_params();
-    if (last_rcvd_append_entries_req_.get_ms() >
+
+    if (is_leader()) {
+        // If it is a leader, check if responding peers are enough
+        // to form a full consensus.
+        recur_lock(lock_);
+        int32_t num_voting_members = get_num_voting_members();
+        int32_t nr_peers = (int32_t)get_not_responding_peers_count(
+            params.heart_beat_interval_ * raft_limits_.full_consensus_follower_limit_);
+        int32_t min_quorum_size = get_quorum_for_commit() + 1;
+        if (num_voting_members - nr_peers < min_quorum_size) {
+            // It means this leader couldn't reach a majority of the cluster members
+            // for the duration of follower's markdown interval.
+            //
+            // In that case, there can be a chance that a new leader has been elected.
+            // But that new leader may not reach a full consensus yet,
+            // because leader's markdown interval is longer than
+            // follower's markdown interval.
+            return false;
+        }
+
+        // Valid leadership, we are part of full consensus.
+        return true;
+    }
+
+    // Follower.
+    if (last_rcvd_valid_append_entries_req_.get_ms() >
             (uint64_t)params.heart_beat_interval_ *
             raft_limits_.full_consensus_follower_limit_) {
         // If we have not received any append entries request for
@@ -2047,6 +2150,13 @@ bool raft_server::is_part_of_full_consensus() {
         return false;
     }
     return true;
+}
+
+bool raft_server::is_excluded_by_leader() {
+    if (is_leader()) {
+        return false;
+    }
+    return excluded_from_the_quorum_;
 }
 
 } // namespace nuraft;

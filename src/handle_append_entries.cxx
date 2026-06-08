@@ -18,6 +18,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 **************************************************************************/
 
+#include "global_mgr.hxx"
 #include "pp_util.hxx"
 #include "raft_params.hxx"
 #include "raft_server.hxx"
@@ -48,22 +49,37 @@ struct resp_appendix {
         DO_NOT_REWIND = 1,
         RECEIVING_SNAPSHOT = 2,
         COMPACTED_SNAPSHOT_BOUNDARY = 3,
+        NOTIFYING_SM_COMMITTED_INDEX = 4,
     };
 
-    resp_appendix() : extra_order_(NONE) {}
+    resp_appendix()
+        : extra_order_(NONE)
+        , sm_committed_idx_(0)
+        {}
 
     ptr<buffer> serialize() const {
         const static uint8_t CUR_VERSION = 0;
         size_t buf_len = sizeof(CUR_VERSION) + sizeof(extra_order_);
+        if (extra_order_ == NOTIFYING_SM_COMMITTED_INDEX) {
+            buf_len += sizeof(sm_committed_idx_);
+        }
 
         //  << Format >>
         // Format version       1 byte
         // Extra order          1 byte
 
+        //  << Format (if order == NOTIFYING_SM_COMMITTED_INDEX) >>
+        // Format version       1 byte
+        // Extra order          1 byte
+        // SM committed index   8 bytes
+
         ptr<buffer> result = buffer::alloc(buf_len);
         buffer_serializer bs(*result);
         bs.put_u8(CUR_VERSION);
         bs.put_u8(extra_order_);
+        if (extra_order_ == NOTIFYING_SM_COMMITTED_INDEX) {
+            bs.put_u64(sm_committed_idx_);
+        }
 
         return result;
     }
@@ -79,6 +95,10 @@ struct resp_appendix {
         }
 
         res->extra_order_ = static_cast<extra_order>(bs.get_u8());
+        if (res->extra_order_ == NOTIFYING_SM_COMMITTED_INDEX &&
+            bs.pos() + sizeof(uint64_t) <= buf.size()) {
+            res->sm_committed_idx_ = bs.get_u64();
+        }
         return res;
     }
 
@@ -92,12 +112,23 @@ struct resp_appendix {
             return "RECEIVING_SNAPSHOT";
         case COMPACTED_SNAPSHOT_BOUNDARY:
             return "COMPACTED_SNAPSHOT_BOUNDARY";
+        case NOTIFYING_SM_COMMITTED_INDEX:
+            return "NOTIFYING_SM_COMMITTED_INDEX";
         default:
             return "UNKNOWN";
         }
     };
 
+    /**
+     * Extra order for the response.
+     */
     extra_order extra_order_;
+
+    /**
+     * If non-zero, it indicates the committed log index of
+     * the state machine of the follower who sent this response.
+     */
+    uint64_t sm_committed_idx_;
 };
 
 const static int32 APPEND_ENTRIES_SAME_START_THROTTLE_THRESHOLD = 5;
@@ -688,8 +719,8 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         uint64_t required_log_idx =
             quick_commit_index_ > (uint64_t)params->max_append_size_
             ? quick_commit_index_ - params->max_append_size_ : 0;
-        if (last_resp_time_ms > expiry ||
-            p.get_matched_idx() < required_log_idx) {
+        if (is_excluded_from_quorum(p, last_resp_time_ms, expiry, required_log_idx,
+                                    /* include_self_mark_down = */ false)) {
             req->set_extra_flags(
                 req->get_extra_flags() | req_msg::EXCLUDED_FROM_THE_QUORUM);
         }
@@ -707,6 +738,35 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
 
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
+    ptr<raft_params> params = ctx_->get_params();
+    uint64_t time_gap_ms = last_rcvd_append_entries_req_.get_ms();
+    last_rcvd_append_entries_req_.reset();
+    if (params->use_full_consensus_among_healthy_members_ &&
+        time_gap_ms > (uint64_t)params->heart_beat_interval_ *
+            raft_limits_.full_consensus_follower_limit_) {
+        // If full consensus mode is on, and heartbeat or append_entries request
+        // arrives after the limit. We cannot accept it due to the case as follows:
+        //
+        // [L] Sends heartbeat, still in-flight.
+        // [L] At 4*H, the leader will exclude the follower and make another commit.
+        // [F] Receives heartbeat after 5*H, at this moment,
+        //     it thinks it is part of consensus and able to server reads.
+        //     But it does not have the latest commit.
+        //
+        // To avoid this, we should accept the request only when its interval
+        // is smaller than the limit.
+        //
+        // If all the request have longer interval than the limit,
+        // it is reasonable to say this follower is not healthy and excluded.
+        p_wn("heartbeat or append_entries request arrives after %" PRIu64 " ms, "
+             "which is larger than the limit: %d ms, reject it",
+             time_gap_ms,
+             params->heart_beat_interval_ *
+                 raft_limits_.full_consensus_follower_limit_);
+
+        return nullptr;
+    }
+
     bool supp_exp_warning = false;
     if (state_->is_catching_up()) {
         // WARNING:
@@ -912,9 +972,8 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     }
 
     // Reset timer.
-    last_rcvd_append_entries_req_.reset();
+    last_rcvd_valid_append_entries_req_.reset();
 
-    ptr<raft_params> params = ctx_->get_params();
     // Pipelined processing requires both sides to opt in. Old NuRaft on
     // either side falls back to the blocking path.
     bool async_log_appending =
@@ -1238,6 +1297,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             resp->get_extra_flags() | resp_msg::SELF_MARK_DOWN
         );
     }
+    if (ctx_->get_params()->track_peers_sm_commit_idx_ && !resp->get_ctx()) {
+        // If peer track mode is enabled, we should send
+        // the current SM committed index to the leader.
+        resp_appendix appendix;
+        appendix.extra_order_ = resp_appendix::NOTIFYING_SM_COMMITTED_INDEX;
+        appendix.sm_committed_idx_ = sm_commit_index_.load();
+        resp->set_ctx( appendix.serialize() );
+        p_tr("appended extra order %s, sm committed index: %" PRIu64,
+             resp_appendix::extra_order_msg(appendix.extra_order_),
+             appendix.sm_committed_idx_);
+    }
+
     p_ts("batch size hint: %" PRId64 " bytes, flags: %" PRIx64,
          bs_hint, resp->get_extra_flags());
 
@@ -1316,6 +1387,9 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
 
         uint64_t prev_matched_idx = 0;
         uint64_t new_matched_idx = 0;
+        uint64_t prev_sm_committed_idx = p->get_sm_committed_idx();
+        uint64_t new_sm_committed_idx = 0;
+
         {
             std::lock_guard<std::mutex> l(p->get_lock());
             p->set_next_log_idx(resp.get_next_idx());
@@ -1330,6 +1404,46 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             p->set_matched_idx(new_matched_idx);
             p->set_last_accepted_log_idx(new_matched_idx);
         }
+
+        bool sm_committed_idx_updated = false;
+        if (resp.get_ctx() &&
+            ctx_->get_params()->track_peers_sm_commit_idx_) {
+            // If the response contains appendix, it should be
+            // `resp_appendix` type.
+            ptr<resp_appendix> appendix = resp_appendix::deserialize(*resp.get_ctx());
+            if (appendix->extra_order_ == resp_appendix::NOTIFYING_SM_COMMITTED_INDEX) {
+                {
+                    std::lock_guard<std::mutex> l(p->get_lock());
+                    new_sm_committed_idx = appendix->sm_committed_idx_;
+                    p_tr("sm committed index of peer %d: %" PRIu64 " -> %" PRIu64,
+                         p->get_id(), prev_sm_committed_idx, new_sm_committed_idx);
+                    p->set_sm_committed_idx(new_sm_committed_idx);
+                    sm_committed_idx_updated = true;
+                }
+
+                if (sm_committed_idx_updated &&
+                    prev_sm_committed_idx < new_sm_committed_idx) {
+                    uint64_t target_idx = find_sm_commit_idx_to_notify();
+                    target_idx = update_sm_commit_notifier_target_idx(target_idx);
+                    p_tr("sm commit notify ready: %" PRIu64 ", target idx: %" PRIu64
+                         ", notified idx: %" PRIu64,
+                          new_sm_committed_idx, target_idx,
+                          sm_commit_notifier_notified_idx_.load());
+                    global_mgr* mgr = get_global_mgr();
+                    if (mgr) {
+                        // Global thread pool exists, request it.
+                        mgr->request_commit( this->shared_from_this() );
+                    } else {
+                        std::unique_lock<std::mutex> lock(commit_cv_lock_);
+                        commit_cv_.notify_one();
+                    }
+                }
+            }
+        }
+        if (!sm_committed_idx_updated) {
+            p->set_sm_committed_idx(0);
+        }
+
         cb_func::Param param(id_, leader_, p->get_id());
         param.ctx = &new_matched_idx;
         CbReturnCode rc = ctx_->cb_func_.call
@@ -1374,6 +1488,25 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
                                  : resp.get_next_idx();
         need_to_catchup = p->clear_pending_commit() ||
                           next_idx_to_send < log_store_->next_slot();
+        if (ctx_->get_params()->track_peers_sm_commit_idx_ &&
+            p->get_sm_committed_idx() &&
+            p->get_sm_committed_idx() < quick_commit_index_) {
+            // If peer's SM committed index is lagging behind the
+            // quick commit index, we should keep sending messages
+            // to listen to the peer's SM commit progress.
+
+            // However, if stream mode is on, and if there are
+            // requests already in flight, those requests will do the job.
+            // So we don't need to set `need_to_catchup` true in that case.
+            bool streaming = last_streamed_log_idx > 0;
+            int64_t bytes_in_flight = p->get_bytes_in_flight();
+            if (streaming && bytes_in_flight > 0) {
+                // No need to send.
+            } else {
+                need_to_catchup = true;
+            }
+        }
+        p_tr("need to catchup peer %d: %d", p->get_id(), need_to_catchup);
 
     } else {
         std::lock_guard<std::mutex> guard(p->get_lock());
@@ -1386,7 +1519,10 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             static timer_helper extra_order_timer(1000 * 1000, true);
             int log_lv = extra_order_timer.timeout_and_reset() ? L_INFO : L_TRACE;
             p_lv(log_lv, "received extra order: %s",
-                 resp_appendix::extra_order_msg(extra_order));
+                 resp_appendix::extra_order_msg(appendix->extra_order_));
+            if (extra_order == resp_appendix::NOTIFYING_SM_COMMITTED_INDEX) {
+                extra_order = resp_appendix::NONE;
+            }
         }
 
         bool current_term_log_probe =
@@ -1676,12 +1812,18 @@ ulong raft_server::get_expected_committed_log_idx() {
                std::greater<ulong>() );
 
     size_t quorum_idx = get_quorum_for_commit();
-    if (ctx_->get_params()->use_full_consensus_among_healthy_members_) {
-        ptr<raft_params> params = ctx_->get_params();
+    ptr<raft_params> params = ctx_->get_params();
+
+    if (ctx_->get_params()->use_full_consensus_among_healthy_members_ &&
+        params->custom_commit_quorum_size_ == 0) {
         // In full consensus mode, a peer is considered unhealthy when
         //   1) it is not responding for 3 times of heartbeat interval, or
         //   2) its last log index is smaller (older) than
         //      the current committed log index - max batch size.
+        //
+        // WARNING: If custom quorum size is set, we should prioritize
+        //          the custom quorum size over full consensus mode.
+
         int32_t allowed_interval =
             params->heart_beat_interval_ *
             raft_server::raft_limits_.full_consensus_leader_limit_;;

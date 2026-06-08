@@ -28,6 +28,7 @@ limitations under the License.
 
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace nuraft {
@@ -41,32 +42,29 @@ class state_mgr;
 class global_mgr;
 struct context {
 public:
-    context( ptr<state_mgr>& mgr,
-             ptr<state_machine>& m,
-             const std::vector<ptr<rpc_listener>>& listeners,
-             ptr<logger>& l,
-             ptr<rpc_client_factory>& cli_factory,
-             ptr<delayed_task_scheduler>& scheduler,
-             const raft_params& params,
-             global_mgr* custom_global_mgr = nullptr)
-        : state_mgr_(mgr)
-        , state_machine_(m)
-        , rpc_listeners_(listeners)
-        , logger_(l)
-        , rpc_cli_factory_(cli_factory)
-        , scheduler_(scheduler)
+    context(ptr<state_mgr> mgr,
+            ptr<state_machine> m,
+            std::vector<ptr<rpc_listener>> listeners,
+            ptr<logger> l,
+            ptr<rpc_client_factory> cli_factory,
+            ptr<delayed_task_scheduler> scheduler,
+            const raft_params& params,
+            global_mgr* custom_global_mgr = nullptr)
+        : state_mgr_(std::move(mgr))
+        , state_machine_(std::move(m))
+        , rpc_listeners_(std::move(listeners))
+        , logger_(std::move(l))
+        , rpc_cli_factory_(std::move(cli_factory))
+        , scheduler_(std::move(scheduler))
         , params_(cs_new<raft_params>(params))
-        , custom_global_mgr_(custom_global_mgr)
-    {}
+        , custom_global_mgr_(custom_global_mgr) {}
 
     /**
      * Register an event callback function.
      *
      * @param func Callback function to register.
      */
-    void set_cb_func(cb_func::func_type func) {
-        cb_func_ = cb_func(func);
-    }
+    void set_cb_func(cb_func::func_type func) { cb_func_ = cb_func(func); }
 
     /**
      * Return the pointer to current Raft parameters.
@@ -148,6 +146,6 @@ public:
     mutable std::mutex ctx_lock_;
 };
 
-}
+} // namespace nuraft
 
 #endif //_CONTEXT_HXX_

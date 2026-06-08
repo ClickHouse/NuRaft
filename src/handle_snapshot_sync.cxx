@@ -58,9 +58,7 @@ bool raft_server::check_snapshot_timeout(ptr<peer> pp) {
 
 void raft_server::destroy_user_snp_ctx(ptr<snapshot_sync_ctx> sync_ctx) {
     if (!sync_ctx) return;
-    void*& user_ctx = sync_ctx->get_user_snp_ctx();
-    p_tr("destroy user ctx %p", user_ctx);
-    state_machine_->free_user_snp_ctx(user_ctx);
+    sync_ctx->close_user_snp_ctx(*state_machine_);
 }
 
 void raft_server::clear_snapshot_sync_ctx(peer& pp) {
@@ -88,12 +86,10 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     ulong prev_sync_snp_log_idx = 0;
     if (sync_ctx) {
         snp = sync_ctx->get_snapshot();
-        p_db( "previous sync_ctx exists %p, offset %" PRIu64 ", snp idx %" PRIu64
-              ", user_ctx %p",
+        p_db( "previous sync_ctx exists %p, offset %" PRIu64 ", snp idx %" PRIu64,
               sync_ctx.get(),
               sync_ctx->get_offset(),
-              snp->get_last_log_idx(),
-              sync_ctx->get_user_snp_ctx() );
+              snp->get_last_log_idx() );
         prev_sync_snp_log_idx = snp->get_last_log_idx();
 
         if (sync_ctx->get_timer().timeout()) {
@@ -167,15 +163,29 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     if (params->use_bg_thread_for_snapshot_io_) {
         // If async snapshot IO, push the snapshot read request to the manager
         // and immediately return here.
-        snapshot_io_mgr::instance().push( this->shared_from_this(),
-                                          pp,
-                                          ( (pp == srv_to_join_)
-                                            ? ex_resp_handler_
-                                            : resp_handler_ ) );
+        if (!snapshot_io_mgr::instance().push( this->shared_from_this(),
+                                               pp,
+                                               ( (pp == srv_to_join_)
+                                                 ? ex_resp_handler_
+                                                 : resp_handler_ ) ))
+        {
+            return nullptr;
+        }
         succeeded_out = true;
         return nullptr;
     }
     // Otherwise (sync snapshot IO), read the requested object here and then return.
+
+    sync_ctx = p.get_snapshot_sync_ctx();
+    if (!sync_ctx)
+    {
+        return nullptr;
+    }
+    snp = sync_ctx->get_snapshot();
+    if (!snp)
+    {
+        return nullptr;
+    }
 
     bool last_request = false;
     ptr<buffer> data = nullptr;
@@ -183,7 +193,7 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     if (snp->get_type() == snapshot::raw_binary) {
         // LCOV_EXCL_START
         // Raw binary snapshot (original)
-        ulong offset = p.get_snapshot_sync_ctx()->get_offset();
+        ulong offset = sync_ctx->get_offset();
         ulong sz_left = ( snp->size() > offset ) ? ( snp->size() - offset ) : 0;
         int32 blk_sz = get_snapshot_sync_block_size();
         data = buffer::alloc((size_t)(std::min((ulong)blk_sz, sz_left)));
@@ -202,14 +212,22 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
 
     } else {
         // Logical object type snapshot
-        sync_ctx = p.get_snapshot_sync_ctx();
         ulong obj_idx = sync_ctx->get_offset();
-        void*& user_snp_ctx = sync_ctx->get_user_snp_ctx();
-        p_dv("peer: %d, obj_idx: %" PRIu64 ", user_snp_ctx %p",
-             (int)p.get_id(), obj_idx, user_snp_ctx);
+        snapshot_sync_ctx::user_snp_ctx_io_guard user_ctx_guard(*sync_ctx, *state_machine_);
+        if (!user_ctx_guard)
+        {
+            return nullptr;
+        }
+        p_dv("peer: %d, obj_idx: %" PRIu64,
+             (int)p.get_id(), obj_idx);
 
-        int rc = state_machine_->read_logical_snp_obj( *snp, user_snp_ctx, obj_idx,
+        int rc = state_machine_->read_logical_snp_obj( *snp, user_ctx_guard.get(), obj_idx,
                                                        data, last_request );
+        const bool closed = user_ctx_guard.finish();
+        if (closed)
+        {
+            return nullptr;
+        }
         if (rc < 0) {
             p_wn( "reading snapshot (idx %" PRIu64 ", term %" PRIu64
                   ", object %" PRIu64 ") failed: %d",
@@ -561,6 +579,15 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
             ~ExecAutoResume() { clean_func_(); }
             std::function<void()> clean_func_;
         } exec_auto_resume([this](){ resume_state_machine_execution(); });
+
+        if (req.get_snapshot().get_last_log_idx() <= quick_commit_index_) {
+            p_wn( "snapshot (idx %" PRIu64 ", term %" PRIu64 ") is already "
+                  "covered by current commit idx %" PRIu64 ", skip applying it",
+                  req.get_snapshot().get_last_log_idx(),
+                  req.get_snapshot().get_last_log_term(),
+                  quick_commit_index_.load() );
+            return true;
+        }
 
         state_->set_receiving_snapshot(false);
         ctx_->state_mgr_->save_state(*state_);

@@ -128,13 +128,20 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] got stale RPC response from %d: "
                           "current id %" PRIu64 ", from id %" PRIu64 ". "
-                          "will ignore this response",
-                          get_config().get_id(),
+                          "will ignore this response. "
+                          "Currently, stale_resps: %d, response_limit: %d",
+                          config_->get_id(),
                           cur_rpc_id,
-                          my_rpc_client_id );
+                          my_rpc_client_id,
+                          stale_resps,
+                          limit );
                 } else if (stale_resps == limit) {
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
-                          "will suppress it from now", config_->get_id() );
+                          "will suppress it from now."
+                          "Currently, stale_resps: %d, response_limit: %d",
+                          config_->get_id(),
+                          stale_resps,
+                          limit );
                 }
 
             } else {
@@ -208,13 +215,20 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 if (stale_resps < limit) {
                     p_wn( "[EDGE CASE] RPC for %d has been reset before "
                           "returning error: current id %" PRIu64
-                          ", from id %" PRIu64,
+                          ", from id %" PRIu64 ". "
+                          "Currently, stale_resps: %d, response_limit: %d",
                           config_->get_id(),
                           cur_rpc_id,
-                          my_rpc_client_id );
+                          my_rpc_client_id,
+                          stale_resps,
+                          limit );
                 } else if (stale_resps == limit) {
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
-                          "will suppress it from now", config_->get_id() );
+                          "will suppress it from now."
+                          "Currently, stale_resps: %d, response_limit: %d",
+                          config_->get_id(),
+                          stale_resps,
+                          limit );
                 }
             }
         }

@@ -22,9 +22,12 @@ limitations under the License.
 
 #include "event_awaiter.hxx"
 #include "raft_params.hxx"
+#include "snapshot_sync_ctx.hxx"
 #include "test_common.h"
 
+#include <atomic>
 #include <stdio.h>
+#include <thread>
 
 using namespace nuraft;
 using namespace raft_functional_common;
@@ -32,6 +35,53 @@ using namespace raft_functional_common;
 using raft_result = cmd_result< ptr<buffer> >;
 
 namespace snapshot_test {
+
+class StaleSnapshotTestServer : public raft_server {
+public:
+    StaleSnapshotTestServer(context* ctx, const init_options& opt)
+        : raft_server(ctx, opt)
+        {}
+
+    bool handle_stale_final_snapshot_as_leader(snapshot_sync_req& req) {
+        std::unique_lock<std::recursive_mutex> guard(lock_);
+        role_ = srv_role::leader;
+        quick_commit_index_ = req.get_snapshot().get_last_log_idx();
+        bool ret = handle_snapshot_sync_req(req, guard);
+        state_->set_receiving_snapshot(false);
+        return ret;
+    }
+};
+
+class BlockingUserCtxSm : public raft_functional_common::TestSm
+{
+public:
+    nuraft::EventAwaiter read_started;
+    nuraft::EventAwaiter release_read;
+    std::atomic<size_t> free_count{0};
+
+    int read_logical_snp_obj(snapshot& s,
+                             void*& user_snp_ctx,
+                             ulong obj_id,
+                             ptr<buffer>& data_out,
+                             bool& is_last_obj) override
+    {
+        int rc = raft_functional_common::TestSm::read_logical_snp_obj(
+            s, user_snp_ctx, obj_id, data_out, is_last_obj);
+        read_started.invoke();
+        release_read.wait();
+        return rc;
+    }
+
+    void free_user_snp_ctx(void*& user_snp_ctx) override
+    {
+        if (user_snp_ctx)
+        {
+            free_count.fetch_add(1);
+        }
+        raft_functional_common::TestSm::free_user_snp_ctx(user_snp_ctx);
+        user_snp_ctx = nullptr;
+    }
+};
 
 static ptr<buffer> make_test_msg(const std::string& test_msg) {
     ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
@@ -851,6 +901,50 @@ int snapshot_leader_switch_test() {
 
     f_base->destroy();
 
+    return 0;
+}
+
+int stale_snapshot_finalization_role_change_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    ptr<FakeNetwork> f_net = cs_new<FakeNetwork>(s1_addr, f_base);
+    f_base->addNetwork(f_net);
+
+    ptr<FakeTimer> f_timer = cs_new<FakeTimer>(s1_addr, f_base->getLogger());
+    ptr<TestMgr> s_mgr = cs_new<TestMgr>(1, s1_addr);
+    ptr<TestSm> sm = cs_new<TestSm>(f_base->getLogger());
+    ptr<logger_wrapper> log_wrapper = cs_new<logger_wrapper>("./srv1.log");
+    ptr<logger> my_log = log_wrapper;
+
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(5);
+    params.with_log_sync_stopping_gap(1);
+    params.use_bg_thread_for_urgent_commit_ = false;
+
+    context* ctx = new context( s_mgr, sm, {f_net}, my_log,
+                                f_net, f_timer, params );
+    ptr<StaleSnapshotTestServer> srv =
+        cs_new<StaleSnapshotTestServer>
+        ( ctx, raft_server::init_options(false, false, true) );
+
+    ptr<snapshot> stale_snp =
+        cs_new<snapshot>( 10, 3, s_mgr->load_config(), 0,
+                          snapshot::logical_object );
+    ptr<buffer> data = buffer::alloc(0);
+    snapshot_sync_req req(stale_snp, 0, data, true);
+
+    CHK_TRUE( srv->handle_stale_final_snapshot_as_leader(req) );
+    CHK_NULL( sm->last_snapshot().get() );
+
+    f_base->removeNetwork(s1_addr);
+    log_wrapper->destroy();
     return 0;
 }
 
@@ -2028,6 +2122,64 @@ int snapshot_rewind_floor_test() {
     return 0;
 }
 
+int snapshot_user_ctx_deferred_free_test()
+{
+    BlockingUserCtxSm sm;
+    ptr<cluster_config> config = cs_new<cluster_config>();
+    ptr<snapshot> snp = cs_new<snapshot>(10, 3, config, 0, snapshot::logical_object);
+    ptr<snapshot_sync_ctx> sync_ctx = cs_new<snapshot_sync_ctx>(snp, 2, 1000000);
+    std::atomic<int> reader_result{0};
+
+    std::thread reader([&sm, &sync_ctx, &snp, &reader_result]()
+    {
+        try
+        {
+            ptr<buffer> data;
+            bool is_last_obj = false;
+            snapshot_sync_ctx::user_snp_ctx_io_guard guard(*sync_ctx, sm);
+            if (!guard)
+            {
+                reader_result = 1;
+                return;
+            }
+
+            int rc = sm.read_logical_snp_obj(*snp, guard.get(), 0, data, is_last_obj);
+            bool closed = guard.finish();
+            if (rc != 0 || !closed)
+            {
+                reader_result = 2;
+            }
+        }
+        catch (...)
+        {
+            reader_result = 3;
+        }
+    });
+
+    sm.read_started.wait();
+    sync_ctx->close_user_snp_ctx(sm);
+    CHK_EQ((size_t)0, sm.free_count.load());
+    sm.release_read.invoke();
+    reader.join();
+
+    CHK_Z(reader_result.load());
+    CHK_EQ((size_t)1, sm.free_count.load());
+    CHK_Z(sm.getNumOpenedUserCtxs());
+
+    snapshot_sync_ctx::user_snp_ctx_io_guard closed_guard(*sync_ctx, sm);
+    CHK_FALSE(closed_guard);
+
+    ptr<snapshot_sync_ctx> closed_before_read_ctx =
+        cs_new<snapshot_sync_ctx>(snp, 2, 1000000);
+    closed_before_read_ctx->close_user_snp_ctx(sm);
+    snapshot_sync_ctx::user_snp_ctx_io_guard closed_before_read_guard(
+        *closed_before_read_ctx, sm);
+    CHK_FALSE(closed_before_read_guard);
+    CHK_EQ((size_t)1, sm.free_count.load());
+
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -2062,6 +2214,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot leader switch test",
                snapshot_leader_switch_test );
+
+    ts.doTest( "stale snapshot finalization role change test",
+               stale_snapshot_finalization_role_change_test );
 
     ts.doTest( "snapshot stale sync flag test",
                snapshot_stale_sync_flag_test );
@@ -2098,6 +2253,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot rewind floor test",
                snapshot_rewind_floor_test );
+
+    ts.doTest( "snapshot user ctx deferred free test",
+               snapshot_user_ctx_deferred_free_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");

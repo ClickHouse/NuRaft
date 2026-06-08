@@ -121,7 +121,7 @@ public:
             , leave_limit_(5)
             , vote_limit_(5)
             , busy_connection_limit_(20)
-            , full_consensus_leader_limit_(3)
+            , full_consensus_leader_limit_(4)
             , full_consensus_follower_limit_(2)
             {}
 
@@ -968,10 +968,30 @@ public:
      */
     bool is_part_of_full_consensus();
 
+    /**
+     * Check if this server is excluded from the quorum by the leader,
+     * when it runs in full consensus mode.
+     *
+     * @return `true` if this server is excluded by the current leader and
+     *         not the part of the full consensus.
+     */
+    bool is_excluded_by_leader();
+
+    /**
+     * Wait for the state machine to commit the log at the given index.
+     * This function will return immediately, and the commit results will be
+     * set to the returned `cmd_result` instance later.
+     *
+     * @return `cmd_result` instance. It will contain `true` if the commit
+     *         has been invoked, and `false` if not.
+     */
+    ptr<cmd_result<bool>> wait_for_state_machine_commit(uint64_t target_idx);
+
 protected:
     typedef std::unordered_map<int32, ptr<peer>>::const_iterator peer_itor;
 
     struct commit_ret_elem;
+    struct sm_watcher_elem;
 
     struct pre_vote_status_t {
         pre_vote_status_t()
@@ -1038,6 +1058,11 @@ protected:
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
     size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
+    static bool is_excluded_from_quorum(const peer& pp,
+                                        int32_t resp_elapsed_ms,
+                                        int32_t expiry,
+                                        uint64_t required_log_idx,
+                                        bool include_self_mark_down = true);
 
     void for_each_voting_members(
         const std::function<void(const ptr<peer>&, int32_t)>& callback);
@@ -1055,6 +1080,7 @@ protected:
         handle_cli_req_callback_async(ptr< cmd_result< ptr<buffer> > > async_res);
 
     void drop_all_pending_commit_elems();
+    void drop_all_sm_watcher_elems();
 
     ptr<resp_msg> handle_ext_msg(req_msg& req,
                                  std::unique_lock<std::recursive_mutex>& guard);
@@ -1155,6 +1181,14 @@ protected:
                         bool need_to_handle_commit_elem,
                         bool initial_commit_exec);
     void commit_conf(ulong idx_to_commit, ptr<log_entry>& le);
+
+    void scan_sm_commit_and_notify(uint64_t idx_upto);
+
+    uint64_t find_sm_commit_idx_to_notify();
+
+    uint64_t update_sm_commit_notifier_target_idx(uint64_t to);
+
+    bool reset_sm_commit_notifier_target_idx(uint64_t expected);
 
     ptr< cmd_result< ptr<buffer> > >
         send_msg_to_leader(ptr<req_msg>& req,
@@ -1651,12 +1685,22 @@ protected:
      * Client requests waiting for replication.
      * Only used in blocking mode.
      */
-    std::map<ulong, ptr<commit_ret_elem>> commit_ret_elems_;
+    std::map<uint64_t, ptr<commit_ret_elem>> commit_ret_elems_;
 
     /**
      * Lock for `commit_ret_elems_`.
      */
     std::mutex commit_ret_elems_lock_;
+
+    /**
+     * Map of state machine watchers.
+     */
+    std::map<uint64_t, sm_watcher_elem> sm_watchers_;
+
+    /**
+     * Lock for `sm_watchers_`.
+     */
+    std::mutex sm_watchers_lock_;
 
     /**
      * Condition variable to invoke Raft server for
@@ -1764,9 +1808,32 @@ protected:
 
     /**
      * Timer that will be reset on receiving
-     * a successful `AppendEntries` request.
+     * a valid `AppendEntries` request.
+     */
+    timer_helper last_rcvd_valid_append_entries_req_;
+
+    /**
+     * Timer that will be reset on receiving
+     * a `AppendEntries` request including invalid one too.
      */
     timer_helper last_rcvd_append_entries_req_;
+
+    /**
+     * When tracking peers' SM index mode is on, this is the target
+     * log index to invoke the client request's callback.
+     * It is set to `min(healthy peers' SM commit index)`.
+     *
+     * Protected by `lock_`.
+     */
+    std::atomic<uint64_t> sm_commit_notifier_target_idx_;
+
+    /**
+     * When tracking peers' SM index mode is on, this is set to
+     * the last log index that client requests are notified.
+     *
+     * Protected by `lock_`.
+     */
+    std::atomic<uint64_t> sm_commit_notifier_notified_idx_;
 };
 
 } // namespace nuraft;

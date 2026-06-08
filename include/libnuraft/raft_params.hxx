@@ -100,6 +100,7 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
+        , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
         , max_bytes_in_flight_in_stream_(0)
@@ -655,9 +656,19 @@ public:
      * cannot commit the log.
      *
      * A member becomes "unhealthy" if it does not respond to the leader's
-     * request for a configured time (`response_limit_`).
+     * request for a configured time (`full_consensus_leader_limit_`).
+     *
+     * A member also does self-mark-down if it does not receive valid messages
+     * from the leader for a configured time (`full_consensus_follower_limit_`).
      */
     bool use_full_consensus_among_healthy_members_;
+
+    /**
+     * (Experimental)
+     * If `true`, the leader will track the commit index of each peers' state machine.
+     * It can be used along with `use_full_consensus_among_healthy_members_`
+     */
+    bool track_peers_sm_commit_idx_;
 
     /**
      * (Experimental)

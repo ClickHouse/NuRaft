@@ -40,7 +40,10 @@ limitations under the License.
 namespace nuraft {
 
 void raft_server::commit(ulong target_idx) {
+    bool track_peers_sm_commit_idx = ctx_->get_params()->track_peers_sm_commit_idx_;
     if (target_idx > quick_commit_index_) {
+        p_db( "trigger commit upto %" PRIu64 ", current quick commit index %" PRIu64,
+              target_idx, quick_commit_index_.load() );
         quick_commit_index_ = target_idx;
         lagging_sm_target_index_ = target_idx;
 
@@ -57,6 +60,12 @@ void raft_server::commit(ulong target_idx) {
         if (role_ == srv_role::leader) {
             for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
                 ptr<peer> pp = it->second;
+                if (track_peers_sm_commit_idx &&
+                    pp->get_sm_committed_idx() >= target_idx) {
+                    // This peer's state machine is already committed
+                    // upto the target index. No need to send AE.
+                    continue;
+                }
                 if (!request_append_entries(pp)) {
                     pp->set_pending_commit();
                 }
@@ -116,14 +125,20 @@ void raft_server::commit_in_bg() {
         // WARNING:
         //   If `sm_commit_paused_` is set, we shouldn't enter
         //   `commit_in_bg_exec()`, as it will cause an infinite loop.
-        while ( quick_commit_index_ <= sm_commit_index_ ||
-                sm_commit_index_ >= log_store_->next_slot() - 1 ||
-                sm_commit_paused_ ) {
+        while ( ( quick_commit_index_ <= sm_commit_index_ ||
+                  sm_commit_index_ >= log_store_->next_slot() - 1 ||
+                  sm_commit_paused_ ) &&
+                sm_commit_notifier_target_idx_ == sm_commit_notifier_notified_idx_ ) {
             std::unique_lock<std::mutex> lock(commit_cv_lock_);
 
             auto wait_check = [this]() {
+                // Wake up (escape this loop) on `true`.
+
                 if (stopping_) {
                     // WARNING: `stopping_` flag should have the highest priority.
+                    return true;
+                }
+                if (sm_commit_notifier_target_idx_ > sm_commit_notifier_notified_idx_) {
                     return true;
                 }
                 if (sm_commit_paused_) {
@@ -161,6 +176,11 @@ void raft_server::commit_in_bg() {
         }
 
         commit_in_bg_exec(0, is_log_store_commit_exec);
+
+        if (sm_commit_notifier_target_idx_ > sm_commit_notifier_notified_idx_) {
+            uint64_t target_idx = sm_commit_notifier_target_idx_;
+            scan_sm_commit_and_notify(target_idx);
+        }
 
      } catch (std::exception& err) {
         // LCOV_EXCL_START
@@ -289,7 +309,34 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms, bool initial_commit_exec)
                  exp_idx,
                  index_to_commit);
         }
+
+        std::list<sm_watcher_elem> watcher_elems_to_notify;
+        {
+            // Notify watchers for the state machine commit.
+            std::unique_lock<std::mutex> lock(sm_watchers_lock_);
+            p_tr("total watchers: %zu", sm_watchers_.size());
+            auto entry = sm_watchers_.find(index_to_commit);
+            if (entry != sm_watchers_.end()) {
+                // If found, notify the watcher.
+                sm_watcher_elem& watcher = entry->second;
+                watcher_elems_to_notify.push_back(watcher);
+                sm_watchers_.erase(entry);
+            }
+        }
+        // Notify the watchers outside the lock.
+        for (auto& w_elem: watcher_elems_to_notify) {
+            p_tr("notify sm watcher for idx %" PRIu64 ", %zu watchers",
+                 w_elem.idx_, w_elem.watchers_.size());
+            for (auto& watcher: w_elem.watchers_) {
+                // Notify the watcher.
+                bool ret_bool = true;
+                ptr<std::exception> exp = nullptr;
+                watcher->set_result(ret_bool, exp);
+            }
+        }
+
     }
+
     p_db( "DONE: commit upto %" PRIu64 ", current idx %" PRIu64,
           quick_commit_index_.load(), sm_commit_index_.load() );
 
@@ -317,6 +364,16 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms, bool initial_commit_exec)
         }
     }
 
+    if (ctx_->get_params()->track_peers_sm_commit_idx_) {
+        uint64_t target_idx = find_sm_commit_idx_to_notify();
+        uint64_t target_idx2 = update_sm_commit_notifier_target_idx(target_idx);
+        if (target_idx != target_idx2) {
+            p_tr("sm commit notify ready: %" PRIu64 ", target idx: %" PRIu64
+                 ", notified idx: %" PRIu64,
+                 target_idx, target_idx2, sm_commit_notifier_notified_idx_.load());
+        }
+    }
+
     return finished_in_time;
 }
 
@@ -340,6 +397,8 @@ void raft_server::commit_app_log(ulong idx_to_commit,
     ret_value = state_machine_->commit_ext
                 ( state_machine::ext_op_params( sm_idx, buf, le->get_term() ) );
     if (ret_value) ret_value->pos(0);
+
+    auto params = ctx_->get_params();
 
     std::list< ptr<commit_ret_elem> > async_elems;
     if (need_to_handle_commit_elem) {
@@ -367,24 +426,32 @@ void raft_server::commit_app_log(ulong idx_to_commit,
                 need_to_check_commit_ret = false;
                 p_ts("notify cb %" PRIu64 " %p", sm_idx, &elem->awaiter_);
 
-                switch (ctx_->get_params()->return_method_) {
-                case raft_params::blocking:
-                default:
-                    // Blocking mode:
-                    if (elem->callback_invoked_) {
-                        // If elem callback invoked, remove it
-                        commit_ret_elems_.erase(entry);
-                    } else {
-                        // or notify client that request done
-                        elem->awaiter_.invoke();
-                    }
-                    break;
+                if (params->track_peers_sm_commit_idx_) {
+                    // Respond upon all peers' SM commit.
+                    // It will be handled later in `commit_in_bg_exec`.
 
-                case raft_params::async_handler:
-                    // Async handler: put into list.
-                    async_elems.push_back(elem);
-                    commit_ret_elems_.erase(entry);
-                    break;
+                } else {
+                    // Respond upon the leader's SM commit.
+                    p_dv("notify cb %" PRIu64 " %p", sm_idx, &elem->awaiter_);
+                    switch (params->return_method_) {
+                    case raft_params::blocking:
+                    default:
+                        // Blocking mode:
+                        if (elem->callback_invoked_) {
+                            // If elem callback invoked (== TIMEOUT), remove it
+                            commit_ret_elems_.erase(entry);
+                        } else {
+                            // or notify client that request done
+                            elem->awaiter_.invoke();
+                        }
+                        break;
+
+                    case raft_params::async_handler:
+                        // Async handler: put into list.
+                        async_elems.push_back(elem);
+                        commit_ret_elems_.erase(entry);
+                        break;
+                    }
                 }
             }
         }
@@ -399,19 +466,23 @@ void raft_server::commit_app_log(ulong idx_to_commit,
             p_tr("commit thread is invoked earlier than user thread, "
                  "log %" PRIu64 ", elem %p", sm_idx, elem.get());
 
-            switch (ctx_->get_params()->return_method_) {
-            case raft_params::blocking:
-            default:
-                elem->awaiter_.invoke(); // Callback will not sleep.
-                break;
-            case raft_params::async_handler:
-                // Async handler:
-                //   Set the result, but should not put it into the
-                //   `async_elems` list, as the user thread (supposed to be
-                //   executed right after this) will invoke the callback immediately.
-                elem->async_result_ =
-                    cs_new< cmd_result< ptr<buffer> > >( elem->ret_value_ );
-                break;
+            if (params->track_peers_sm_commit_idx_) {
+                // Ditto.
+            } else {
+                switch (params->return_method_) {
+                case raft_params::blocking:
+                default:
+                    elem->awaiter_.invoke(); // Callback will not sleep.
+                    break;
+                case raft_params::async_handler:
+                    // Async handler:
+                    //   Set the result, but should not put it into the
+                    //   `async_elems` list, as the user thread (supposed to be
+                    //   executed right after this) will invoke the callback immediately.
+                    elem->async_result_ =
+                        cs_new< cmd_result< ptr<buffer> > >( elem->ret_value_ );
+                    break;
+                }
             }
             commit_ret_elems_.insert( std::make_pair(sm_idx, elem) );
         }
@@ -468,6 +539,124 @@ void raft_server::commit_conf(ulong idx_to_commit,
     //     p_in("this server is committed as one of cluster members");
     //     catching_up_ = false;
     // }
+}
+
+void raft_server::scan_sm_commit_and_notify(uint64_t idx_upto) {
+    auto params = ctx_->get_params();
+    if (params->track_peers_sm_commit_idx_ == false) {
+        return;
+    }
+
+    p_tr("sm commit notifier scan start, upto %" PRIu64, idx_upto);
+
+    std::list< ptr<commit_ret_elem> > async_elems;
+
+    std::unique_lock<std::mutex> cre_lock(commit_ret_elems_lock_);
+
+    // NOTE: If we reach here, we assume the leader already finished its
+    //       commit (i.e., `commit_app_log`), hence the corresponding
+    //       `commit_ret_elem` must exist.
+    auto entry = commit_ret_elems_.begin();
+    while (entry != commit_ret_elems_.end()) {
+        if (entry->first > idx_upto) {
+            break;
+        }
+        ptr<commit_ret_elem> elem = entry->second;
+
+        p_tr("notify cb %" PRIu64 " %p", entry->first, &elem->awaiter_);
+        switch (params->return_method_) {
+        case raft_params::blocking:
+        default:
+            // Blocking mode:
+            if (elem->callback_invoked_) {
+                // If elem callback invoked (== TIMEOUT), remove it
+                entry = commit_ret_elems_.erase(entry);
+            } else {
+                // or notify client that request done
+                elem->awaiter_.invoke();
+                entry++;
+            }
+            break;
+
+        case raft_params::async_handler:
+            // Async handler: put into list.
+            async_elems.push_back(elem);
+            entry = commit_ret_elems_.erase(entry);
+            break;
+        }
+    }
+
+    for (auto& entry: async_elems) {
+        ptr<commit_ret_elem>& elem = entry;
+        if (elem->async_result_) {
+            ptr<std::exception> err = nullptr;
+            elem->async_result_->set_result( elem->ret_value_, err, cmd_result_code::OK );
+            elem->ret_value_.reset();
+            elem->async_result_.reset();
+        }
+    }
+
+    sm_commit_notifier_notified_idx_ = idx_upto;
+    p_tr("sm commit notifier scan done, notified index %" PRIu64,
+         sm_commit_notifier_notified_idx_.load());
+}
+
+uint64_t raft_server::find_sm_commit_idx_to_notify() {
+    ptr<raft_params> params = ctx_->get_params();
+
+    recur_lock(lock_);
+    uint64_t expiry = params->heart_beat_interval_ *
+                      raft_server::raft_limits_.full_consensus_leader_limit_;
+    uint64_t required_log_idx =
+        quick_commit_index_ > (uint64_t)params->max_append_size_
+        ? quick_commit_index_ - params->max_append_size_ : 0;
+
+    uint64_t min_commit_idx = sm_commit_index_;
+    std::vector<uint64_t> commit_idx_list;
+    commit_idx_list.reserve(16);
+    commit_idx_list.push_back(sm_commit_index_);
+
+    for (auto& pp: peers_) {
+        uint64_t last_resp_time_ms = pp.second->get_resp_timer_us() / 1000;
+        if (is_excluded_from_quorum(*pp.second, last_resp_time_ms,
+                                    expiry, required_log_idx)) {
+            continue;
+        }
+        if (pp.second->get_sm_committed_idx() == 0) {
+            continue;
+        }
+        commit_idx_list.push_back(pp.second->get_sm_committed_idx());
+    }
+    // Sort it (decending order).
+    std::sort(commit_idx_list.begin(), commit_idx_list.end(),
+              std::greater<uint64_t>());
+
+    // Pick last one (== minimum).
+    size_t idx_to_pick = commit_idx_list.size() - 1;
+    if (params->custom_commit_quorum_size_ &&
+        params->custom_commit_quorum_size_ < (int)commit_idx_list.size()) {
+        // If custom quorum size is set, pick the index based on it.
+        idx_to_pick = params->custom_commit_quorum_size_ - 1;
+    }
+    min_commit_idx = commit_idx_list[idx_to_pick];
+
+    return min_commit_idx;
+}
+
+uint64_t raft_server::update_sm_commit_notifier_target_idx(uint64_t to) {
+    recur_lock(lock_);
+    if (sm_commit_notifier_target_idx_ >= to) {
+        // Already set to a larger value.
+        return sm_commit_notifier_target_idx_;
+    }
+    sm_commit_notifier_target_idx_ = to;
+    return sm_commit_notifier_target_idx_;
+}
+
+bool raft_server::reset_sm_commit_notifier_target_idx(uint64_t expected) {
+    recur_lock(lock_);
+    sm_commit_notifier_notified_idx_ = expected;
+    return true;
 }
 
 bool raft_server::apply_config_log_entry(ptr<log_entry>& le,
@@ -923,10 +1112,8 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
                 p_in("srv_to_leave_: %d", srv_to_leave_->get_id());
                 ptr<snapshot_sync_ctx> snp_ctx = srv_to_leave_->get_snapshot_sync_ctx();
                 if (snp_ctx) {
-                    void* user_ctx = snp_ctx->get_user_snp_ctx();
-                    p_in("srv_to_leave_ has snapshot context %p and user context %p, "
-                         "destroy them",
-                         snp_ctx.get(), user_ctx);
+                    p_in("srv_to_leave_ has snapshot context %p, destroy it",
+                         snp_ctx.get());
                     clear_snapshot_sync_ctx(*srv_to_leave_);
                 }
 
@@ -1064,4 +1251,3 @@ bool raft_server::wait_for_state_machine_pause(size_t timeout_ms) {
 }
 
 } // namespace nuraft;
-
