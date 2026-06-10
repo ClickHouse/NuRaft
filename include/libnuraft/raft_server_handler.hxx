@@ -69,6 +69,19 @@ protected:
     static ptr<snapshot> get_last_snapshot(raft_server* srv) {
         return srv->get_last_snapshot();
     }
+
+    /**
+     * Set the last snapshot pointer in a raft_server (for testing).
+     */
+    static void set_last_snapshot(raft_server* srv, const ptr<snapshot>& snp) {
+        srv->set_last_snapshot(snp);
+    }
+
+    static ptr<req_msg> create_append_entries_req(raft_server* srv,
+                                                  ptr<peer>& pp,
+                                                  ulong custom_last_log_idx = 0) {
+        return srv->create_append_entries_req(pp, custom_last_log_idx);
+    }
 };
 
 }

@@ -254,8 +254,66 @@ public:
         }
     }
 
+    ulong getPeerSnapshotSyncCtxLastLogIdx(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+            if (sync_ctx && sync_ctx->get_snapshot()) {
+                return sync_ctx->get_snapshot()->get_last_log_idx();
+            }
+        }
+        return 0;
+    }
+
+    void beginPeerSnapshotAsyncRequest(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+            if (sync_ctx) {
+                sync_ctx->begin_async_snapshot_request();
+            }
+        }
+    }
+
+    bool getPeerAsyncSnapshotRequestInProgress(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+            return sync_ctx && sync_ctx->is_async_snapshot_request_in_progress();
+        }
+        return false;
+    }
+
+    bool getPeerAsyncSnapshotTransferStarted(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+            return sync_ctx && sync_ctx->is_async_snapshot_transfer_started();
+        }
+        return false;
+    }
+
     ptr<snapshot> getLastSnapshot(raft_server* srv) {
         return get_last_snapshot(srv);
+    }
+
+    void setLastSnapshot(raft_server* srv, ptr<snapshot> snp) {
+        set_last_snapshot(srv, snp);
+    }
+
+    ptr<req_msg> createAppendEntriesReq(raft_server* srv,
+                                        int32 peer_id,
+                                        ulong custom_last_log_idx = 0) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return create_append_entries_req(srv, it->second, custom_last_log_idx);
+        }
+        return nullptr;
     }
 
 private:

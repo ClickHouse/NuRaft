@@ -923,7 +923,13 @@ void raft_server::reset_peer_info() {
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
     if (err) {
-        int32 peer_id = err->req()->get_dst();
+        ptr<req_msg> req = err->req();
+        if (!req) {
+            p_wn("peer response error without request: %s", err->what());
+            return;
+        }
+
+        int32 peer_id = req->get_dst();
         ptr<peer> pp = nullptr;
         auto entry = peers_.find(peer_id);
         if (entry != peers_.end()) pp = entry->second;
@@ -933,6 +939,12 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
             pp->inc_rpc_errs();
             rpc_errs = pp->get_rpc_errs();
 
+            if (req->get_type() == msg_type::install_snapshot_request) {
+                ptr<snapshot_sync_ctx> sync_ctx = pp->get_snapshot_sync_ctx();
+                if (sync_ctx) {
+                    sync_ctx->finish_async_snapshot_request();
+                }
+            }
             check_snapshot_timeout(pp);
         }
 
@@ -1572,12 +1584,29 @@ bool raft_server::request_leadership(int successor_id) {
 void raft_server::become_follower() {
     // stop hb for all peers
     p_in("[BECOME FOLLOWER] term %" PRIu64 "", state_->get_term());
+    ptr<raft_params> params = ctx_->get_params();
     {   std::lock_guard<std::recursive_mutex> ll(cli_lock_);
+        if (params->use_bg_thread_for_snapshot_io_) {
+            snapshot_io_mgr::instance().drop_reqs(this);
+        }
+
         for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
             it->second->enable_hb(false);
             it->second->reset_stream();
+            ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+            if ( sync_ctx &&
+                 sync_ctx->is_async_snapshot_transfer_started() ) {
+                clear_snapshot_sync_ctx(*it->second);
+            }
         }
 
+        if (srv_to_join_) {
+            ptr<snapshot_sync_ctx> sync_ctx = srv_to_join_->get_snapshot_sync_ctx();
+            if ( sync_ctx &&
+                 sync_ctx->is_async_snapshot_transfer_started() ) {
+                clear_snapshot_sync_ctx(*srv_to_join_);
+            }
+        }
         srv_to_join_.reset();
         role_ = srv_role::follower;
         index_at_becoming_leader_ = 0;
@@ -1594,7 +1623,6 @@ void raft_server::become_follower() {
         pre_vote_.quorum_reject_count_ = 0;
         pre_vote_.no_response_failure_count_ = 0;
 
-        ptr<raft_params> params = ctx_->get_params();
         if ( params->auto_adjust_quorum_for_small_cluster_ &&
              peers_.size() == 1 &&
              params->custom_commit_quorum_size_ == 1 ) {
@@ -1731,11 +1759,20 @@ void raft_server::handle_ext_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) 
 
 void raft_server::handle_ext_resp_err(rpc_exception& err) {
     ptr<req_msg> req = err.req();
+    if (!req) {
+        p_in("receive an rpc error response from peer server without request, %s",
+             err.what());
+        return;
+    }
     p_in( "receive an rpc error response from peer server, %s %d",
           err.what(), req->get_type() );
 
     if ( req->get_type() == msg_type::install_snapshot_request ) {
         if (srv_to_join_ && srv_to_join_->get_id() == req->get_dst()) {
+            ptr<snapshot_sync_ctx> sync_ctx = srv_to_join_->get_snapshot_sync_ctx();
+            if (sync_ctx) {
+                sync_ctx->finish_async_snapshot_request();
+            }
             bool timed_out = check_snapshot_timeout(srv_to_join_);
             if (!timed_out) {
                 // Enable temp HB to retry snapshot.

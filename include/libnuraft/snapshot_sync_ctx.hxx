@@ -27,6 +27,7 @@ limitations under the License.
 #include "pp_util.hxx"
 #include "ptr.hxx"
 
+#include <atomic>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -96,6 +97,12 @@ public:
 
     timer_helper& get_timer() { return timer_; }
 
+    bool begin_async_snapshot_request();
+    void finish_async_snapshot_request();
+    void finish_async_snapshot_transfer();
+    bool is_async_snapshot_request_in_progress() const;
+    bool is_async_snapshot_transfer_started() const;
+
 private:
     void io_thread_loop();
     bool begin_user_snp_ctx_io();
@@ -134,6 +141,9 @@ private:
     bool user_snp_ctx_io_active_ = false;
     bool user_snp_ctx_closed_ = false;
 
+    std::atomic<bool> async_snapshot_transfer_started_{false};
+    std::atomic<bool> async_snapshot_request_in_progress_{false};
+
     /**
      * Timer to check snapshot transfer timeout.
      */
@@ -156,8 +166,9 @@ public:
      * @param r Raft server instance.
      * @param p Peer instance.
      * @param h Response handler.
-     * @return `true` if a request was queued or already pending. `false` if no
-     *         safe current snapshot sync context and snapshot could be captured.
+     * @return `true` if a request was queued. `false` if another request is
+     *         already pending for this peer, or if a safe current snapshot
+     *         sync context and snapshot could not be captured.
      */
     bool push(ptr<raft_server> r,
               ptr<peer> p,
@@ -201,6 +212,7 @@ private:
     void async_io_loop();
 
     bool push(ptr<io_queue_elem>& elem);
+    void clear_dropped_request(ptr<io_queue_elem>& elem);
 
     /**
      * A dedicated thread for reading snapshot object.

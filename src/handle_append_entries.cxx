@@ -304,10 +304,20 @@ bool raft_server::request_append_entries(ptr<peer> p) {
     }
 
     if (params->use_bg_thread_for_snapshot_io_) {
+        ptr<snapshot_sync_ctx> sync_ctx = p->get_snapshot_sync_ctx();
+        if ( sync_ctx &&
+             sync_ctx->is_async_snapshot_request_in_progress() ) {
+            check_snapshot_timeout(p);
+            snapshot_io_mgr::instance().invoke();
+            return true;
+        }
+
         // Check the current queue if previous request exists.
         if (snapshot_io_mgr::instance().has_pending_request(this, p->get_id())) {
             p_tr( "previous snapshot request for peer %d already exists",
                   p->get_id() );
+            check_snapshot_timeout(p);
+            snapshot_io_mgr::instance().invoke();
             return true;
         }
     }
@@ -519,6 +529,16 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
          ", cur_nxt_idx: %" PRIu64 "\n",
          last_log_idx, starting_idx, cur_nxt_idx);
 
+    ptr<raft_params> params = ctx_->get_params();
+    ptr<snapshot_sync_ctx> active_sync_ctx = p.get_snapshot_sync_ctx();
+    ptr<snapshot> active_snp =
+        active_sync_ctx ? active_sync_ctx->get_snapshot() : nullptr;
+    const bool active_async_snapshot_transfer =
+        params->use_bg_thread_for_snapshot_io_ &&
+        active_sync_ctx &&
+        active_sync_ctx->is_async_snapshot_transfer_started() &&
+        active_snp;
+
     // Verify log index range.
     bool entries_valid = (last_log_idx + 1 >= starting_idx);
     if (entries_valid && pp->is_snapshot_sync_needed()) {
@@ -529,22 +549,26 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         // warning to the follower, blocking its election timer).
         ptr<snapshot> snp_local = get_last_snapshot();
         if (!snp_local || last_log_idx >= snp_local->get_last_log_idx()) {
-            // Either no snapshot exists (flag is stale — nothing to sync)
-            // or the peer has caught up past the snapshot. In both cases,
-            // clear the flag and proceed with normal log replication.
-            if (snp_local) {
-                p_in("peer %d log idx %" PRIu64 " has caught up past "
-                     "snapshot %" PRIu64 ", clearing stale snapshot sync "
-                     "flag before log replication",
-                     p.get_id(), last_log_idx,
-                     snp_local->get_last_log_idx());
+            if (active_async_snapshot_transfer) {
+                entries_valid = false;
             } else {
-                p_in("peer %d log idx %" PRIu64 ", no snapshot exists, "
-                     "clearing stale snapshot sync flag",
-                     p.get_id(), last_log_idx);
+                // Either no snapshot exists (flag is stale — nothing to sync)
+                // or the peer has caught up past the snapshot. In both cases,
+                // clear the flag and proceed with normal log replication.
+                if (snp_local) {
+                    p_in("peer %d log idx %" PRIu64 " has caught up past "
+                         "snapshot %" PRIu64 ", clearing stale snapshot sync "
+                         "flag before log replication",
+                         p.get_id(), last_log_idx,
+                         snp_local->get_last_log_idx());
+                } else {
+                    p_in("peer %d log idx %" PRIu64 ", no snapshot exists, "
+                         "clearing stale snapshot sync flag",
+                         p.get_id(), last_log_idx);
+                }
+                clear_snapshot_sync_ctx(p);
+                pp->set_snapshot_sync_is_needed(false);
             }
-            clear_snapshot_sync_ctx(p);
-            pp->set_snapshot_sync_is_needed(false);
         } else {
             entries_valid = false;
         }
@@ -553,7 +577,6 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     // Read log entries. The underlying log store may have removed some log entries
     // causing some of the requested entries to be unavailable. The log store should
     // return nullptr to indicate such errors.
-    ptr<raft_params> params = ctx_->get_params();
     ulong end_idx = std::min( cur_nxt_idx,
                               last_log_idx + 1 + params->max_append_size_ );
 
@@ -610,7 +633,8 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
         // Required log entries are missing. First, we try to use snapshot to recover.
         // To avoid inconsistency due to smart pointer, should have local varaible
         // to increase its ref count.
-        ptr<snapshot> snp_local = get_last_snapshot();
+        ptr<snapshot> snp_local =
+            active_async_snapshot_transfer ? active_snp : get_last_snapshot();
 
         // Modified by Jung-Sang Ahn (Oct 11 2017):
         // As `reserved_log` has been newly added, need to check snapshot
@@ -623,6 +647,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
             // snapshot sync anymore — clear the flag and fall through
             // to normal log replication or out-of-log-range handling.
             if ( last_log_idx >= snp_local->get_last_log_idx() &&
+                 !active_async_snapshot_transfer &&
                  pp->is_snapshot_sync_needed() ) {
                 p_in( "peer %d log idx %" PRIu64 " has caught up past "
                       "snapshot %" PRIu64 ", clearing snapshot sync flag",
