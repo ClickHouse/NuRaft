@@ -36,8 +36,6 @@ limitations under the License.
 
 #include "thread.hxx"
 
-class EventAwaiter;
-
 namespace nuraft {
 
 class peer;

@@ -18,9 +18,11 @@ limitations under the License.
 #include "buffer_serializer.hxx"
 #include "debugging_options.hxx"
 #include "in_memory_log_store.hxx"
+#include "peer.hxx"
 #include "raft_server_handler.hxx"
 #include "raft_package_asio.hxx"
 #include "asio_test_common.hxx"
+#include "snapshot_sync_ctx.hxx"
 
 #include "event_awaiter.hxx"
 #include "test_common.h"
