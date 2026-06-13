@@ -130,7 +130,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                           "current id %" PRIu64 ", from id %" PRIu64 ". "
                           "will ignore this response. "
                           "Currently, stale_resps: %d, response_limit: %d",
-                          config_->get_id(),
+                          get_id(),
                           cur_rpc_id,
                           my_rpc_client_id,
                           stale_resps,
@@ -139,7 +139,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
                           "will suppress it from now."
                           "Currently, stale_resps: %d, response_limit: %d",
-                          config_->get_id(),
+                          get_id(),
                           stale_resps,
                           limit );
                 }
@@ -189,7 +189,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 reset_stream();
                 if (last_streamed_log_idx) {
                     p_in("stop stream mode for peer %d at idx: %" PRIu64 "",
-                         config_->get_id(), last_streamed_log_idx);
+                         get_id(), last_streamed_log_idx);
                 }
                 reset_stale_rpc_responses();
                 reset_bytes_in_flight();
@@ -217,7 +217,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                           "returning error: current id %" PRIu64
                           ", from id %" PRIu64 ". "
                           "Currently, stale_resps: %d, response_limit: %d",
-                          config_->get_id(),
+                          get_id(),
                           cur_rpc_id,
                           my_rpc_client_id,
                           stale_resps,
@@ -226,7 +226,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                     p_wn( "[EDGE CASE] too verbose stale RPC response from peer %d, "
                           "will suppress it from now."
                           "Currently, stale_resps: %d, response_limit: %d",
-                          config_->get_id(),
+                          get_id(),
                           stale_resps,
                           limit );
                 }
@@ -337,7 +337,7 @@ void peer::reopen(context& ctx, timer_task<int32>::executor& hb_exec) {
     hb_task_ = cs_new< timer_task<int32>,
                             timer_task<int32>::executor&,
                             int32 >
-                          ( hb_exec, config_->get_id(),
+                          ( hb_exec, get_id(),
                             timer_task_type::heartbeat_timer ) ;
     p_tr("call peer %d reopen succeeded", get_id());
 }
