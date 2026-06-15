@@ -18,8 +18,11 @@ limitations under the License.
 #include "buffer_serializer.hxx"
 #include "debugging_options.hxx"
 #include "in_memory_log_store.hxx"
+#include "peer.hxx"
+#include "raft_server_handler.hxx"
 #include "raft_package_asio.hxx"
 #include "asio_test_common.hxx"
+#include "snapshot_sync_ctx.hxx"
 
 #include "event_awaiter.hxx"
 #include "test_common.h"
@@ -43,6 +46,36 @@ using namespace raft_functional_common;
 static bool flag_bg_snapshot_io = false;
 
 namespace asio_service_test {
+
+class AsioPeerInspector : public raft_server_handler
+{
+public:
+    static bool asyncSnapshotRequestInProgress(raft_server* srv, int32 peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it == peers.end())
+        {
+            return false;
+        }
+
+        ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+        return sync_ctx && sync_ctx->is_async_snapshot_request_in_progress();
+    }
+
+    static bool asyncSnapshotTransferStarted(raft_server* srv, int32 peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it == peers.end())
+        {
+            return false;
+        }
+
+        ptr<snapshot_sync_ctx> sync_ctx = it->second->get_snapshot_sync_ctx();
+        return sync_ctx && sync_ctx->is_async_snapshot_transfer_started();
+    }
+};
 
 int make_group_test() {
     reset_log_files();
@@ -1074,6 +1107,12 @@ int snapshot_read_failure_during_join_test(size_t log_sync_gap) {
 
     // Wait until S3 completes catch-up.
     wait_for_catch_up(s1, s3);
+    if (flag_bg_snapshot_io) {
+        CHK_FALSE( AsioPeerInspector::asyncSnapshotRequestInProgress(
+                       s1.raftServer.get(), 3) );
+        CHK_FALSE( AsioPeerInspector::asyncSnapshotTransferStarted(
+                       s1.raftServer.get(), 3) );
+    }
 
     // State machine should be identical.
     CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
@@ -1150,6 +1189,12 @@ int snapshot_read_failure_for_lagging_server_test(size_t num_failures) {
 
     // Wait until S3 completes catch-up.
     wait_for_catch_up(s1, s3);
+    if (flag_bg_snapshot_io) {
+        CHK_FALSE( AsioPeerInspector::asyncSnapshotRequestInProgress(
+                       s1.raftServer.get(), 3) );
+        CHK_FALSE( AsioPeerInspector::asyncSnapshotTransferStarted(
+                       s1.raftServer.get(), 3) );
+    }
 
     // State machine should be identical.
     CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
@@ -2142,4 +2187,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-

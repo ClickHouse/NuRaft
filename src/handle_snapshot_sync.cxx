@@ -64,6 +64,7 @@ void raft_server::destroy_user_snp_ctx(ptr<snapshot_sync_ctx> sync_ctx) {
 void raft_server::clear_snapshot_sync_ctx(peer& pp) {
     ptr<snapshot_sync_ctx> snp_ctx = pp.get_snapshot_sync_ctx();
     if (snp_ctx) {
+        snp_ctx->finish_async_snapshot_transfer();
         destroy_user_snp_ctx(snp_ctx);
         p_tr("destroy snapshot sync ctx %p", snp_ctx.get());
     }
@@ -94,11 +95,16 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
 
         if (sync_ctx->get_timer().timeout()) {
             p_in("previous sync_ctx %p timed out, reset it", sync_ctx.get());
-            destroy_user_snp_ctx(sync_ctx);
+            clear_snapshot_sync_ctx(p);
             sync_ctx.reset();
             snp.reset();
         }
     }
+
+    const bool async_snapshot_transfer_started =
+        params->use_bg_thread_for_snapshot_io_ &&
+        sync_ctx &&
+        sync_ctx->is_async_snapshot_transfer_started();
 
     // Modified by Jung-Sang Ahn, May 15 2018:
     //   Even though new snapshot has been created,
@@ -108,7 +114,10 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     // if ( !snp /*||
     //      ( last_snapshot_ &&
     //        last_snapshot_->get_last_log_idx() > snp->get_last_log_idx() )*/ ) {
-    if ( !snp || sync_ctx->get_offset() == 0 ) {
+    if ( !snp ||
+         ( sync_ctx &&
+           sync_ctx->get_offset() == 0 &&
+           !async_snapshot_transfer_started ) ) {
         snp = get_last_snapshot();
         if ( snp == nilptr ) {
             static timer_helper msg_timer(5000000);
@@ -163,15 +172,36 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     if (params->use_bg_thread_for_snapshot_io_) {
         // If async snapshot IO, push the snapshot read request to the manager
         // and immediately return here.
+        sync_ctx = p.get_snapshot_sync_ctx();
+        if (!sync_ctx)
+        {
+            return nullptr;
+        }
+
+        snp = sync_ctx->get_snapshot();
+        if (!snp)
+        {
+            return nullptr;
+        }
+
+        if (!sync_ctx->begin_async_snapshot_request())
+        {
+            succeeded_out = true;
+            snapshot_io_mgr::instance().invoke();
+            return nullptr;
+        }
+
         if (!snapshot_io_mgr::instance().push( this->shared_from_this(),
                                                pp,
                                                ( (pp == srv_to_join_)
                                                  ? ex_resp_handler_
                                                  : resp_handler_ ) ))
         {
+            clear_snapshot_sync_ctx(p);
             return nullptr;
         }
         succeeded_out = true;
+        snapshot_io_mgr::instance().invoke();
         return nullptr;
     }
     // Otherwise (sync snapshot IO), read the requested object here and then return.
@@ -403,6 +433,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
             } else {
                 p_db("continue to sync snapshot at offset %" PRIu64,
                      resp.get_next_idx());
+                sync_ctx->finish_async_snapshot_request();
                 sync_ctx->set_offset(resp.get_next_idx());
             }
         }
@@ -459,6 +490,12 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
         return;
     }
 
+    if (!resp.get_accepted()) {
+        clear_snapshot_sync_ctx(*srv_to_join_);
+        sync_log_to_new_srv(srv_to_join_->get_next_log_idx());
+        return;
+    }
+
     ptr<snapshot> snp = sync_ctx->get_snapshot();
     bool snp_install_done =
         ( snp->get_type() == snapshot::raw_binary &&
@@ -482,6 +519,7 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
               srv_to_join_->get_next_log_idx(),
               srv_to_join_->get_matched_idx() );
     } else {
+        sync_ctx->finish_async_snapshot_request();
         sync_ctx->set_offset(resp.get_next_idx());
         p_db( "continue to send snapshot to new server at offset %" PRIu64 "",
               resp.get_next_idx() );

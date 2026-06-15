@@ -83,6 +83,35 @@ void snapshot_sync_ctx::set_offset(ulong offset) {
     offset_ = offset;
 }
 
+bool snapshot_sync_ctx::begin_async_snapshot_request()
+{
+    async_snapshot_transfer_started_.store(true, std::memory_order_release);
+    bool expected = false;
+    return async_snapshot_request_in_progress_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void snapshot_sync_ctx::finish_async_snapshot_request()
+{
+    async_snapshot_request_in_progress_.store(false, std::memory_order_release);
+}
+
+void snapshot_sync_ctx::finish_async_snapshot_transfer()
+{
+    async_snapshot_request_in_progress_.store(false, std::memory_order_release);
+    async_snapshot_transfer_started_.store(false, std::memory_order_release);
+}
+
+bool snapshot_sync_ctx::is_async_snapshot_request_in_progress() const
+{
+    return async_snapshot_request_in_progress_.load(std::memory_order_acquire);
+}
+
+bool snapshot_sync_ctx::is_async_snapshot_transfer_started() const
+{
+    return async_snapshot_transfer_started_.load(std::memory_order_acquire);
+}
+
 bool snapshot_sync_ctx::begin_user_snp_ctx_io()
 {
     std::lock_guard<std::mutex> lock(user_snp_ctx_lock_);
@@ -272,26 +301,41 @@ bool snapshot_io_mgr::push(ptr<raft_server> r,
                                sync_ctx,
                                p,
                                h );
-    push(elem);
-    return true;
+    return push(elem);
 }
 
 void snapshot_io_mgr::invoke() {
     io_thread_ea_->invoke();
 }
 
+void snapshot_io_mgr::clear_dropped_request(ptr<io_queue_elem>& elem) {
+    if (elem->dst_->get_snapshot_sync_ctx() == elem->sync_ctx_) {
+        elem->raft_->clear_snapshot_sync_ctx(*elem->dst_);
+    } else {
+        elem->sync_ctx_->finish_async_snapshot_transfer();
+    }
+}
+
 void snapshot_io_mgr::drop_reqs(raft_server* r) {
-    auto_lock(queue_lock_);
-    logger* l_ = r->l_.get();
-    auto entry = queue_.begin();
-    while (entry != queue_.end()) {
-        if ((*entry)->raft_.get() == r) {
-            p_tr("drop snapshot request for peer %d, raft server %p",
-                 (*entry)->dst_->get_id(), r);
-            entry = queue_.erase(entry);
-        } else {
-            entry++;
+    std::list< ptr<io_queue_elem> > reqs_to_drop;
+    {
+        auto_lock(queue_lock_);
+        logger* l_ = r->l_.get();
+        auto entry = queue_.begin();
+        while (entry != queue_.end()) {
+            if ((*entry)->raft_.get() == r) {
+                p_tr("drop snapshot request for peer %d, raft server %p",
+                     (*entry)->dst_->get_id(), r);
+                reqs_to_drop.push_back(*entry);
+                entry = queue_.erase(entry);
+            } else {
+                entry++;
+            }
         }
+    }
+
+    for (auto& elem: reqs_to_drop) {
+        clear_dropped_request(elem);
     }
 }
 
@@ -311,6 +355,16 @@ void snapshot_io_mgr::shutdown() {
     if (io_thread_.joinable()) {
         io_thread_ea_->invoke();
         io_thread_.join();
+    }
+
+    std::list< ptr<io_queue_elem> > reqs_to_drop;
+    {
+        auto_lock(queue_lock_);
+        reqs_to_drop.splice(reqs_to_drop.end(), queue_);
+    }
+
+    for (auto& elem: reqs_to_drop) {
+        clear_dropped_request(elem);
     }
 }
 
@@ -334,11 +388,53 @@ void snapshot_io_mgr::async_io_loop() {
         }
 
         for (ptr<io_queue_elem>& elem: reqs) {
+            class async_snapshot_request_guard
+            {
+            public:
+                async_snapshot_request_guard(snapshot_io_mgr& owner, ptr<io_queue_elem> elem)
+                    : owner_(owner)
+                    , elem_(elem)
+                {
+                }
+
+                ~async_snapshot_request_guard()
+                {
+                    if (active_)
+                    {
+                        elem_->sync_ctx_->finish_async_snapshot_request();
+                    }
+                }
+
+                void disarm()
+                {
+                    active_ = false;
+                }
+
+                void clear_context_if_current()
+                {
+                    if (!active_)
+                    {
+                        return;
+                    }
+
+                    recur_lock(elem_->raft_->lock_);
+                    owner_.clear_dropped_request(elem_);
+                    active_ = false;
+                }
+
+            private:
+                snapshot_io_mgr& owner_;
+                ptr<io_queue_elem> elem_;
+                bool active_ = true;
+            } request_guard(*this, elem);
+
             if (terminating_) {
-                break;
+                request_guard.clear_context_if_current();
+                continue;
             }
             if (!elem->raft_->is_leader()) {
-                break;
+                request_guard.clear_context_if_current();
+                continue;
             }
 
             int dst_id = elem->dst_->get_id();
@@ -388,10 +484,17 @@ void snapshot_io_mgr::async_io_loop() {
                 recur_lock(elem->raft_->lock_);
                 auto entry = elem->raft_->peers_.find(dst_id);
                 if (entry != elem->raft_->peers_.end()) {
-                    // If normal member (already in the peer list):
-                    //   reset the `sync_ctx` so as to retry with the newer version.
-                    elem->raft_->clear_snapshot_sync_ctx(*elem->dst_);
-                } else if (elem->raft_->srv_to_join_.get()) {
+                    if (elem->dst_->get_snapshot_sync_ctx() == elem->sync_ctx_) {
+                        // If normal member (already in the peer list):
+                        //   reset the `sync_ctx` so as to retry with the newer version.
+                        elem->raft_->clear_snapshot_sync_ctx(*elem->dst_);
+                        request_guard.disarm();
+                    } else {
+                        request_guard.clear_context_if_current();
+                    }
+                } else if ( elem->raft_->srv_to_join_.get() &&
+                            elem->raft_->srv_to_join_ == elem->dst_ &&
+                            elem->dst_->get_snapshot_sync_ctx() == elem->sync_ctx_ ) {
                     // If it is joing the server (not in the peer list),
                     // enable HB temporarily to retry the request.
                     elem->raft_->srv_to_join_snp_retry_required_ = true;
@@ -402,6 +505,7 @@ void snapshot_io_mgr::async_io_loop() {
                     // Ignore it.
                     p_wn("stale snapshot request in queue for peer %d, ignore it",
                          dst_id);
+                    request_guard.clear_context_if_current();
                 }
 
                 continue;
@@ -410,6 +514,17 @@ void snapshot_io_mgr::async_io_loop() {
 
             // Send snapshot message with the given response handler.
             recur_lock(elem->raft_->lock_);
+            if ( terminating_ ||
+                 !elem->raft_->is_leader() ||
+                 elem->dst_->get_snapshot_sync_ctx() != elem->sync_ctx_ ) {
+                p_tr("drop stale snapshot request for peer %d after read, "
+                     "object %" PRIu64 ", snapshot idx %" PRIu64
+                     ", term %" PRIu64,
+                     dst_id, obj_idx, snp_log_idx, snp_log_term);
+                request_guard.clear_context_if_current();
+                continue;
+            }
+
             ulong term = elem->raft_->state_->get_term();
             ulong commit_idx = elem->raft_->quick_commit_index_;
 
@@ -433,10 +548,14 @@ void snapshot_io_mgr::async_io_loop() {
                 elem->dst_->send_req(elem->dst_, req, elem->handler_);
                 elem->dst_->reset_ls_timer();
                 p_tr("bg thread sent message to peer %d", dst_id);
+                if (elem->dst_->is_busy()) {
+                    request_guard.disarm();
+                }
 
             } else {
                 p_db("peer %d is busy, push the request back to queue", dst_id);
                 reqs_to_return.push_back(elem);
+                request_guard.disarm();
             }
         }
 

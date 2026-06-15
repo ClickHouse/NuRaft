@@ -1110,6 +1110,199 @@ int snapshot_stale_sync_flag_test() {
     return 0;
 }
 
+int snapshot_async_request_state_lifecycle_test() {
+    ptr<cluster_config> config = cs_new<cluster_config>();
+    ptr<snapshot> snp =
+        cs_new<snapshot>(10, 3, config, 0, snapshot::logical_object);
+    snapshot_sync_ctx sync_ctx(snp, 2, 1000);
+
+    CHK_FALSE( sync_ctx.is_async_snapshot_transfer_started() );
+    CHK_FALSE( sync_ctx.is_async_snapshot_request_in_progress() );
+
+    CHK_TRUE( sync_ctx.begin_async_snapshot_request() );
+    CHK_TRUE( sync_ctx.is_async_snapshot_transfer_started() );
+    CHK_TRUE( sync_ctx.is_async_snapshot_request_in_progress() );
+
+    CHK_FALSE( sync_ctx.begin_async_snapshot_request() );
+    CHK_TRUE( sync_ctx.is_async_snapshot_transfer_started() );
+    CHK_TRUE( sync_ctx.is_async_snapshot_request_in_progress() );
+
+    sync_ctx.finish_async_snapshot_request();
+    CHK_TRUE( sync_ctx.is_async_snapshot_transfer_started() );
+    CHK_FALSE( sync_ctx.is_async_snapshot_request_in_progress() );
+
+    CHK_TRUE( sync_ctx.begin_async_snapshot_request() );
+    sync_ctx.finish_async_snapshot_transfer();
+    CHK_FALSE( sync_ctx.is_async_snapshot_transfer_started() );
+    CHK_FALSE( sync_ctx.is_async_snapshot_request_in_progress() );
+
+    return 0;
+}
+
+int async_snapshot_does_not_reselect_snapshot_at_offset_zero_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs) {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        param.use_bg_thread_for_snapshot_io_ = true;
+        entry->raftServer->update_params(param);
+    }
+
+    for (size_t ii = 0; ii < 10; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< raft_result > ret = s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+    }
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    ptr<snapshot> original_snp =
+        s1.fNet->getLastSnapshot(s1.raftServer.get());
+    CHK_NONNULL( original_snp.get() );
+
+    ptr<snapshot> newer_snp =
+        cs_new<snapshot>( original_snp->get_last_log_idx() + 100,
+                          original_snp->get_last_log_term(),
+                          original_snp->get_last_config(),
+                          0,
+                          snapshot::logical_object );
+    s1.fNet->setLastSnapshot(s1.raftServer.get(), newer_snp);
+
+    s1.fNet->setPeerSnapshotInSync(s1.raftServer.get(), 3, original_snp);
+    s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 3, 1);
+    s1.fNet->beginPeerSnapshotAsyncRequest(s1.raftServer.get(), 3);
+
+    ptr<req_msg> req =
+        s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 3);
+    CHK_NULL( req.get() );
+
+    CHK_EQ( original_snp->get_last_log_idx(),
+            s1.fNet->getPeerSnapshotSyncCtxLastLogIdx(
+                s1.raftServer.get(), 3) );
+    CHK_TRUE( s1.fNet->getPeerAsyncSnapshotRequestInProgress(
+                  s1.raftServer.get(), 3) );
+    CHK_TRUE( s1.fNet->getPeerAsyncSnapshotTransferStarted(
+                  s1.raftServer.get(), 3) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+
+    f_base->destroy();
+    return 0;
+}
+
+int active_async_snapshot_context_not_cleared_by_caught_up_branch_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs) {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        param.use_bg_thread_for_snapshot_io_ = true;
+        entry->raftServer->update_params(param);
+    }
+
+    for (size_t ii = 0; ii < 10; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< raft_result > ret = s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+    }
+    for (int ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    ptr<snapshot> leader_snp =
+        s1.fNet->getLastSnapshot(s1.raftServer.get());
+    CHK_NONNULL( leader_snp.get() );
+
+    s1.fNet->setPeerSnapshotInSync(s1.raftServer.get(), 3, leader_snp);
+    s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
+    s1.fNet->setPeerNextLogIdx(
+        s1.raftServer.get(), 3, leader_snp->get_last_log_idx() + 1);
+    s1.fNet->beginPeerSnapshotAsyncRequest(s1.raftServer.get(), 3);
+
+    ptr<req_msg> active_req =
+        s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 3);
+    CHK_NULL( active_req.get() );
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(
+                  s1.raftServer.get(), 3) );
+    CHK_TRUE( s1.fNet->getPeerAsyncSnapshotTransferStarted(
+                  s1.raftServer.get(), 3) );
+
+    s1.fNet->setPeerSnapshotInSync(s1.raftServer.get(), 3, leader_snp);
+    s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
+    s1.fNet->setPeerNextLogIdx(
+        s1.raftServer.get(), 3, leader_snp->get_last_log_idx() + 1);
+
+    ptr<req_msg> stale_req =
+        s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 3);
+    (void)stale_req;
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(
+                   s1.raftServer.get(), 3) );
+    CHK_FALSE( s1.fNet->getPeerSnapshotSyncNeeded(
+                   s1.raftServer.get(), 3) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+
+    f_base->destroy();
+    return 0;
+}
+
 // Test for Fix 1: create_sync_snapshot_req handles null snapshot
 // gracefully instead of calling system_exit/abort.
 //
@@ -2220,6 +2413,12 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot stale sync flag test",
                snapshot_stale_sync_flag_test );
+    ts.doTest( "snapshot async request state lifecycle test",
+               snapshot_async_request_state_lifecycle_test );
+    ts.doTest( "async snapshot does not reselect snapshot at offset zero test",
+               async_snapshot_does_not_reselect_snapshot_at_offset_zero_test );
+    ts.doTest( "active async snapshot context not cleared by caught up branch test",
+               active_async_snapshot_context_not_cleared_by_caught_up_branch_test );
 
     ts.doTest( "snapshot null snapshot join test",
                snapshot_null_snapshot_join_test );
