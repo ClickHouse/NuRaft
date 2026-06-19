@@ -116,7 +116,9 @@ public:
      *         given by the batch_size_hint_in_bytes.
      */
     virtual ptr<std::vector<ptr<log_entry>>> log_entries_ext(
-            ulong start, ulong end, int64 batch_size_hint_in_bytes = 0) {
+            ulong start, ulong end, int64 batch_size_hint_in_bytes = 0,
+            int32 peer_id = -1) {  /// NO_PEER_ID sentinel; default forwards to current behaviour
+        (void)peer_id;
         return log_entries(start, end);
     }
 
