@@ -265,7 +265,7 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms, bool initial_commit_exec)
         p_tr( "commit upto %" PRIu64 ", current idx %" PRIu64 "\n",
               quick_commit_index_.load(), index_to_commit );
 
-        ptr<log_entry> le = log_store_->entry_at(index_to_commit);
+        ptr<log_entry> le = log_store_->entry_at_ext(index_to_commit, true);
         if (!le)
         {
             // LCOV_EXCL_START

@@ -123,6 +123,23 @@ public:
     }
 
     /**
+     * (Optional)
+     * Get the log entry at the specified log index number, with a hint
+     * whether the caller is the commit thread.
+     *
+     * The default implementation forwards to `entry_at`.
+     *
+     * @param index Should be equal to or greater than 1.
+     * @param for_commit `true` if invoked by the state machine commit loop,
+     *        which reads entries strictly sequentially.
+     * @return The log entry or null if index >= this->next_slot().
+     */
+    virtual ptr<log_entry> entry_at_ext(ulong index, bool for_commit = false) {
+        (void)for_commit;
+        return entry_at(index);
+    }
+
+    /**
      * Get the log entry at the specified log index number.
      *
      * @param index Should be equal to or greater than 1.
