@@ -150,7 +150,17 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 //   it may free the peer even though new RPC client is already created.
                 reset_stale_rpc_responses();
                 bytes_in_flight_sub(req_size_bytes);
-                try_set_free(req->get_type(), streaming);
+                if (req->get_type() == msg_type::append_entries_request && !streaming) {
+                    // This is exactly the case where `try_set_free()` would
+                    // free the peer immediately below. Instead, defer it
+                    // until `raft_server::handle_append_entries_resp()` has
+                    // updated `next_log_idx_`/`matched_idx_` from this
+                    // response (see the comment on `deferred_free_` in
+                    // peer.hxx).
+                    mark_deferred_free();
+                } else {
+                    try_set_free(req->get_type(), streaming);
+                }
             }
         }
 
@@ -161,7 +171,19 @@ void peer::handle_rpc_result( ptr<peer> myself,
         }
         ptr<rpc_exception> no_except;
         resp->set_peer(myself);
-        pending_result->set_result(resp, no_except);
+        try {
+            pending_result->set_result(resp, no_except);
+        } catch (...) {
+            // Safety net: never leave a deferred busy flag set if the
+            // handler throws before consuming it.
+            consume_deferred_free();
+            throw;
+        }
+        // Safety net for response types / early-return paths in
+        // `raft_server::handle_append_entries_resp()` that never reach
+        // their own `consume_deferred_free()` call. No-op if the flag
+        // was already consumed there, which is the common case.
+        consume_deferred_free();
 
         reconn_backoff_.reset();
         reconn_backoff_.set_duration_ms(1);
