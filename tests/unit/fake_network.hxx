@@ -246,12 +246,30 @@ public:
 
     void setPeerSnapshotInSync(raft_server* srv,
                                int32 peer_id,
-                               ptr<snapshot> snp) {
+                               ptr<snapshot> snp,
+                               ulong timeout_ms = 10 * 1000) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);
         if (it != peers.end()) {
-            it->second->set_snapshot_in_sync(snp);
+            it->second->set_snapshot_in_sync(snp, timeout_ms);
         }
+    }
+
+    /**
+     * Run the real snapshot-install timeout check, so a test can reach the
+     * post-timeout state through production code instead of emulating it.
+     */
+    bool checkPeerSnapshotTimeout(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return check_snapshot_timeout(srv, it->second);
+        }
+        return false;
+    }
+
+    ulong getPrecommitIndex(raft_server* srv) {
+        return get_precommit_index(srv);
     }
 
     ulong getPeerSnapshotSyncCtxLastLogIdx(raft_server* srv, int32 peer_id) {

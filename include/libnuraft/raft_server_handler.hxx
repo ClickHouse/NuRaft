@@ -82,6 +82,20 @@ protected:
                                                   ulong custom_last_log_idx = 0) {
         return srv->create_append_entries_req(pp, custom_last_log_idx);
     }
+
+    /**
+     * Run the snapshot-install timeout check on a peer (for testing).
+     */
+    static bool check_snapshot_timeout(raft_server* srv, ptr<peer>& pp) {
+        return srv->check_snapshot_timeout(pp);
+    }
+
+    /**
+     * Get the pre-commit index of a raft_server (for testing).
+     */
+    static ulong get_precommit_index(raft_server* srv) {
+        return srv->precommit_index_;
+    }
 };
 
 }
