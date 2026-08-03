@@ -1582,6 +1582,10 @@ bool raft_server::request_leadership(int successor_id) {
 }
 
 void raft_server::apply_full_consensus_mode(bool enable) {
+    // Lock is needed to make the read-modify-write of the parameters atomic
+    // against other writers (e.g. quorum auto-adjustment or recovery mode),
+    // otherwise a concurrent change could be clobbered by the stale clone.
+    recur_lock(lock_);
     ptr<raft_params> params = ctx_->get_params();
     if (params->use_full_consensus_among_healthy_members_ == enable) {
         p_in("full consensus mode is already %s", enable ? "ON" : "OFF");
@@ -1619,6 +1623,12 @@ void raft_server::broadcast_full_consensus_mode(bool enable) {
         req->log_entries().push_back(custom_noti_le);
 
         if (pp->make_busy()) {
+            // NOTE: The response will go through
+            //       `handle_custom_notification_resp`, which updates the
+            //       peer's next log index. If `max_log_gap_in_stream_` is
+            //       set, this may interleave with in-flight streamed
+            //       append entries requests and cause a harmless
+            //       resend of a few log entries.
             pp->send_req(pp, req, resp_handler_);
         } else {
             // Best-effort propagation: the peer will keep its old mode.

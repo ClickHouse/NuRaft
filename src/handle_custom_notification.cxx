@@ -302,6 +302,17 @@ ptr<resp_msg> raft_server::handle_full_consensus_mode_request
         return resp;
     }
 
+    if (req.get_term() < state_->get_term()) {
+        // A request with a stale term may come from a leader that
+        // has not yet found out that it was deposed. Ignoring it also
+        // prevents two servers believing they are leaders from
+        // re-broadcasting the mode to each other in a loop.
+        p_wn("[FULL CONSENSUS MODE] got request from peer %d "
+             "with stale term %" PRIu64 ", my term %" PRIu64 ", ignore it",
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     ptr<full_consensus_mode_msg> fc_msg =
         full_consensus_mode_msg::deserialize(*msg->ctx_);
 
