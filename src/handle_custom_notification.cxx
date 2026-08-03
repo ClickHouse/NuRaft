@@ -136,6 +136,33 @@ ptr<buffer> force_vote_msg::serialize() const {
 }
 
 
+// --- full_consensus_mode_msg ---
+
+ptr<full_consensus_mode_msg> full_consensus_mode_msg::deserialize(buffer& buf) {
+    ptr<full_consensus_mode_msg> ret = cs_new<full_consensus_mode_msg>();
+    buffer_serializer bs(buf);
+    uint8_t version = bs.get_u8();
+    (void)version;
+    ret->enable_ = bs.get_u8() != 0;
+    return ret;
+}
+
+ptr<buffer> full_consensus_mode_msg::serialize() const {
+    //   << Format >>
+    // version                      1 byte
+    // enable flag                  1 byte
+
+    size_t len = sizeof(uint8_t) + sizeof(uint8_t);
+    ptr<buffer> ret = buffer::alloc(len);
+
+    const uint8_t CURRENT_VERSION = 0x0;
+    buffer_serializer bs(ret);
+    bs.put_u8(CURRENT_VERSION);
+    bs.put_u8(enable_ ? 1 : 0);
+    return ret;
+}
+
+
 // --- handlers ---
 
 ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
@@ -170,6 +197,9 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     }
     case custom_notification_msg::request_leadership: {
         return handle_request_leadership_request(req, msg, resp);
+    }
+    case custom_notification_msg::set_full_consensus_mode: {
+        return handle_full_consensus_mode_request(req, msg, resp);
     }
     default:
         break;
@@ -257,6 +287,46 @@ ptr<resp_msg> raft_server::handle_request_leadership_request
     p_in("[REQUEST LEADER REQUEST] got request");
 
     request_leadership();
+
+    return resp;
+}
+
+ptr<resp_msg> raft_server::handle_full_consensus_mode_request
+                           ( req_msg& req,
+                             ptr<custom_notification_msg> msg,
+                             ptr<resp_msg> resp )
+{
+    if (!msg->ctx_) {
+        p_er("[FULL CONSENSUS MODE] got request from peer %d "
+             "without context", req.get_src());
+        return resp;
+    }
+
+    ptr<full_consensus_mode_msg> fc_msg =
+        full_consensus_mode_msg::deserialize(*msg->ctx_);
+
+    if (is_leader()) {
+        // A follower asks this leader to change the mode:
+        // apply it and propagate to all peers.
+        p_in("[FULL CONSENSUS MODE] got request from peer %d "
+             "to turn full consensus mode %s",
+             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
+        apply_full_consensus_mode(fc_msg->enable_);
+        broadcast_full_consensus_mode(fc_msg->enable_);
+
+    } else if (req.get_src() == leader_) {
+        // Propagation from the current leader: apply locally.
+        p_in("[FULL CONSENSUS MODE] leader %d turned "
+             "full consensus mode %s",
+             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
+        apply_full_consensus_mode(fc_msg->enable_);
+
+    } else {
+        p_wn("[FULL CONSENSUS MODE] got request from peer %d, "
+             "but this node is not a leader and the request is not "
+             "from the current leader %d",
+             req.get_src(), leader_.load());
+    }
 
     return resp;
 }

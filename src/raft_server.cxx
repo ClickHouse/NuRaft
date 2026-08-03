@@ -1581,6 +1581,124 @@ bool raft_server::request_leadership(int successor_id) {
     }
 }
 
+void raft_server::apply_full_consensus_mode(bool enable) {
+    ptr<raft_params> params = ctx_->get_params();
+    if (params->use_full_consensus_among_healthy_members_ == enable) {
+        p_in("full consensus mode is already %s", enable ? "ON" : "OFF");
+        return;
+    }
+    raft_params clone = *params;
+    clone.use_full_consensus_among_healthy_members_ = enable;
+    update_params(clone);
+}
+
+void raft_server::broadcast_full_consensus_mode(bool enable) {
+    recur_lock(lock_);
+    for (auto& entry: peers_) {
+        ptr<peer> pp = entry.second;
+
+        ptr<req_msg> req = cs_new<req_msg>
+                           ( state_->get_term(),
+                             msg_type::custom_notification_request,
+                             id_, pp->get_id(),
+                             term_for_log(log_store_->next_slot() - 1),
+                             log_store_->next_slot() - 1,
+                             quick_commit_index_.load() );
+
+        ptr<full_consensus_mode_msg> fc_msg =
+            cs_new<full_consensus_mode_msg>(enable);
+
+        ptr<custom_notification_msg> custom_noti =
+            cs_new<custom_notification_msg>
+            ( custom_notification_msg::set_full_consensus_mode );
+        custom_noti->ctx_ = fc_msg->serialize();
+
+        ptr<log_entry> custom_noti_le =
+            cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+        req->log_entries().push_back(custom_noti_le);
+
+        if (pp->make_busy()) {
+            pp->send_req(pp, req, resp_handler_);
+        } else {
+            // Best-effort propagation: the peer will keep its old mode.
+            // Users should verify the mode on each node.
+            p_wn("cannot propagate full consensus mode to peer %d, "
+                 "peer is busy", pp->get_id());
+        }
+    }
+}
+
+bool raft_server::request_full_consensus_mode(bool enable) {
+    if (leader_ == id_) {
+        p_in("turning full consensus mode %s", enable ? "ON" : "OFF");
+        apply_full_consensus_mode(enable);
+        broadcast_full_consensus_mode(enable);
+        return true;
+    }
+
+    if (leader_ == -1) {
+        p_er("cannot request full consensus mode: cannot find leader");
+        return false;
+    }
+
+    // Send the request to the current leader.
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( state_->get_term(),
+                         msg_type::custom_notification_request,
+                         id_, leader_,
+                         term_for_log(log_store_->next_slot() - 1),
+                         log_store_->next_slot() - 1,
+                         quick_commit_index_.load() );
+
+    ptr<full_consensus_mode_msg> fc_msg =
+        cs_new<full_consensus_mode_msg>(enable);
+
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::set_full_consensus_mode );
+    custom_noti->ctx_ = fc_msg->serialize();
+
+    // Wrap it using log_entry.
+    ptr<log_entry> custom_noti_le =
+        cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+    req->log_entries().push_back(custom_noti_le);
+
+    recur_lock(lock_);
+    auto entry = peers_.find(leader_);
+    if (entry == peers_.end()) {
+        p_er("cannot request full consensus mode: cannot find peer for "
+             "leader id %d", leader_.load());
+        return false;
+    }
+
+    ptr<peer> pp = entry->second;
+    if (pp->need_to_reconnect()) {
+        p_in("need to reconnect to peer %d", leader_.load());
+        ptr<srv_config> s_conf = get_config()->get_server(leader_);
+        if (!s_conf) {
+            p_wn("can't reconnect to peer %d: config not found",
+                 leader_.load());
+            return false;
+        }
+        if (!pp->recreate_rpc(s_conf, *ctx_)) {
+            p_wn("reconnection to peer %d failed", leader_.load());
+            return false;
+        }
+    }
+
+    if (pp->make_busy()) {
+        p_in("requesting full consensus mode %s from leader %d",
+             enable ? "ON" : "OFF", leader_.load());
+        pp->send_req(pp, req, resp_handler_);
+        return true;
+    } else {
+        p_in("cannot request full consensus mode, leader is busy");
+        return false;
+    }
+}
+
 void raft_server::become_follower() {
     // stop hb for all peers
     p_in("[BECOME FOLLOWER] term %" PRIu64 "", state_->get_term());
