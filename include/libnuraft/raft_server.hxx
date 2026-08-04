@@ -1080,7 +1080,8 @@ protected:
                                         int32_t resp_elapsed_ms,
                                         int32_t expiry,
                                         uint64_t required_log_idx,
-                                        bool include_self_mark_down = true);
+                                        bool include_self_mark_down = true,
+                                        int32_t lagging_grace_period = 0);
 
     void for_each_voting_members(
         const std::function<void(const ptr<peer>&, int32_t)>& callback);

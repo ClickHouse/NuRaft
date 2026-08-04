@@ -745,7 +745,8 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
             quick_commit_index_ > (uint64_t)params->max_append_size_
             ? quick_commit_index_ - params->max_append_size_ : 0;
         if (is_excluded_from_quorum(p, last_resp_time_ms, expiry, required_log_idx,
-                                    /* include_self_mark_down = */ false)) {
+                                    /* include_self_mark_down = */ false,
+                                    params->full_consensus_lagging_member_grace_period_)) {
             req->set_extra_flags(
                 req->get_extra_flags() | req_msg::EXCLUDED_FROM_THE_QUORUM);
         }

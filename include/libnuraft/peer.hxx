@@ -64,6 +64,7 @@ public:
                             timer_task_type::heartbeat_timer ) )
         , snp_sync_ctx_(nullptr)
         , lock_()
+        , failing_to_sync_(false)
         , long_pause_warnings_(0)
         , network_recoveries_(0)
         , manual_free_(false)
@@ -271,6 +272,20 @@ public:
     // Time of the last network activity from peer (including failure).
     void reset_active_timer()       { last_active_timer_.reset(); }
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
+
+    // How long this peer has been failing to sync, for full consensus mode.
+    // The timer starts on the transition into the failing state, so that
+    // repeated evaluations of the same state do not extend the grace period.
+    void set_failing_to_sync() const {
+        if (!failing_to_sync_.exchange(true)) {
+            failing_to_sync_timer_.reset();
+        }
+    }
+    void clear_failing_to_sync() const  { failing_to_sync_ = false; }
+    bool is_failing_to_sync() const     { return failing_to_sync_; }
+    uint64_t get_failing_to_sync_ms() const {
+        return failing_to_sync_timer_.get_ms();
+    }
 
     void reset_long_pause_warnings()    { long_pause_warnings_ = 0; }
     void inc_long_pause_warnings()      { long_pause_warnings_.fetch_add(1); }
@@ -544,6 +559,19 @@ private:
      * Timestamp when the last active network activity was detected.
      */
     timer_helper last_active_timer_;
+
+    /**
+     * `true` if this peer is alive but failing to sync (lagging behind the
+     * committed log index or receiving a snapshot), for full consensus mode.
+     * Mutable, as it is maintained by the quorum evaluation, which does not
+     * otherwise modify the peer.
+     */
+    mutable std::atomic<bool> failing_to_sync_;
+
+    /**
+     * Timestamp when this peer started failing to sync.
+     */
+    mutable timer_helper failing_to_sync_timer_;
 
     /**
      * Counter of long pause warnings.

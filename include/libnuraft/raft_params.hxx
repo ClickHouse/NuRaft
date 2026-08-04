@@ -100,6 +100,7 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
+        , full_consensus_lagging_member_grace_period_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -662,6 +663,31 @@ public:
      * from the leader for a configured time (`full_consensus_follower_limit_`).
      */
     bool use_full_consensus_among_healthy_members_;
+
+    /**
+     * (Experimental)
+     * Grace period, in millisecond, that the leader gives to a member that
+     * is alive but failing to sync, before excluding it from the quorum of
+     * full consensus (`use_full_consensus_among_healthy_members_`).
+     *
+     * A member is failing to sync if its matched log index is behind the
+     * committed log index by more than `max_append_size_`, or if it is
+     * receiving a snapshot. Such a member is still required to acknowledge
+     * a log for this amount of time, which throttles the commit rate down
+     * to the rate that member can sustain, and thus gives it a chance to
+     * catch up instead of falling further behind.
+     *
+     * A member that does not respond at all for `full_consensus_leader_limit_`
+     * is excluded immediately regardless of this option, as it cannot catch
+     * up while it is down.
+     *
+     *   - If `0`, a member failing to sync is excluded immediately.
+     *   - If positive, it is excluded after failing to sync for that long.
+     *   - If negative, it is never excluded, and commits are blocked until
+     *     it catches up. Use with care: a member that never recovers blocks
+     *     the cluster until this option is changed.
+     */
+    int32 full_consensus_lagging_member_grace_period_;
 
     /**
      * (Experimental)

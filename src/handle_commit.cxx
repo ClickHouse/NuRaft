@@ -619,7 +619,9 @@ uint64_t raft_server::find_sm_commit_idx_to_notify() {
     for (auto& pp: peers_) {
         uint64_t last_resp_time_ms = pp.second->get_resp_timer_us() / 1000;
         if (is_excluded_from_quorum(*pp.second, last_resp_time_ms,
-                                    expiry, required_log_idx)) {
+                                    expiry, required_log_idx,
+                                    /* include_self_mark_down = */ true,
+                                    params->full_consensus_lagging_member_grace_period_)) {
             continue;
         }
         if (pp.second->get_sm_committed_idx() == 0) {
