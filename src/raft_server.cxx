@@ -386,6 +386,13 @@ void raft_server::update_params(const raft_params& new_params) {
     }
 }
 
+void raft_server::modify_params(const std::function<void(raft_params&)>& modifier) {
+    recur_lock(lock_);
+    raft_params clone = *ctx_->get_params();
+    modifier(clone);
+    update_params(clone);
+}
+
 void raft_server::apply_and_log_current_params() {
     ptr<raft_params> params = ctx_->get_params();
 
@@ -687,29 +694,36 @@ bool raft_server::is_excluded_from_quorum(const peer& pp,
             //       given, i.e. only for full consensus mode, so that the
             //       evaluations that do not care about it (e.g. leadership
             //       validity check) do not reset the grace period.
-            if ( ( pp.get_matched_idx() &&
-                   pp.get_matched_idx() < required_log_idx ) ||
-                 pp.get_snapshot_sync_ctx().get() ) {
+            //
+            // WARNING: Should make exception for matched_idx = 0,
+            //          which means the peer has not responded yet right
+            //          after the new connection.
+            //
+            // WARNING: member receiving snapshot may have matched_idx = 0.
+            bool failing_to_sync =
+                ( pp.get_matched_idx() &&
+                  pp.get_matched_idx() < required_log_idx ) ||
+                pp.get_snapshot_sync_ctx().get();
+
+            if (!lagging_grace_period) {
+                // No grace period: a peer failing to sync is excluded right
+                // away, and the failing-to-sync state is not maintained at all.
+                excluded = failing_to_sync;
+
+            } else if (failing_to_sync) {
                 // The peer is alive, but failing to sync: either its matched
                 // index is behind the required log index, or it is receiving
-                // a snapshot.
-                //
-                // WARNING: Should make exception for matched_idx = 0,
-                //          which means the peer has not responded yet right
-                //          after the new connection.
-                //
-                // WARNING: member receiving snapshot may have matched_idx = 0.
-                pp.set_failing_to_sync();
-
-                // Such a peer is still required to acknowledge a log for the
-                // grace period, to throttle the commit rate down to the rate
-                // it can sustain and let it catch up. A negative grace period
-                // means it is required indefinitely.
-                if ( lagging_grace_period >= 0 &&
-                     pp.get_failing_to_sync_ms() >
+                // a snapshot. It is still required to acknowledge a log for
+                // the grace period, to throttle the commit rate down to the
+                // rate it can sustain and let it catch up. A negative grace
+                // period means it is required indefinitely.
+                pp.set_failing_to_sync(lagging_grace_period);
+                if ( lagging_grace_period > 0 &&
+                     pp.get_failing_to_sync_ms() >=
                          (uint64_t)lagging_grace_period ) {
                     excluded = true;
                 }
+
             } else {
                 pp.clear_failing_to_sync();
             }
@@ -723,9 +737,16 @@ bool raft_server::is_excluded_from_quorum(const peer& pp,
     } else {
         // The peer does not respond at all: it cannot catch up while it is
         // down, so the grace period does not apply and it is excluded right
-        // away. The failing-to-sync state is left as is, so that a peer that
-        // was already failing to sync before going down does not get a fresh
-        // grace period when it comes back still behind.
+        // away.
+        //
+        // The grace period starts here as well, so that a peer that comes
+        // back after being down longer than the grace period does not hold
+        // the commit while it catches up: it already had its chance, and the
+        // catch-up of a peer that was down long enough to need a snapshot is
+        // exactly the case where blocking every write would hurt the most.
+        if (required_log_idx && lagging_grace_period) {
+            pp.set_failing_to_sync(lagging_grace_period);
+        }
         excluded = true;
     }
     return excluded;
@@ -745,8 +766,13 @@ size_t raft_server::get_not_responding_peers_count(
     int32_t lagging_grace_period =
         params->full_consensus_lagging_member_grace_period_;
 
+    // Rate limited, as this runs on every commit attempt.
+    static timer_helper held_commit_msg_timer(5000000);
+    bool report_held_commit =
+        lagging_grace_period && held_commit_msg_timer.timeout_and_reset();
+
     size_t num_not_resp_nodes = 0;
-    auto cb = [&num_not_resp_nodes, required_log_idx, expiry, lagging_grace_period]
+    auto cb = [&, required_log_idx, expiry, lagging_grace_period]
         (const ptr<peer>& pp, int32_t resp_elapsed_ms)
     {
         bool non_responding_peer =
@@ -756,6 +782,23 @@ size_t raft_server::get_not_responding_peers_count(
 
         if (non_responding_peer) {
             ++num_not_resp_nodes;
+        }
+
+        if (report_held_commit && pp->is_failing_to_sync()) {
+            // This is the only place that can name the member the commit is
+            // waiting for, so say it out loud: an operator seeing writes time
+            // out has no other way to find out why.
+            uint64_t failing_ms = pp->get_failing_to_sync_ms();
+            p_wn("peer %d is failing to sync for %" PRIu64 " ms: "
+                 "matched index %" PRIu64 ", required %" PRIu64 ", "
+                 "receiving snapshot %s, grace period %d ms, %s",
+                 pp->get_id(), failing_ms,
+                 pp->get_matched_idx(), required_log_idx,
+                 pp->get_snapshot_sync_ctx() ? "YES" : "NO",
+                 lagging_grace_period,
+                 non_responding_peer
+                     ? "excluded from the quorum of full consensus"
+                     : "commits are held until it catches up");
         }
     };
     for_each_voting_members(cb);
@@ -1214,6 +1257,10 @@ void raft_server::become_leader() {
             pp->set_next_log_idx(log_store_->next_slot());
             pp->set_next_log_idx_floor(0);
             pp->reset_stream();
+            // This server did not track the peers as a follower, so anything
+            // it knows about them failing to sync is stale: give each of them
+            // a full grace period under this leadership.
+            pp->reset_failing_to_sync();
             enable_hb_for_peer(*pp);
             pp->set_recovered();
             pp->set_snapshot_sync_is_needed(false);
@@ -1612,18 +1659,26 @@ bool raft_server::request_leadership(int successor_id) {
 }
 
 void raft_server::apply_full_consensus_mode(bool enable) {
-    // Lock is needed to make the read-modify-write of the parameters atomic
+    // `modify_params` makes the read-modify-write of the parameters atomic
     // against other writers (e.g. quorum auto-adjustment or recovery mode),
     // otherwise a concurrent change could be clobbered by the stale clone.
     recur_lock(lock_);
-    ptr<raft_params> params = ctx_->get_params();
-    if (params->use_full_consensus_among_healthy_members_ == enable) {
+    if ( ctx_->get_params()->use_full_consensus_among_healthy_members_ ==
+         enable ) {
         p_in("full consensus mode is already %s", enable ? "ON" : "OFF");
         return;
     }
-    raft_params clone = *params;
-    clone.use_full_consensus_among_healthy_members_ = enable;
-    update_params(clone);
+    modify_params([enable](raft_params& params) {
+        params.use_full_consensus_among_healthy_members_ = enable;
+    });
+
+    // The failing-to-sync state was observed under the previous mode, where
+    // the commit index moves by different rules, so it says nothing about the
+    // new one. Without this, turning the mode off and on again would find a
+    // long-expired timer and exclude a member without any grace period.
+    for (auto& entry: peers_) {
+        entry.second->reset_failing_to_sync();
+    }
 }
 
 void raft_server::broadcast_full_consensus_mode(bool enable) {
@@ -1670,7 +1725,11 @@ void raft_server::broadcast_full_consensus_mode(bool enable) {
 }
 
 bool raft_server::request_full_consensus_mode(bool enable) {
-    if (leader_ == id_) {
+    // NOTE: `is_leader()` rather than `leader_ == id_`: `become_follower` does
+    //       not reset `leader_`, so a just deposed leader would otherwise
+    //       apply the mode locally and broadcast a notification that every
+    //       peer rejects, leaving itself permanently divergent.
+    if (is_leader()) {
         p_in("turning full consensus mode %s", enable ? "ON" : "OFF");
         apply_full_consensus_mode(enable);
         broadcast_full_consensus_mode(enable);

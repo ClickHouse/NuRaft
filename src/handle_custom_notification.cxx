@@ -313,6 +313,11 @@ ptr<resp_msg> raft_server::handle_full_consensus_mode_request
         return resp;
     }
 
+    // A newer term is proof that this node is behind, and that it is not the
+    // leader anymore if it thought it was. Step down before doing anything
+    // else, as a deposed leader must not re-broadcast with its stale term.
+    update_term(req.get_term());
+
     ptr<full_consensus_mode_msg> fc_msg =
         full_consensus_mode_msg::deserialize(*msg->ctx_);
 
@@ -325,8 +330,14 @@ ptr<resp_msg> raft_server::handle_full_consensus_mode_request
         apply_full_consensus_mode(fc_msg->enable_);
         broadcast_full_consensus_mode(fc_msg->enable_);
 
-    } else if (req.get_src() == leader_) {
+    } else if (req.get_src() == leader_ || leader_ == -1) {
         // Propagation from the current leader: apply locally.
+        //
+        // NOTE: `leader_ == -1` is accepted as well, otherwise every
+        //       propagation that races with a leader change would be dropped,
+        //       and the mode would systematically diverge right after every
+        //       election. The term was checked above, and there is at most
+        //       one leader per term.
         p_in("[FULL CONSENSUS MODE] leader %d turned "
              "full consensus mode %s",
              req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
@@ -353,8 +364,17 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     }
     ptr<peer> p = it->second;
 
-    p->set_next_log_idx(resp.get_next_idx());
-    p->reset_cnt_backward_log_probe();
+    // NOTE: Only move the next log index forward. A custom notification is not
+    //       a log replication request, and its response carries the peer's
+    //       current `next_slot`, which is behind the leader's view while the
+    //       peer is catching up or receiving a snapshot. Moving the index
+    //       backwards here would make the leader re-send log entries it
+    //       already sent, or decide that the peer needs a snapshot again and
+    //       restart the transfer from the beginning.
+    if (resp.get_next_idx() > p->get_next_log_idx()) {
+        p->set_next_log_idx(resp.get_next_idx());
+        p->reset_cnt_backward_log_probe();
+    }
 }
 
 } // namespace nuraft;

@@ -679,13 +679,21 @@ public:
      *
      * A member that does not respond at all for `full_consensus_leader_limit_`
      * is excluded immediately regardless of this option, as it cannot catch
-     * up while it is down.
+     * up while it is down. The grace period starts while it is down, so a
+     * member that was down longer than the grace period does not hold the
+     * commit once it comes back and starts catching up.
+     *
+     * The grace period is re-armed only after the member has been synced for
+     * at least as long as the grace period itself, so a member oscillating
+     * around the lag threshold cannot block commits on every crossing.
      *
      *   - If `0`, a member failing to sync is excluded immediately.
      *   - If positive, it is excluded after failing to sync for that long.
      *   - If negative, it is never excluded, and commits are blocked until
-     *     it catches up. Use with care: a member that never recovers blocks
-     *     the cluster until this option is changed.
+     *     it catches up. Use with care: nothing can be committed while a
+     *     member is failing to sync, including the configuration change that
+     *     would remove it, so the only way out is to change this option or to
+     *     turn full consensus mode off.
      */
     int32 full_consensus_lagging_member_grace_period_;
 

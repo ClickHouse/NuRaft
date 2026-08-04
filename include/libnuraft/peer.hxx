@@ -31,6 +31,7 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
+#include <limits>
 
 namespace nuraft {
 
@@ -274,14 +275,38 @@ public:
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
 
     // How long this peer has been failing to sync, for full consensus mode.
+    //
     // The timer starts on the transition into the failing state, so that
     // repeated evaluations of the same state do not extend the grace period.
-    void set_failing_to_sync() const {
-        if (!failing_to_sync_.exchange(true)) {
+    // It is re-armed only if the peer has been synced for `rearm_after_ms`
+    // since the previous failing state, so that a peer oscillating around
+    // the lag threshold cannot earn a fresh grace period on every crossing.
+    void set_failing_to_sync(int32_t rearm_after_ms) const {
+        if (failing_to_sync_.exchange(true)) {
+            return;
+        }
+        if ( rearm_after_ms < 0 ||
+             synced_timer_.get_ms() >= (uint64_t)rearm_after_ms ) {
             failing_to_sync_timer_.reset();
         }
     }
-    void clear_failing_to_sync() const  { failing_to_sync_ = false; }
+    void clear_failing_to_sync() const {
+        if (failing_to_sync_.exchange(false)) {
+            synced_timer_.reset();
+        }
+    }
+    // Forget the failing-to-sync state entirely, so that the next failing
+    // state gets a full grace period. To be called when the regime changes
+    // (full consensus mode toggled, this server became the leader, custom
+    // quorum size changed), as the state observed under the previous regime
+    // says nothing about the new one.
+    void reset_failing_to_sync() const {
+        failing_to_sync_ = false;
+        failing_to_sync_timer_.reset();
+        // Pretend the peer has been synced longer than any grace period can
+        // be, so that the re-arm condition is satisfied.
+        synced_timer_.reset(-(int64_t)std::numeric_limits<int32>::max());
+    }
     bool is_failing_to_sync() const     { return failing_to_sync_; }
     uint64_t get_failing_to_sync_ms() const {
         return failing_to_sync_timer_.get_ms();
@@ -572,6 +597,12 @@ private:
      * Timestamp when this peer started failing to sync.
      */
     mutable timer_helper failing_to_sync_timer_;
+
+    /**
+     * Timestamp when this peer stopped failing to sync, used to decide
+     * whether it earned a fresh grace period.
+     */
+    mutable timer_helper synced_timer_;
 
     /**
      * Counter of long pause warnings.

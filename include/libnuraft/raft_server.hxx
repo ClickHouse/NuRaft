@@ -138,6 +138,8 @@ public:
             leave_limit_ = src.leave_limit_.load();
             vote_limit_ = src.vote_limit_.load();
             busy_connection_limit_ = src.busy_connection_limit_.load();
+            full_consensus_leader_limit_ = src.full_consensus_leader_limit_.load();
+            full_consensus_follower_limit_ = src.full_consensus_follower_limit_.load();
             return *this;
         }
 
@@ -770,6 +772,18 @@ public:
      * @param new_params Parameters to set.
      */
     void update_params(const raft_params& new_params);
+
+    /**
+     * Update the current Raft parameters by modifying them in place.
+     *
+     * Unlike a `get_current_params` - modify - `update_params` sequence, the
+     * read and the write happen under the same lock, so a concurrent update
+     * of an unrelated parameter cannot be lost.
+     *
+     * @param modifier Invoked with a copy of the current parameters, under
+     *                 the Raft lock. It should not block.
+     */
+    void modify_params(const std::function<void(raft_params&)>& modifier);
 
     /**
      * Get the current Raft parameters.

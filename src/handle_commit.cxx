@@ -616,12 +616,21 @@ uint64_t raft_server::find_sm_commit_idx_to_notify() {
     commit_idx_list.reserve(16);
     commit_idx_list.push_back(sm_commit_index_);
 
+    // NOTE: This runs whenever peers' state machine commit indexes are tracked,
+    //       independently of full consensus mode, so the grace period applies
+    //       only when that mode is on. Otherwise a lagging peer would hold back
+    //       state machine commit notifications, i.e. client responses, for the
+    //       grace period without full consensus mode being requested at all.
+    int32_t lagging_grace_period =
+        params->use_full_consensus_among_healthy_members_
+        ? params->full_consensus_lagging_member_grace_period_ : 0;
+
     for (auto& pp: peers_) {
         uint64_t last_resp_time_ms = pp.second->get_resp_timer_us() / 1000;
         if (is_excluded_from_quorum(*pp.second, last_resp_time_ms,
                                     expiry, required_log_idx,
                                     /* include_self_mark_down = */ true,
-                                    params->full_consensus_lagging_member_grace_period_)) {
+                                    lagging_grace_period)) {
             continue;
         }
         if (pp.second->get_sm_committed_idx() == 0) {
