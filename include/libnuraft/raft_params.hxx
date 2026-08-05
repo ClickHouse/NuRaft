@@ -100,7 +100,7 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
-        , full_consensus_lagging_member_grace_period_(0)
+        , slow_member_backpressure_max_hold_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -666,40 +666,39 @@ public:
 
     /**
      * (Experimental)
-     * Grace period, in millisecond, that the leader gives to a member that
-     * is alive but failing to sync, before excluding it from the quorum of
-     * full consensus (`use_full_consensus_among_healthy_members_`).
+     * How long, in millisecond, the leader holds the commit index back for a
+     * member that has fallen behind, before giving up on it.
      *
-     * A member is failing to sync if its matched log index is behind the
-     * committed log index by more than `max_append_size_`, or if it is
-     * receiving a snapshot. Such a member is still required to acknowledge
-     * a log for this amount of time, which throttles the commit rate down
-     * to the rate that member can sustain, and thus gives it a chance to
-     * catch up instead of falling further behind.
+     * Without this, the commit index advances as soon as a quorum has
+     * acknowledged a log, so a member slower than the quorum is never waited
+     * for and can keep falling behind indefinitely, until it is so far behind
+     * that it needs a snapshot. While the commit index is held, clients are
+     * not acknowledged, which stops the leader from accepting new writes as
+     * fast, and the member gets a chance to catch up.
      *
-     * Note that this reasoning does not hold for a member receiving a
-     * snapshot: the transfer does not go faster because commits are held,
-     * so for that case the option is only a delay before excluding it.
+     * A member starts being waited for when it falls behind the last log
+     * index by more than `stale_log_gap_`, and stops being waited for once
+     * the gap is one replication batch (`max_append_size_`) back under that
+     * threshold. In a healthy cluster, where every member is within a batch
+     * of the leader, nothing is ever held.
      *
-     * A member that does not respond at all for `full_consensus_leader_limit_`
-     * is excluded immediately regardless of this option, as it cannot catch
-     * up while it is down. The grace period starts while it is down, so a
-     * member that was down longer than the grace period does not hold the
-     * commit once it comes back and starts catching up.
+     * The two thresholds are deliberately close: a member is pinned just
+     * under `stale_log_gap_` by many short holds, rather than being held
+     * until it has closed the whole gap, which would stall writes for the
+     * entire catch-up.
      *
-     * The grace period is re-armed only after the member has been synced for
-     * at least as long as the grace period itself, so a member oscillating
-     * around the lag threshold cannot block commits on every crossing.
+     * A member that does not respond at all, or that is receiving a snapshot,
+     * is never waited for: it cannot catch up any faster because the commit
+     * index waits, so holding it would only stall the cluster.
      *
-     *   - If `0`, a member failing to sync is excluded immediately.
-     *   - If positive, it is excluded after failing to sync for that long.
-     *   - If negative, it is never excluded, and commits are blocked until
-     *     it catches up. Use with care: nothing can be committed while a
-     *     member is failing to sync, including the configuration change that
-     *     would remove it, so the only way out is to change this option or to
-     *     turn full consensus mode off.
+     *   - If `0`, the commit index is never held (default).
+     *   - If positive, it is held for at most that long for a given member,
+     *     after which the member is left behind until it becomes fresh again.
+     *   - If negative, it is held until the member catches up, with no time
+     *     limit. Use with care: nothing can be committed meanwhile, including
+     *     the configuration change that would remove that member.
      */
-    int32 full_consensus_lagging_member_grace_period_;
+    int32 slow_member_backpressure_max_hold_;
 
     /**
      * (Experimental)

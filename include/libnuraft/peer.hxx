@@ -31,7 +31,6 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
-#include <limits>
 
 namespace nuraft {
 
@@ -65,7 +64,8 @@ public:
                             timer_task_type::heartbeat_timer ) )
         , snp_sync_ctx_(nullptr)
         , lock_()
-        , failing_to_sync_(false)
+        , lagging_(false)
+        , backpressure_given_up_(false)
         , long_pause_warnings_(0)
         , network_recoveries_(0)
         , manual_free_(false)
@@ -274,45 +274,39 @@ public:
     void reset_active_timer()       { last_active_timer_.reset(); }
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
 
-    // How long this peer has been failing to sync, for full consensus mode.
+    // Whether this peer has fallen so far behind that the leader holds the
+    // commit index back for it. Entering and leaving this state use two
+    // different gaps (`stale_log_gap_` and `fresh_log_gap_`), so the caller
+    // provides the hysteresis and this is a plain latch.
     //
-    // The timer starts on the transition into the failing state, so that
-    // repeated evaluations of the same state do not extend the grace period.
-    // It is re-armed only if the peer has been synced for `rearm_after_ms`
-    // since the previous failing state, so that a peer oscillating around
-    // the lag threshold cannot earn a fresh grace period on every crossing.
-    // A negative `rearm_after_ms` (an unlimited grace period) always re-arms,
-    // as there is nothing to bound.
-    void set_failing_to_sync(int32_t rearm_after_ms) const {
-        if (failing_to_sync_.exchange(true)) {
-            return;
+    // Returns `true` if this call changed the state, for logging.
+    bool set_lagging() {
+        if (lagging_.exchange(true)) {
+            return false;
         }
-        if ( rearm_after_ms < 0 ||
-             synced_timer_.get_ms() >= (uint64_t)rearm_after_ms ) {
-            failing_to_sync_timer_.reset();
-        }
+        lagging_timer_.reset();
+        return true;
     }
-    void clear_failing_to_sync() const {
-        if (failing_to_sync_.exchange(false)) {
-            synced_timer_.reset();
-        }
+    bool clear_lagging() {
+        backpressure_given_up_ = false;
+        return lagging_.exchange(false);
     }
-    // Forget the failing-to-sync state entirely, so that the next failing
-    // state gets a full grace period. Called when the regime changes, i.e.
-    // when full consensus mode is toggled and when this server becomes the
-    // leader, as the state observed under the previous regime says nothing
-    // about the new one.
-    void reset_failing_to_sync() const {
-        failing_to_sync_ = false;
-        failing_to_sync_timer_.reset();
-        // Pretend the peer has been synced longer than any grace period can
-        // be, so that the re-arm condition is satisfied.
-        synced_timer_.reset(-(int64_t)std::numeric_limits<int32>::max());
+    // Forget the state entirely, without the caller treating it as a
+    // transition. Called when this server becomes the leader, as it did not
+    // track the peers as a follower.
+    void reset_lagging() {
+        lagging_ = false;
+        backpressure_given_up_ = false;
+        lagging_timer_.reset();
     }
-    bool is_failing_to_sync() const     { return failing_to_sync_; }
-    uint64_t get_failing_to_sync_ms() const {
-        return failing_to_sync_timer_.get_ms();
-    }
+    bool is_lagging() const         { return lagging_; }
+    uint64_t get_lagging_ms()       { return lagging_timer_.get_ms(); }
+
+    // Whether the leader stopped holding the commit index for this peer
+    // because it did not catch up in time. Reset only when the peer becomes
+    // fresh again, so that it cannot immediately hold the commit again.
+    bool is_backpressure_given_up() const   { return backpressure_given_up_; }
+    void set_backpressure_given_up()        { backpressure_given_up_ = true; }
 
     void reset_long_pause_warnings()    { long_pause_warnings_ = 0; }
     void inc_long_pause_warnings()      { long_pause_warnings_.fetch_add(1); }
@@ -588,23 +582,21 @@ private:
     timer_helper last_active_timer_;
 
     /**
-     * `true` if this peer is alive but failing to sync (lagging behind the
-     * committed log index or receiving a snapshot), for full consensus mode.
-     * Mutable, as it is maintained by the quorum evaluation, which does not
-     * otherwise modify the peer.
+     * `true` if this peer has fallen behind by more than `stale_log_gap_`
+     * and the leader is holding the commit index back for it.
      */
-    mutable std::atomic<bool> failing_to_sync_;
+    std::atomic<bool> lagging_;
 
     /**
-     * Timestamp when this peer started failing to sync.
+     * Timestamp when this peer started lagging.
      */
-    mutable timer_helper failing_to_sync_timer_;
+    timer_helper lagging_timer_;
 
     /**
-     * Timestamp when this peer stopped failing to sync, used to decide
-     * whether it earned a fresh grace period.
+     * `true` if the leader stopped holding the commit index for this peer
+     * because it did not catch up within the configured time.
      */
-    mutable timer_helper synced_timer_;
+    std::atomic<bool> backpressure_given_up_;
 
     /**
      * Counter of long pause warnings.
