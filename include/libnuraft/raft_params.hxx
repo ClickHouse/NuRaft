@@ -677,6 +677,10 @@ public:
      * to the rate that member can sustain, and thus gives it a chance to
      * catch up instead of falling further behind.
      *
+     * Note that this reasoning does not hold for a member receiving a
+     * snapshot: the transfer does not go faster because commits are held,
+     * so for that case the option is only a delay before excluding it.
+     *
      * A member that does not respond at all for `full_consensus_leader_limit_`
      * is excluded immediately regardless of this option, as it cannot catch
      * up while it is down. The grace period starts while it is down, so a

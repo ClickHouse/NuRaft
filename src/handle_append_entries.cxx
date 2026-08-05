@@ -736,15 +736,17 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     }
     p.set_last_sent_idx(last_log_idx + 1);
 
-    if ( params->use_full_consensus_among_healthy_members_ &&
-         params->custom_commit_quorum_size_ == 0 ) {
+    if (params->use_full_consensus_among_healthy_members_) {
         // Full consensus mode: set flag indicating the member is excluded.
         //
-        // NOTE: The custom quorum size takes precedence over full consensus
-        //       mode in `get_expected_committed_log_idx`, so this flag must
-        //       follow the same condition. Otherwise the follower would be
-        //       told that it is still part of the quorum while the leader
-        //       commits without it, and it would serve stale local reads.
+        // NOTE: Unlike `get_expected_committed_log_idx`, this is not gated on
+        //       `custom_commit_quorum_size_ == 0`. The two therefore disagree
+        //       when a custom quorum size is set: the leader commits by that
+        //       quorum while it still tells members whether they would have
+        //       been excluded by full consensus. Keeping the flag is the
+        //       conservative direction, as a member that is behind is told so;
+        //       suppressing it would make every member believe it is part of
+        //       the quorum.
         uint64_t last_resp_time_ms = p.get_resp_timer_us() / 1000;
         uint64_t expiry = params->heart_beat_interval_ *
                           raft_server::raft_limits_.full_consensus_leader_limit_;

@@ -1708,12 +1708,10 @@ void raft_server::broadcast_full_consensus_mode(bool enable) {
         req->log_entries().push_back(custom_noti_le);
 
         if (pp->make_busy()) {
-            // NOTE: The response will go through
-            //       `handle_custom_notification_resp`, which updates the
-            //       peer's next log index. If `max_log_gap_in_stream_` is
-            //       set, this may interleave with in-flight streamed
-            //       append entries requests and cause a harmless
-            //       resend of a few log entries.
+            // NOTE: The response goes through
+            //       `handle_custom_notification_resp`, which only moves the
+            //       peer's next log index forward, so this cannot roll back
+            //       in-flight streamed append entries.
             pp->send_req(pp, req, resp_handler_);
         } else {
             // Best-effort propagation: the peer will keep its old mode.

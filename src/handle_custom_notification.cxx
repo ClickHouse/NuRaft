@@ -336,8 +336,10 @@ ptr<resp_msg> raft_server::handle_full_consensus_mode_request
         // NOTE: `leader_ == -1` is accepted as well, otherwise every
         //       propagation that races with a leader change would be dropped,
         //       and the mode would systematically diverge right after every
-        //       election. The term was checked above, and there is at most
-        //       one leader per term.
+        //       election. In that window the sender cannot be verified to be
+        //       the leader, only to be in the current term, which is enough
+        //       here: the mode affects availability, not safety, and it is
+        //       best-effort by design.
         p_in("[FULL CONSENSUS MODE] leader %d turned "
              "full consensus mode %s",
              req.get_src(), fc_msg->enable_ ? "ON" : "OFF");

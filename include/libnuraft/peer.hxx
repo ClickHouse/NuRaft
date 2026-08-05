@@ -281,6 +281,8 @@ public:
     // It is re-armed only if the peer has been synced for `rearm_after_ms`
     // since the previous failing state, so that a peer oscillating around
     // the lag threshold cannot earn a fresh grace period on every crossing.
+    // A negative `rearm_after_ms` (an unlimited grace period) always re-arms,
+    // as there is nothing to bound.
     void set_failing_to_sync(int32_t rearm_after_ms) const {
         if (failing_to_sync_.exchange(true)) {
             return;
@@ -296,10 +298,10 @@ public:
         }
     }
     // Forget the failing-to-sync state entirely, so that the next failing
-    // state gets a full grace period. To be called when the regime changes
-    // (full consensus mode toggled, this server became the leader, custom
-    // quorum size changed), as the state observed under the previous regime
-    // says nothing about the new one.
+    // state gets a full grace period. Called when the regime changes, i.e.
+    // when full consensus mode is toggled and when this server becomes the
+    // leader, as the state observed under the previous regime says nothing
+    // about the new one.
     void reset_failing_to_sync() const {
         failing_to_sync_ = false;
         failing_to_sync_timer_.reset();
