@@ -55,6 +55,7 @@ public:
         , matched_idx_(0)
         , next_log_idx_floor_(0)
         , busy_flag_(false)
+        , deferred_free_(false)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
         , hb_task_( cs_new< timer_task<int32>,
@@ -386,6 +387,54 @@ public:
 
     void try_set_free(msg_type type, bool streaming);
 
+    /**
+     * For a non-streamed `append_entries_request`, the busy flag
+     * (`busy_flag_`) must not be released before this peer's
+     * `next_log_idx_` / `matched_idx_` have actually been advanced
+     * from the response, i.e. before
+     * `raft_server::handle_append_entries_resp()` has updated them
+     * under `lock_`.
+     *
+     * If the flag were freed earlier (as `try_set_free()` does for
+     * every other response type, right after the RPC callback fires),
+     * a concurrent `raft_server::request_append_entries()` call for
+     * the same peer (e.g. from the commit path, which fires hundreds
+     * of times per second) can win `make_busy()` while `next_log_idx_`
+     * is still stale, and build a duplicate append_entries request
+     * that re-reads the just-served log range from the log store --
+     * an expensive redundant read (and network send), especially with
+     * changelog read-ahead enabled.
+     *
+     * To avoid that, `peer::handle_rpc_result()` calls
+     * `mark_deferred_free()` instead of `try_set_free()` for this one
+     * case, transferring free-ownership of the busy flag to
+     * `raft_server::handle_append_entries_resp()`. That function calls
+     * `consume_deferred_free()` right after updating the peer's log
+     * positions in the accepted case, and again after adjusting them
+     * in the declined case.
+     *
+     * As a safety net for response types / early-return paths in
+     * `handle_append_entries_resp()` that never reach a
+     * `consume_deferred_free()` call (e.g. a response from an already
+     * removed peer, or a peer that just finished catching up right
+     * before being removed), `handle_rpc_result()` also calls
+     * `consume_deferred_free()` itself, right after delivering the
+     * response. That call is a no-op if the flag has already been
+     * consumed, which is the common case.
+     */
+    void mark_deferred_free() {
+        deferred_free_.store(true);
+    }
+
+    bool consume_deferred_free() {
+        bool exp = true;
+        if (deferred_free_.compare_exchange_strong(exp, false)) {
+            set_free();
+            return true;
+        }
+        return false;
+    }
+
     bool is_lost() const { return lost_by_leader_; }
     void set_lost() { lost_by_leader_ = true; }
     void set_recovered() { lost_by_leader_ = false; }
@@ -497,6 +546,15 @@ private:
      * the response.
      */
     std::atomic<bool> busy_flag_;
+
+    /**
+     * `true` if the release of `busy_flag_` for the in-flight
+     * non-streamed `append_entries_request` has been deferred from
+     * `peer::handle_rpc_result()` to
+     * `raft_server::handle_append_entries_resp()`. See
+     * `mark_deferred_free()` / `consume_deferred_free()` above.
+     */
+    std::atomic<bool> deferred_free_;
 
     /**
      * `true` if we need to send follow-up request immediately

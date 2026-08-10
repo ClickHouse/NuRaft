@@ -158,7 +158,8 @@ bool inmem_log_store::is_conf(ulong index)
 ptr<std::vector<ptr<log_entry>>>
     inmem_log_store::log_entries_ext(ulong start,
                                      ulong end,
-                                     int64 batch_size_hint_in_bytes)
+                                     int64 batch_size_hint_in_bytes,
+                                     int32 /*peer_id*/)
 {
     ptr< std::vector< ptr<log_entry> > > ret =
         cs_new< std::vector< ptr<log_entry> > >();

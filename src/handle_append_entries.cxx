@@ -621,7 +621,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
                                     : std::min(params->max_append_size_bytes_,
                                                p.get_next_batch_size_hint_in_bytes());
         log_entries = log_store_->log_entries_ext(last_log_idx + 1, end_idx,
-                                                  batch_size_hint);
+                                                  batch_size_hint, p.get_id());
         if (log_entries == nullptr) {
             p_wn("failed to retrieve log entries: %" PRIu64 " - %" PRIu64,
                  last_log_idx + 1, end_idx);
@@ -1430,6 +1430,11 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             p->set_last_accepted_log_idx(new_matched_idx);
         }
 
+        // busy flag was intentionally held by `handle_rpc_result()` until
+        // the peer's log positions were updated; release it now, before
+        // any follow-up send.
+        p->consume_deferred_free();
+
         bool sm_committed_idx_updated = false;
         if (resp.get_ctx() &&
             ctx_->get_params()->track_peers_sm_commit_idx_) {
@@ -1674,6 +1679,11 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             p_in("stop stream mode for peer %d at idx: %" PRIu64 "",
                  p->get_id(), last_streamed_log_idx);
         }
+
+        // busy flag was intentionally held by `handle_rpc_result()` until
+        // the peer's log positions were updated; release it now, before
+        // any follow-up send.
+        p->consume_deferred_free();
     }
 
     if (!config_changing_ && p->get_config().is_new_joiner()) {
