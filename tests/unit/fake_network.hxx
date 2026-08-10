@@ -255,10 +255,7 @@ public:
         }
     }
 
-    /**
-     * Run the real snapshot-install timeout check, so a test can reach the
-     * post-timeout state through production code instead of emulating it.
-     */
+    /// Runs the production snapshot-install timeout check.
     bool checkPeerSnapshotTimeout(raft_server* srv, int32 peer_id) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);

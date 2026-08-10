@@ -41,28 +41,11 @@ limitations under the License.
 namespace nuraft {
 
 /**
- * Terminal context of a logical-object `install_snapshot_response`, i.e. the payload a follower
- * attaches to the response for the last object to say "the install is done".
+ * Completion context for logical-object snapshot installs.
  *
- * Originally this was a single zero byte, and the index of the installed snapshot lived
- * exclusively in the leader's `snapshot_sync_ctx`. That made a completion uninterpretable -- and
- * therefore droppable -- whenever the context was gone by the time the acknowledgement arrived,
- * which is what happens when applying a large snapshot outruns `snapshot_sync_ctx_timeout`. The
- * payload now carries the index itself, so the leader no longer needs the context to read it.
- *
- *  << Format >>
- *  Format tag                       1 byte
- *  Installed snapshot last_log_idx  8 bytes (little endian)
- *
- * `len == 1` with tag `LEGACY_NO_INDEX` is the historical payload and carries no index. For every
- * tag `>= 1` bytes 1..8 are the installed snapshot's `last_log_idx`; keeping that prefix fixed
- * lets a leader read the index out of a tag it does not otherwise understand, so later extensions
- * of this format stay additive. Any other shape is malformed and must be rejected rather than
- * read as a completion -- see `raft_server::handle_install_snapshot_resp`.
- *
- * An older leader never inspects this payload: for logical-object snapshots its completion test
- * is only that `resp_msg::get_ctx` is non-null, which a 9-byte buffer satisfies just as well as a
- * 1-byte one. So a follower on this format can acknowledge to a leader on either format.
+ * Legacy payloads are a one-byte `LEGACY_NO_INDEX` marker. New payloads store the installed
+ * `last_log_idx` after a nonzero tag. The fixed prefix permits additive format extensions and
+ * lets leaders process late acknowledgements after their `snapshot_sync_ctx` has expired.
  */
 struct snp_install_done_ctx {
     enum format_tag : uint8_t {
@@ -79,12 +62,7 @@ struct snp_install_done_ctx {
         return result;
     }
 
-    /**
-     * @param buf Terminal context received from a follower.
-     * @param last_log_idx_out Installed snapshot index, set only if the payload carries one.
-     * @param has_last_log_idx_out Whether the payload carries an index.
-     * @return `true` if the payload is a well-formed completion, `false` if it is malformed.
-     */
+    /// Parses a terminal context; sets the index output only when present.
     static bool parse(buffer& buf,
                       ulong& last_log_idx_out,
                       bool& has_last_log_idx_out)
@@ -92,7 +70,7 @@ struct snp_install_done_ctx {
         has_last_log_idx_out = false;
 
         if (buf.size() == sizeof(uint8_t)) {
-            // The historical payload, and nothing else, may be this short.
+            // Only the legacy marker may be this short.
             buffer_serializer bs(buf);
             return bs.get_u8() == LEGACY_NO_INDEX;
         }
@@ -100,8 +78,7 @@ struct snp_install_done_ctx {
         if (buf.size() < sizeof(uint8_t) + sizeof(uint64_t)) return false;
 
         buffer_serializer bs(buf);
-        // A payload long enough to hold an index but tagged as the indexless legacy one is
-        // inconsistent, so we cannot tell what it means.
+        // The legacy tag cannot carry an index.
         if (bs.get_u8() == LEGACY_NO_INDEX) return false;
 
         last_log_idx_out = bs.get_u64();
@@ -437,10 +414,7 @@ ptr<resp_msg> raft_server::handle_install_snapshot_req(req_msg& req, std::unique
             resp->accept(sync_req->get_offset());
             if (sync_req->is_done()) {
                 // TODO: check if there is missing object.
-                // Add a context buffer to inform installation is done. It names the snapshot
-                // that was installed, so that a leader which no longer has a sync context for
-                // this transfer -- because the install outran `snapshot_sync_ctx_timeout` --
-                // can still tell what this acknowledgement is about.
+                // Carry the installed snapshot index for late acknowledgements.
                 resp->set_ctx( snp_install_done_ctx::serialize(
                                    sync_req->get_snapshot().get_last_log_idx() ) );
             }
@@ -466,9 +440,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
         std::lock_guard<std::mutex> guard(p->get_lock());
         p->reset_cnt_backward_log_probe();
 
-        // A terminal context means the follower is done installing, and under
-        // `snp_install_done_ctx` it also names the snapshot that was installed -- the one thing
-        // the completion bookkeeping below actually needs from the sync context.
+        // A terminal context may identify the installed snapshot.
         ulong acked_snp_idx = 0;
         bool has_acked_snp_idx = false;
         bool ctx_is_well_formed = true;
@@ -477,10 +449,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
                 *resp.get_ctx(), acked_snp_idx, has_acked_snp_idx);
         }
 
-        // Credit the peer with having installed `acked_idx`, if that claim survives validation.
-        // Every write is monotone, so an acknowledgement which arrives late -- or which turns out
-        // to be for a snapshot other than the one in flight -- can never move a peer backwards.
-        // That is what makes acting on an acknowledgement without its sync context safe at all.
+        // Credit validated acknowledgements without moving progress backwards.
         auto advance_peer_to_acked_idx = [&](ulong acked_idx) -> bool {
             if (resp.get_term() != state_->get_term()) {
                 p_wn("ignore the install of snapshot idx %" PRIu64 " acknowledged by peer %d: "
@@ -490,15 +459,14 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
             }
             if (acked_idx == 0 ||
                 acked_idx == std::numeric_limits<ulong>::max()) {
-                // Zero is never a snapshot boundary, and `acked_idx + 1` must not wrap.
+                // A snapshot index must be nonzero and incrementable.
                 p_wn("ignore the install acknowledged by peer %d: "
                      "snapshot idx %" PRIu64 " is out of range",
                      p->get_id(), acked_idx);
                 return false;
             }
             if (acked_idx > precommit_index_) {
-                // This server never wrote that index, so it cannot have sent a snapshot ending
-                // there either.
+                // The leader cannot acknowledge an unwritten index.
                 p_wn("ignore the install of snapshot idx %" PRIu64 " acknowledged by peer %d: "
                      "it is beyond this server's precommit index %" PRIu64,
                      acked_idx, p->get_id(), precommit_index_.load());
@@ -514,11 +482,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
 
         ptr<snapshot_sync_ctx> sync_ctx = p->get_snapshot_sync_ctx();
         if (!ctx_is_well_formed) {
-            // Neither the historical done-marker nor a well-formed extended payload, so we
-            // cannot tell which snapshot -- if any -- this is about. Reading it as a completion
-            // would mark whichever install is live as done, which is the misattribution the
-            // carried index exists to prevent, so drop it instead and leave every field and the
-            // live context alone. The cost is at most a retried install.
+            // Malformed contexts must not complete an in-flight install.
             p_wn("peer %d sent an install snapshot response with a malformed terminal context "
                  "of %zu bytes, drop the response",
                  p->get_id(), resp.get_ctx()->size());
@@ -526,13 +490,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
 
         } else if (sync_ctx == nullptr) {
             if (has_acked_snp_idx && advance_peer_to_acked_idx(acked_snp_idx)) {
-                // The install succeeded and said which snapshot it was for, so there is nothing
-                // left that the destroyed context was needed for. Complete the same bookkeeping
-                // a timely acknowledgement would have done, minus the context teardown. Clearing
-                // `snapshot_sync_is_needed` is the part that actually saves the retransfer: a
-                // follower which answered `RECEIVING_SNAPSHOT` while applying leaves that flag
-                // set, and `create_append_entries_req` would otherwise start a fresh install as
-                // soon as this server has a newer snapshot.
+                // Complete late, indexed acknowledgements without a sync context.
                 if (p->is_snapshot_sync_needed()) {
                     p->set_snapshot_sync_is_needed(false);
                     p_in("peer %d is no longer in snapshot sync mode", p->get_id());
@@ -567,12 +525,7 @@ void raft_server::handle_install_snapshot_resp(resp_msg& resp) {
 
             if ( snp_install_done && has_acked_snp_idx &&
                  acked_snp_idx != snp->get_last_log_idx() ) {
-                // This acknowledgement is for a different snapshot than the one in flight,
-                // which is what a timed-out install restarted with a newer snapshot looks like.
-                // Completing the live transfer from it would set `matched_idx` to an index this
-                // peer never installed, and `matched_idx` feeds the commit-quorum calculation in
-                // `get_expected_committed_log_idx`. So credit only the index that really was
-                // installed, and leave the live transfer to finish and report on its own.
+                // Credit the acknowledged snapshot without completing the newer transfer.
                 p_wn("peer %d acknowledged the install of snapshot idx %" PRIu64 " while "
                      "snapshot idx %" PRIu64 " is in flight, "
                      "do not treat the in-flight install as done",

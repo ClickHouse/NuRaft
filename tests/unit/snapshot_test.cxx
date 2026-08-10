@@ -2373,26 +2373,9 @@ int snapshot_user_ctx_deferred_free_test()
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Late snapshot-install acknowledgements.
-//
-// A follower answers the last snapshot object with a terminal context. The leader used to need
-// its own `snapshot_sync_ctx` to interpret that answer, because the installed snapshot's index
-// lived only there. Applying a large snapshot routinely outruns `snapshot_sync_ctx_timeout` --
-// which is a per-round-trip responsiveness budget, not an allowance for the apply -- so the
-// context was destroyed and a *successful* install was discarded, leaving `next_log_idx_floor`
-// unset and nothing to stop a subsequent backward log walk.
-//
-// The terminal context now carries the installed snapshot's `last_log_idx`, so these tests drive
-// the leader-side handling of that payload: which acknowledgements it acts on, which it refuses,
-// and what it must never do to a peer that has a *different* install in flight.
-// ---------------------------------------------------------------------------
+// Late snapshot-install acknowledgement tests.
 
-// Build a terminal install-snapshot context.
-//
-// `total_len` is explicit so the malformed and future-format cases can be expressed: the format
-// says `len == 1` with tag 0 is the historical indexless marker, and any tag `>= 1` carries the
-// index in bytes 1..8. Everything else is malformed.
+// Build a terminal context; `total_len` supports malformed and future formats.
 static ptr<buffer> make_snp_install_done_ctx(uint8_t tag,
                                              uint64_t snp_idx,
                                              size_t total_len) {
@@ -2409,24 +2392,14 @@ static ptr<buffer> make_snp_install_done_ctx(uint8_t tag,
     return ctx;
 }
 
-// Get a real response from S3 into the leader's pending queue, to be replaced with a crafted one
-// later.
-//
-// This has to happen before the state under test is arranged, and exactly once per delivery: a
-// heartbeat only produces a request while the peer is free, and with a snapshot sync context in
-// place it may produce no ordinary request at all.
+// Queue a real response to replace with a crafted response.
 static int arm_pending_resp(RaftPkg& leader, const std::string& peer_endpoint) {
     leader.fTimer->invoke( timer_task_type::heartbeat_timer );
     CHK_TRUE( leader.fNet->delieverReqTo(peer_endpoint) );
     return 0;
 }
 
-// Put the peer back into a state where `arm_pending_resp` works: no snapshot sync context, and a
-// cursor inside the leader's *available* log.
-//
-// The leader compacts its log up to the last snapshot, so a cursor below that boundary makes the
-// heartbeat start a snapshot transfer instead of producing the ordinary request we want to answer.
-// The state actually under test is set afterwards, once the response is already armed.
+// Reset the peer so a heartbeat produces an ordinary request.
 static void reset_peer_for_arming(RaftPkg& leader,
                                   int32 peer_id,
                                   ulong safe_next_log_idx) {
@@ -2448,7 +2421,7 @@ static void set_peer_cursor(RaftPkg& leader,
     leader.fNet->setPeerNextLogIdxFloor(leader.raftServer.get(), peer_id, floor_idx);
 }
 
-// Assert the peer's progress is exactly where it was left, i.e. the acknowledgement was refused.
+// Verify that a refused acknowledgement does not change peer progress.
 static int check_peer_cursor(RaftPkg& leader,
                              int32 peer_id,
                              ulong next_log_idx,
@@ -2473,7 +2446,7 @@ static int deliver_install_snapshot_resp(RaftPkg& leader,
     ptr<resp_msg> resp = cs_new<resp_msg>( term,
                                            msg_type::install_snapshot_response,
                                            peer_id,
-                                           1,   // dst = S1, the leader.
+                                           1,   // S1, the leader.
                                            next_idx,
                                            accepted );
     if (ctx) resp->set_ctx(ctx);
@@ -2482,8 +2455,7 @@ static int deliver_install_snapshot_resp(RaftPkg& leader,
     return 0;
 }
 
-// Bring up a three-node group, replicate enough entries for the leader to hold a snapshot, and
-// leave a crafted response armed for S3.
+// Three-node fixture with a leader snapshot.
 struct LateAckFixture {
     ptr<FakeNetworkBase> f_base;
     ptr<RaftPkg> s1;
@@ -2493,9 +2465,7 @@ struct LateAckFixture {
     ptr<snapshot> leader_snp;
     ulong precommit_idx = 0;
     ulong term = 0;
-    // A peer cursor that is inside the leader's uncompacted log, so a heartbeat produces an
-    // ordinary append rather than an install, and low enough that the leader never sees a peer
-    // claiming to be ahead of its own log.
+    // A cursor that permits ordinary replication.
     ulong safe_next_log_idx = 0;
 };
 
@@ -2539,9 +2509,7 @@ static void shutdown_late_ack_fixture(LateAckFixture& fx) {
     fx.f_base->destroy();
 }
 
-// Drive the real timeout check so the peer reaches the exact post-timeout state: the context is
-// destroyed, but `snapshot_sync_is_needed` -- which the timeout does not touch -- is left as it
-// was. A zero timeout makes `snapshot_sync_ctx::get_timer` report expiry on the first check.
+// Expire the context through the production timeout check.
 static int expire_snapshot_sync_ctx(RaftPkg& leader,
                                     int32 peer_id,
                                     ptr<snapshot> snp) {
@@ -2556,9 +2524,7 @@ static int expire_snapshot_sync_ctx(RaftPkg& leader,
     return 0;
 }
 
-// Case 1: the acknowledgement of a successful install is acted upon even though the sync context
-// it belonged to is already gone. This is the production failure, and the floor being set is the
-// part that stops the backward walk.
+// Case 1: accept a late acknowledgement after context expiry.
 int late_snapshot_install_ack_accepted_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2569,8 +2535,7 @@ int late_snapshot_install_ack_accepted_test() {
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
 
-    // The peer looks far behind, as it does while it is still applying, and a backward walk has
-    // already started.
+    // Simulate an applying peer with an active backward probe.
     set_peer_cursor(s1, 3, 1, 0, 0);
     s1.fNet->setPeerBackwardLogProbeCount(s1.raftServer.get(), 3, 3);
 
@@ -2584,8 +2549,7 @@ int late_snapshot_install_ack_accepted_test() {
     CHK_EQ( snp_idx, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
     CHK_EQ( snp_idx + 1,
             s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
-    // A non-zero floor is what makes a backward walk impossible; the probe counter is also back
-    // to zero, so no walk is in progress either.
+    // The floor and reset probe counter prevent a backward walk.
     CHK_EQ( 0, s1.fNet->getPeerBackwardLogProbeCount(s1.raftServer.get(), 3) );
 
     print_stats(fx.pkgs);
@@ -2593,9 +2557,7 @@ int late_snapshot_install_ack_accepted_test() {
     return 0;
 }
 
-// Case 2: the updates are monotone. A late acknowledgement for an old snapshot must not pull a
-// peer that has since advanced backwards -- that is the hazard which made dropping such
-// acknowledgements the safe choice in the first place.
+// Case 2: an old acknowledgement cannot move a peer backwards.
 int late_snapshot_install_ack_monotonic_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2604,7 +2566,7 @@ int late_snapshot_install_ack_monotonic_test() {
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
 
-    // An index the leader really could have snapshotted, but long behind where the peer is now.
+    // A valid but stale snapshot index.
     ulong stale_idx = 3;
     CHK_GT( fx.leader_snp->get_last_log_idx(), stale_idx );
 
@@ -2626,10 +2588,7 @@ int late_snapshot_install_ack_monotonic_test() {
     return 0;
 }
 
-// Case 2b: the acknowledgement must also clear `snapshot_sync_is_needed`, otherwise the whole
-// point of accepting it is lost. A follower that answered `RECEIVING_SNAPSHOT` while applying
-// leaves that flag set, and the timeout does not clear it, so the next append cycle would start
-// another full install as soon as the leader holds a newer snapshot.
+// Case 2b: a late acknowledgement clears the sync-needed flag.
 int late_snapshot_install_ack_no_reinstall_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2637,15 +2596,14 @@ int late_snapshot_install_ack_no_reinstall_test() {
 
     ulong snp_idx = fx.leader_snp->get_last_log_idx();
 
-    // Arm before the newer snapshot and the sync-needed flag are in place, so that this heartbeat
-    // is an ordinary one and does not itself start an install.
+    // Arm before setting the sync-needed flag.
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
 
     set_peer_cursor(s1, 3, 1, 0, 0);
     s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
 
-    // The leader moved on to a newer snapshot while the follower was applying the old one.
+    // The leader creates a newer snapshot while the follower applies the old one.
     ptr<snapshot> newer_snp =
         cs_new<snapshot>( snp_idx + 100,
                           fx.leader_snp->get_last_log_term(),
@@ -2662,9 +2620,7 @@ int late_snapshot_install_ack_no_reinstall_test() {
 
     CHK_FALSE( s1.fNet->getPeerSnapshotSyncNeeded(s1.raftServer.get(), 3) );
 
-    // With the flag cleared the peer is served ordinary log replication. Had it stayed set, this
-    // would be an `install_snapshot_request` for `newer_snp` -- the retransfer this fix exists to
-    // avoid.
+    // The next request is ordinary replication, not a reinstall.
     ptr<req_msg> req = s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 3);
     CHK_NONNULL( req.get() );
     CHK_EQ( msg_type::append_entries_request, req->get_type() );
@@ -2674,9 +2630,7 @@ int late_snapshot_install_ack_no_reinstall_test() {
     return 0;
 }
 
-// Case 3: every index the leader acts on is validated first. Each of these acknowledgements is
-// accepted by the follower but carries an index the leader must refuse, and none of them may
-// touch the peer's progress.
+// Case 3: invalid acknowledgements do not change peer progress.
 int late_snapshot_install_ack_validation_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2684,15 +2638,15 @@ int late_snapshot_install_ack_validation_test() {
 
     struct BadAck {
         const char* what;
-        ulong term_offset;   // Subtracted from the current term.
+        ulong term_offset;   // Offset from the current term.
         ulong idx;
     };
     std::vector<BadAck> bad_acks = {
-        // Beyond anything this leader ever wrote, so it cannot have sent such a snapshot.
+        // Beyond the leader's log.
         { "idx beyond precommit index", 0, fx.precommit_idx + 1 },
-        // From an earlier term: the peer state it describes may no longer be this leader's.
+        // From an earlier term.
         { "stale term", 1, fx.leader_snp->get_last_log_idx() },
-        // Never a snapshot boundary.
+        // Not a valid snapshot boundary.
         { "zero idx", 0, 0 },
         // `idx + 1` would wrap.
         { "max idx", 0, std::numeric_limits<ulong>::max() },
@@ -2717,9 +2671,7 @@ int late_snapshot_install_ack_validation_test() {
         CHK_Z( check_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx) );
     }
 
-    // A *declined* response is a different thing entirely: it means the follower is already past
-    // what we offered, and the existing handling deliberately rewrites the peer's position and
-    // zeroes the floor. Carrying the new payload must not change that.
+    // A declined response preserves existing cursor handling.
     _msg("  case: declined response with an extended payload\n");
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
@@ -2738,11 +2690,7 @@ int late_snapshot_install_ack_validation_test() {
     return 0;
 }
 
-// Case 4: an acknowledgement for snapshot `I` that arrives while an install of `J` is in flight
-// must not complete `J`. `matched_idx` feeds the commit-quorum calculation, so crediting the peer
-// with a snapshot it never installed is a safety problem, not just bookkeeping.
-//
-// This test fails on the unfixed code, where the terminal context is only ever a "done" flag.
+// Case 4: an old acknowledgement must not complete a newer install.
 int late_snapshot_install_ack_wrong_snapshot_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/true) );
@@ -2757,9 +2705,7 @@ int late_snapshot_install_ack_wrong_snapshot_test() {
 
     set_peer_cursor(s1, 3, 1, 0, 0);
 
-    // The install of `I` timed out, and the leader restarted the transfer with `J`. Marking the
-    // async read as in progress keeps the resumed transfer from being driven any further by the
-    // response we are about to deliver.
+    // The timed-out install of I is replaced by an in-progress install of J.
     ptr<snapshot> snp_i =
         cs_new<snapshot>( idx_i,
                           fx.leader_snp->get_last_log_term(),
@@ -2776,12 +2722,12 @@ int late_snapshot_install_ack_wrong_snapshot_test() {
                s1, "S3", 3, fx.term, true, 1,
                make_snp_install_done_ctx(1, idx_i, 9)) );
 
-    // `J` was not credited, and its transfer is still live and able to report for itself.
+    // J remains live and uncredited.
     CHK_EQ( idx_i, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
     CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
     CHK_EQ( idx_j,
             s1.fNet->getPeerSnapshotSyncCtxLastLogIdx(s1.raftServer.get(), 3) );
-    // `I` really was installed, so it is credited.
+    // Credit the installed snapshot, I.
     CHK_EQ( idx_i + 1, s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
     CHK_EQ( idx_i + 1,
             s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
@@ -2791,9 +2737,7 @@ int late_snapshot_install_ack_wrong_snapshot_test() {
     return 0;
 }
 
-// Case 5: a follower on the old format sends a one-byte marker with no index. Both outcomes are
-// unchanged from before this fix -- deliberately. The second one is the residue that a carried
-// index cannot fix, because there is nothing to correlate on.
+// Case 5: retain legacy marker behavior.
 int late_snapshot_install_ack_legacy_marker_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2803,7 +2747,7 @@ int late_snapshot_install_ack_legacy_marker_test() {
     ulong matched_idx = next_log_idx - 1;
     ulong floor_idx = next_log_idx - 2;
 
-    // Without a context the response stays uninterpretable, so it is still dropped.
+    // An expired context leaves a legacy marker uninterpretable.
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
     set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
@@ -2814,9 +2758,7 @@ int late_snapshot_install_ack_legacy_marker_test() {
 
     CHK_Z( check_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx) );
 
-    // With a context, the marker still completes whatever that context holds -- including pulling
-    // `matched_idx` back to that snapshot. An old follower gives the leader nothing to check that
-    // assumption against.
+    // A live context still completes from a legacy marker.
     ulong snp_idx = fx.leader_snp->get_last_log_idx();
     reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
     CHK_Z( arm_pending_resp(s1, "S3") );
@@ -2835,10 +2777,7 @@ int late_snapshot_install_ack_legacy_marker_test() {
     return 0;
 }
 
-// Case 6: a payload that is neither the historical marker nor a well-formed extended frame is
-// rejected outright. Falling back to "treat it as the old done-marker" would be the *permissive*
-// reading, because in this code the old marker means completion -- so a malformed acknowledgement
-// would complete whichever install happened to be live.
+// Case 6: malformed payloads cannot complete an install.
 int late_snapshot_install_ack_malformed_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
@@ -2855,9 +2794,9 @@ int late_snapshot_install_ack_malformed_test() {
         size_t len;
     };
     std::vector<Malformed> cases = {
-        // Long enough to hold an index but tagged as the indexless legacy payload.
+        // Legacy tag with an index-sized payload.
         { "legacy tag with an index-sized payload", 0, 9 },
-        // Claims an index it is too short to contain.
+        // Truncated index payload.
         { "index tag with a truncated payload", 1, 5 },
     };
 
@@ -2884,7 +2823,7 @@ int late_snapshot_install_ack_malformed_test() {
                        s1, 3, next_log_idx, matched_idx, floor_idx) );
 
             if (with_live_ctx) {
-                // The live transfer survives an unreadable response.
+                // The live transfer survives.
                 CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(
                               s1.raftServer.get(), 3) );
                 CHK_EQ( idx_j,
@@ -2899,9 +2838,7 @@ int late_snapshot_install_ack_malformed_test() {
     return 0;
 }
 
-// Case 7: the index sits at a fixed offset for every tag `>= 1`, so a leader can read it out of a
-// format it does not otherwise understand. That keeps later extensions of this payload additive
-// instead of being rejected by older peers.
+// Case 7: unknown nonzero tags retain the fixed index prefix.
 int late_snapshot_install_ack_future_format_test() {
     LateAckFixture fx;
     CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
