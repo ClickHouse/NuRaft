@@ -82,6 +82,27 @@ protected:
                                                   ulong custom_last_log_idx = 0) {
         return srv->create_append_entries_req(pp, custom_last_log_idx);
     }
+
+    /// Runs a peer's snapshot-install timeout check (for testing).
+    static bool check_snapshot_timeout(raft_server* srv, ptr<peer>& pp) {
+        return srv->check_snapshot_timeout(pp);
+    }
+
+    /// Gets the server pre-commit index (for testing).
+    static ulong get_precommit_index(raft_server* srv) {
+        return srv->precommit_index_;
+    }
+
+    /// Invokes the joining-server snapshot response handler (for testing).
+    static void handle_install_snapshot_resp_new_member(raft_server* srv,
+                                                        resp_msg& resp) {
+        srv->handle_install_snapshot_resp_new_member(resp);
+    }
+
+    /// Gets the server currently being added to the cluster (for testing).
+    static ptr<peer> get_srv_to_join(raft_server* srv) {
+        return srv->srv_to_join_;
+    }
 };
 
 }

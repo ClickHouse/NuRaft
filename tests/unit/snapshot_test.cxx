@@ -2373,6 +2373,585 @@ int snapshot_user_ctx_deferred_free_test()
     return 0;
 }
 
+// Late snapshot-install acknowledgement tests.
+
+// Build a terminal context; `total_len` supports malformed and future formats.
+static ptr<buffer> make_snp_install_done_ctx(uint8_t tag,
+                                             uint64_t snp_idx,
+                                             size_t total_len) {
+    ptr<buffer> ctx = buffer::alloc(total_len);
+    buffer_serializer bs(*ctx);
+    bs.put_u8(tag);
+    if (total_len >= sizeof(uint8_t) + sizeof(uint64_t)) {
+        bs.put_u64(snp_idx);
+    }
+    while (bs.pos() < total_len) {
+        bs.put_u8(0);
+    }
+    ctx->pos(0);
+    return ctx;
+}
+
+// Queue a real response to replace with a crafted response.
+static int arm_pending_resp(RaftPkg& leader, const std::string& peer_endpoint) {
+    leader.fTimer->invoke( timer_task_type::heartbeat_timer );
+    CHK_TRUE( leader.fNet->delieverReqTo(peer_endpoint) );
+    return 0;
+}
+
+// Reset the peer so a heartbeat produces an ordinary request.
+static void reset_peer_for_arming(RaftPkg& leader,
+                                  int32 peer_id,
+                                  ulong safe_next_log_idx) {
+    leader.fNet->setPeerSnapshotInSync(leader.raftServer.get(), peer_id, nullptr);
+    leader.fNet->setPeerNextLogIdx(
+        leader.raftServer.get(), peer_id, safe_next_log_idx);
+    leader.fNet->setPeerMatchedIdx(
+        leader.raftServer.get(), peer_id, safe_next_log_idx - 1);
+    leader.fNet->setPeerNextLogIdxFloor(leader.raftServer.get(), peer_id, 0);
+}
+
+static void set_peer_cursor(RaftPkg& leader,
+                            int32 peer_id,
+                            ulong next_log_idx,
+                            ulong matched_idx,
+                            ulong floor_idx) {
+    leader.fNet->setPeerNextLogIdx(leader.raftServer.get(), peer_id, next_log_idx);
+    leader.fNet->setPeerMatchedIdx(leader.raftServer.get(), peer_id, matched_idx);
+    leader.fNet->setPeerNextLogIdxFloor(leader.raftServer.get(), peer_id, floor_idx);
+}
+
+// Verify that a refused acknowledgement does not change peer progress.
+static int check_peer_cursor(RaftPkg& leader,
+                             int32 peer_id,
+                             ulong next_log_idx,
+                             ulong matched_idx,
+                             ulong floor_idx) {
+    CHK_EQ( next_log_idx,
+            leader.fNet->getPeerNextLogIdx(leader.raftServer.get(), peer_id) );
+    CHK_EQ( matched_idx,
+            leader.fNet->getPeerMatchedIdx(leader.raftServer.get(), peer_id) );
+    CHK_EQ( floor_idx,
+            leader.fNet->getPeerNextLogIdxFloor(leader.raftServer.get(), peer_id) );
+    return 0;
+}
+
+static int deliver_install_snapshot_resp(RaftPkg& leader,
+                                         const std::string& peer_endpoint,
+                                         int32 peer_id,
+                                         ulong term,
+                                         bool accepted,
+                                         ulong next_idx,
+                                         ptr<buffer> ctx) {
+    ptr<resp_msg> resp = cs_new<resp_msg>( term,
+                                           msg_type::install_snapshot_response,
+                                           peer_id,
+                                           1,   // S1, the leader.
+                                           next_idx,
+                                           accepted );
+    if (ctx) resp->set_ctx(ctx);
+    CHK_TRUE( leader.fNet->replaceLastPendingResp(peer_endpoint, resp) );
+    CHK_TRUE( leader.fNet->handleRespFrom(peer_endpoint) );
+    return 0;
+}
+
+// Three-node fixture with a leader snapshot.
+struct LateAckFixture {
+    ptr<FakeNetworkBase> f_base;
+    ptr<RaftPkg> s1;
+    ptr<RaftPkg> s2;
+    ptr<RaftPkg> s3;
+    std::vector<RaftPkg*> pkgs;
+    ptr<snapshot> leader_snp;
+    ulong precommit_idx = 0;
+    ulong term = 0;
+    // A cursor that permits ordinary replication.
+    ulong safe_next_log_idx = 0;
+};
+
+static int setup_late_ack_fixture(LateAckFixture& fx,
+                                 bool use_bg_thread_for_snapshot_io) {
+    reset_log_files();
+    fx.f_base = cs_new<FakeNetworkBase>();
+
+    fx.s1 = cs_new<RaftPkg>(fx.f_base, 1, std::string("S1"));
+    fx.s2 = cs_new<RaftPkg>(fx.f_base, 2, std::string("S2"));
+    fx.s3 = cs_new<RaftPkg>(fx.f_base, 3, std::string("S3"));
+    fx.pkgs = {fx.s1.get(), fx.s2.get(), fx.s3.get()};
+
+    CHK_Z( launch_servers( fx.pkgs ) );
+    CHK_Z( make_group( fx.pkgs ) );
+
+    for (auto& entry: fx.pkgs) {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 5;
+        param.use_bg_thread_for_snapshot_io_ = use_bg_thread_for_snapshot_io;
+        entry->raftServer->update_params(param);
+    }
+
+    CHK_Z( append_and_replicate(*fx.s1, fx.pkgs, 0, 20) );
+
+    fx.leader_snp = fx.s1->fNet->getLastSnapshot(fx.s1->raftServer.get());
+    CHK_NONNULL( fx.leader_snp.get() );
+    fx.precommit_idx = fx.s1->fNet->getPrecommitIndex(fx.s1->raftServer.get());
+    fx.term = fx.s1->raftServer->get_term();
+    fx.safe_next_log_idx = fx.precommit_idx;
+    CHK_GT( fx.safe_next_log_idx, fx.leader_snp->get_last_log_idx() );
+
+    return 0;
+}
+
+static void shutdown_late_ack_fixture(LateAckFixture& fx) {
+    fx.s1->raftServer->shutdown();
+    fx.s2->raftServer->shutdown();
+    fx.s3->raftServer->shutdown();
+    fx.f_base->destroy();
+}
+
+// Expire the context through the production timeout check.
+static int expire_snapshot_sync_ctx(RaftPkg& leader,
+                                    int32 peer_id,
+                                    ptr<snapshot> snp) {
+    leader.fNet->setPeerSnapshotInSync(
+        leader.raftServer.get(), peer_id, snp, /*timeout_ms=*/0);
+    CHK_TRUE( leader.fNet->hasPeerSnapshotSyncCtx(
+                  leader.raftServer.get(), peer_id) );
+    CHK_TRUE( leader.fNet->checkPeerSnapshotTimeout(
+                  leader.raftServer.get(), peer_id) );
+    CHK_FALSE( leader.fNet->hasPeerSnapshotSyncCtx(
+                   leader.raftServer.get(), peer_id) );
+    return 0;
+}
+
+static ptr<resp_msg> make_install_snapshot_resp(int32 peer_id,
+                                                ulong term,
+                                                ptr<buffer> ctx) {
+    ptr<resp_msg> resp = cs_new<resp_msg>( term,
+                                           msg_type::install_snapshot_response,
+                                           peer_id,
+                                           1,   // S1, the leader.
+                                           1,
+                                           true );
+    resp->set_ctx(ctx);
+    return resp;
+}
+
+// A joining server has its own response handler. It must recover when the
+// final snapshot acknowledgement arrives after its context has timed out.
+int late_snapshot_install_ack_new_member_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    RaftPkg s4(fx.f_base, 4, std::string("S4"));
+    CHK_Z( launch_servers( {&s4} ) );
+    s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+    s1.fNet->setServerToJoinSnapshotInSync(
+        s1.raftServer.get(), fx.leader_snp, /*timeout_ms=*/0);
+    CHK_TRUE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+    CHK_TRUE( s1.fNet->checkServerToJoinSnapshotTimeout(s1.raftServer.get()) );
+    CHK_FALSE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+
+    ptr<resp_msg> resp = make_install_snapshot_resp(
+        4, fx.term, make_snp_install_done_ctx(1, snp_idx, 9));
+    s1.fNet->handleInstallSnapshotRespNewMember(s1.raftServer.get(), *resp);
+
+    CHK_EQ( snp_idx + 1,
+            s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()) );
+    CHK_EQ( snp_idx,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+    CHK_EQ( snp_idx + 1,
+            s1.fNet->getServerToJoinNextLogIdxFloor(s1.raftServer.get()) );
+
+    s4.raftServer->shutdown();
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// A late acknowledgement for an older snapshot must not complete the newer
+// snapshot currently being transferred to the joining server.
+int late_snapshot_install_ack_new_member_wrong_snapshot_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    RaftPkg s4(fx.f_base, 4, std::string("S4"));
+    CHK_Z( launch_servers( {&s4} ) );
+    s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+
+    ulong idx_i = fx.leader_snp->get_last_log_idx();
+    ptr<snapshot> snp_j = cs_new<snapshot>(
+        idx_i + 1,
+        fx.leader_snp->get_last_log_term(),
+        fx.leader_snp->get_last_config(),
+        0,
+        snapshot::logical_object );
+    s1.fNet->setServerToJoinSnapshotInSync(s1.raftServer.get(), snp_j);
+
+    ptr<resp_msg> resp = make_install_snapshot_resp(
+        4, fx.term, make_snp_install_done_ctx(1, idx_i, 9));
+    s1.fNet->handleInstallSnapshotRespNewMember(s1.raftServer.get(), *resp);
+
+    CHK_TRUE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+    CHK_EQ( snp_j->get_last_log_idx(),
+            s1.fNet->getServerToJoinSnapshotSyncCtxLastLogIdx(s1.raftServer.get()) );
+    CHK_EQ( idx_i,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+
+    s4.raftServer->shutdown();
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 1: accept a late acknowledgement after context expiry.
+int late_snapshot_install_ack_accepted_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+
+    // Simulate an applying peer with an active backward probe.
+    set_peer_cursor(s1, 3, 1, 0, 0);
+    s1.fNet->setPeerBackwardLogProbeCount(s1.raftServer.get(), 3, 3);
+
+    CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(1, snp_idx, 9)) );
+
+    CHK_EQ( snp_idx + 1, s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( snp_idx, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( snp_idx + 1,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+    // The floor and reset probe counter prevent a backward walk.
+    CHK_EQ( 0, s1.fNet->getPeerBackwardLogProbeCount(s1.raftServer.get(), 3) );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 2: an old acknowledgement cannot move a peer backwards.
+int late_snapshot_install_ack_monotonic_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+
+    // A valid but stale snapshot index.
+    ulong stale_idx = 3;
+    CHK_GT( fx.leader_snp->get_last_log_idx(), stale_idx );
+
+    ulong next_log_idx = fx.safe_next_log_idx;
+    ulong matched_idx = next_log_idx - 1;
+    ulong floor_idx = next_log_idx - 2;
+    set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+
+    CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(1, stale_idx, 9)) );
+
+    CHK_Z( check_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx) );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 2b: a late acknowledgement clears the sync-needed flag.
+int late_snapshot_install_ack_no_reinstall_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+
+    // Arm before setting the sync-needed flag.
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+
+    set_peer_cursor(s1, 3, 1, 0, 0);
+    s1.fNet->setPeerSnapshotSyncNeeded(s1.raftServer.get(), 3, true);
+
+    // The leader creates a newer snapshot while the follower applies the old one.
+    ptr<snapshot> newer_snp =
+        cs_new<snapshot>( snp_idx + 100,
+                          fx.leader_snp->get_last_log_term(),
+                          fx.leader_snp->get_last_config(),
+                          0,
+                          snapshot::logical_object );
+    s1.fNet->setLastSnapshot(s1.raftServer.get(), newer_snp);
+
+    CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(1, snp_idx, 9)) );
+
+    CHK_FALSE( s1.fNet->getPeerSnapshotSyncNeeded(s1.raftServer.get(), 3) );
+
+    // The next request is ordinary replication, not a reinstall.
+    ptr<req_msg> req = s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 3);
+    CHK_NONNULL( req.get() );
+    CHK_EQ( msg_type::append_entries_request, req->get_type() );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 3: invalid acknowledgements do not change peer progress.
+int late_snapshot_install_ack_validation_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    struct BadAck {
+        const char* what;
+        ulong term_offset;   // Offset from the current term.
+        ulong idx;
+    };
+    std::vector<BadAck> bad_acks = {
+        // Beyond the leader's log.
+        { "idx beyond precommit index", 0, fx.precommit_idx + 1 },
+        // From an earlier term.
+        { "stale term", 1, fx.leader_snp->get_last_log_idx() },
+        // Not a valid snapshot boundary.
+        { "zero idx", 0, 0 },
+        // `idx + 1` would wrap.
+        { "max idx", 0, std::numeric_limits<ulong>::max() },
+    };
+
+    ulong next_log_idx = fx.safe_next_log_idx;
+    ulong matched_idx = next_log_idx - 1;
+    ulong floor_idx = next_log_idx - 2;
+
+    for (auto& bad_ack: bad_acks) {
+        _msg("  case: %s\n", bad_ack.what);
+
+        reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+        CHK_Z( arm_pending_resp(s1, "S3") );
+
+        set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+        CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+        CHK_Z( deliver_install_snapshot_resp(
+                   s1, "S3", 3, fx.term - bad_ack.term_offset, true, 1,
+                   make_snp_install_done_ctx(1, bad_ack.idx, 9)) );
+
+        CHK_Z( check_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx) );
+    }
+
+    // A declined response preserves existing cursor handling.
+    _msg("  case: declined response with an extended payload\n");
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+    set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, false, next_log_idx + 1,
+               make_snp_install_done_ctx(
+                   1, fx.leader_snp->get_last_log_idx(), 9)) );
+
+    CHK_EQ( next_log_idx + 1,
+            s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( 0, s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 4: an old acknowledgement must not complete a newer install.
+int late_snapshot_install_ack_wrong_snapshot_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/true) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong idx_i = 3;
+    ulong idx_j = fx.leader_snp->get_last_log_idx();
+    CHK_GT( idx_j, idx_i );
+
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+
+    set_peer_cursor(s1, 3, 1, 0, 0);
+
+    // The timed-out install of I is replaced by an in-progress install of J.
+    ptr<snapshot> snp_i =
+        cs_new<snapshot>( idx_i,
+                          fx.leader_snp->get_last_log_term(),
+                          fx.leader_snp->get_last_config(),
+                          0,
+                          snapshot::logical_object );
+    CHK_Z( expire_snapshot_sync_ctx(s1, 3, snp_i) );
+
+    s1.fNet->setPeerSnapshotInSync(s1.raftServer.get(), 3, fx.leader_snp);
+    s1.fNet->beginPeerSnapshotAsyncRequest(s1.raftServer.get(), 3);
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(1, idx_i, 9)) );
+
+    // J remains live and uncredited.
+    CHK_EQ( idx_i, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+    CHK_EQ( idx_j,
+            s1.fNet->getPeerSnapshotSyncCtxLastLogIdx(s1.raftServer.get(), 3) );
+    // Credit the installed snapshot, I.
+    CHK_EQ( idx_i + 1, s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( idx_i + 1,
+            s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 5: retain legacy marker behavior.
+int late_snapshot_install_ack_legacy_marker_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong next_log_idx = fx.safe_next_log_idx;
+    ulong matched_idx = next_log_idx - 1;
+    ulong floor_idx = next_log_idx - 2;
+
+    // An expired context leaves a legacy marker uninterpretable.
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+    set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+    CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(0, 0, 1)) );
+
+    CHK_Z( check_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx) );
+
+    // A live context still completes from a legacy marker.
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+    reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+    CHK_Z( arm_pending_resp(s1, "S3") );
+    set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+    s1.fNet->setPeerSnapshotInSync(s1.raftServer.get(), 3, fx.leader_snp);
+    CHK_Z( deliver_install_snapshot_resp(
+               s1, "S3", 3, fx.term, true, 1,
+               make_snp_install_done_ctx(0, 0, 1)) );
+
+    CHK_EQ( snp_idx, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_EQ( snp_idx + 1, s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 6: malformed payloads cannot complete an install.
+int late_snapshot_install_ack_malformed_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong idx_j = fx.leader_snp->get_last_log_idx();
+    ulong next_log_idx = fx.safe_next_log_idx;
+    ulong matched_idx = next_log_idx - 1;
+    ulong floor_idx = next_log_idx - 2;
+
+    struct Malformed {
+        const char* what;
+        uint8_t tag;
+        size_t len;
+    };
+    std::vector<Malformed> cases = {
+        // Legacy tag with an index-sized payload.
+        { "legacy tag with an index-sized payload", 0, 9 },
+        // Truncated index payload.
+        { "index tag with a truncated payload", 1, 5 },
+    };
+
+    for (auto& bad: cases) {
+        for (int with_live_ctx = 0; with_live_ctx <= 1; ++with_live_ctx) {
+            _msg("  case: %s, live context: %s\n",
+                 bad.what, with_live_ctx ? "yes" : "no");
+
+            reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+            CHK_Z( arm_pending_resp(s1, "S3") );
+
+            set_peer_cursor(s1, 3, next_log_idx, matched_idx, floor_idx);
+            CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+            if (with_live_ctx) {
+                s1.fNet->setPeerSnapshotInSync(
+                    s1.raftServer.get(), 3, fx.leader_snp);
+            }
+
+            CHK_Z( deliver_install_snapshot_resp(
+                       s1, "S3", 3, fx.term, true, 1,
+                       make_snp_install_done_ctx(bad.tag, idx_j, bad.len)) );
+
+            CHK_Z( check_peer_cursor(
+                       s1, 3, next_log_idx, matched_idx, floor_idx) );
+
+            if (with_live_ctx) {
+                // The live transfer survives.
+                CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(
+                              s1.raftServer.get(), 3) );
+                CHK_EQ( idx_j,
+                        s1.fNet->getPeerSnapshotSyncCtxLastLogIdx(
+                            s1.raftServer.get(), 3) );
+            }
+        }
+    }
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// Case 7: unknown nonzero tags retain the fixed index prefix.
+int late_snapshot_install_ack_future_format_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+
+    for (size_t len: {size_t(9), size_t(17)}) {
+        _msg("  case: unknown tag 2, payload length %zu\n", len);
+
+        reset_peer_for_arming(s1, 3, fx.safe_next_log_idx);
+        CHK_Z( arm_pending_resp(s1, "S3") );
+
+        set_peer_cursor(s1, 3, 1, 0, 0);
+        CHK_Z( expire_snapshot_sync_ctx(s1, 3, fx.leader_snp) );
+        CHK_Z( deliver_install_snapshot_resp(
+                   s1, "S3", 3, fx.term, true, 1,
+                   make_snp_install_done_ctx(2, snp_idx, len)) );
+
+        CHK_EQ( snp_idx + 1,
+                s1.fNet->getPeerNextLogIdx(s1.raftServer.get(), 3) );
+        CHK_EQ( snp_idx, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+        CHK_EQ( snp_idx + 1,
+                s1.fNet->getPeerNextLogIdxFloor(s1.raftServer.get(), 3) );
+    }
+
+    print_stats(fx.pkgs);
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
 } // namespace snapshot_test
 using namespace snapshot_test;
 
@@ -2455,6 +3034,36 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot user ctx deferred free test",
                snapshot_user_ctx_deferred_free_test );
+
+    ts.doTest( "late snapshot install ack accepted test",
+               late_snapshot_install_ack_accepted_test );
+
+    ts.doTest( "late snapshot install ack new member test",
+               late_snapshot_install_ack_new_member_test );
+
+    ts.doTest( "late snapshot install ack new member wrong snapshot test",
+               late_snapshot_install_ack_new_member_wrong_snapshot_test );
+
+    ts.doTest( "late snapshot install ack monotonic test",
+               late_snapshot_install_ack_monotonic_test );
+
+    ts.doTest( "late snapshot install ack no reinstall test",
+               late_snapshot_install_ack_no_reinstall_test );
+
+    ts.doTest( "late snapshot install ack validation test",
+               late_snapshot_install_ack_validation_test );
+
+    ts.doTest( "late snapshot install ack wrong snapshot test",
+               late_snapshot_install_ack_wrong_snapshot_test );
+
+    ts.doTest( "late snapshot install ack legacy marker test",
+               late_snapshot_install_ack_legacy_marker_test );
+
+    ts.doTest( "late snapshot install ack malformed test",
+               late_snapshot_install_ack_malformed_test );
+
+    ts.doTest( "late snapshot install ack future format test",
+               late_snapshot_install_ack_future_format_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
