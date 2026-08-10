@@ -2524,6 +2524,88 @@ static int expire_snapshot_sync_ctx(RaftPkg& leader,
     return 0;
 }
 
+static ptr<resp_msg> make_install_snapshot_resp(int32 peer_id,
+                                                ulong term,
+                                                ptr<buffer> ctx) {
+    ptr<resp_msg> resp = cs_new<resp_msg>( term,
+                                           msg_type::install_snapshot_response,
+                                           peer_id,
+                                           1,   // S1, the leader.
+                                           1,
+                                           true );
+    resp->set_ctx(ctx);
+    return resp;
+}
+
+// A joining server has its own response handler. It must recover when the
+// final snapshot acknowledgement arrives after its context has timed out.
+int late_snapshot_install_ack_new_member_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    RaftPkg s4(fx.f_base, 4, std::string("S4"));
+    CHK_Z( launch_servers( {&s4} ) );
+    s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+
+    ulong snp_idx = fx.leader_snp->get_last_log_idx();
+    s1.fNet->setServerToJoinSnapshotInSync(
+        s1.raftServer.get(), fx.leader_snp, /*timeout_ms=*/0);
+    CHK_TRUE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+    CHK_TRUE( s1.fNet->checkServerToJoinSnapshotTimeout(s1.raftServer.get()) );
+    CHK_FALSE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+
+    ptr<resp_msg> resp = make_install_snapshot_resp(
+        4, fx.term, make_snp_install_done_ctx(1, snp_idx, 9));
+    s1.fNet->handleInstallSnapshotRespNewMember(s1.raftServer.get(), *resp);
+
+    CHK_EQ( snp_idx + 1,
+            s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()) );
+    CHK_EQ( snp_idx,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+    CHK_EQ( snp_idx + 1,
+            s1.fNet->getServerToJoinNextLogIdxFloor(s1.raftServer.get()) );
+
+    s4.raftServer->shutdown();
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
+// A late acknowledgement for an older snapshot must not complete the newer
+// snapshot currently being transferred to the joining server.
+int late_snapshot_install_ack_new_member_wrong_snapshot_test() {
+    LateAckFixture fx;
+    CHK_Z( setup_late_ack_fixture(fx, /*use_bg_thread_for_snapshot_io=*/false) );
+    RaftPkg& s1 = *fx.s1;
+
+    RaftPkg s4(fx.f_base, 4, std::string("S4"));
+    CHK_Z( launch_servers( {&s4} ) );
+    s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+
+    ulong idx_i = fx.leader_snp->get_last_log_idx();
+    ptr<snapshot> snp_j = cs_new<snapshot>(
+        idx_i + 1,
+        fx.leader_snp->get_last_log_term(),
+        fx.leader_snp->get_last_config(),
+        0,
+        snapshot::logical_object );
+    s1.fNet->setServerToJoinSnapshotInSync(s1.raftServer.get(), snp_j);
+
+    ptr<resp_msg> resp = make_install_snapshot_resp(
+        4, fx.term, make_snp_install_done_ctx(1, idx_i, 9));
+    s1.fNet->handleInstallSnapshotRespNewMember(s1.raftServer.get(), *resp);
+
+    CHK_TRUE( s1.fNet->hasServerToJoinSnapshotSyncCtx(s1.raftServer.get()) );
+    CHK_EQ( snp_j->get_last_log_idx(),
+            s1.fNet->getServerToJoinSnapshotSyncCtxLastLogIdx(s1.raftServer.get()) );
+    CHK_EQ( idx_i,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+
+    s4.raftServer->shutdown();
+    shutdown_late_ack_fixture(fx);
+    return 0;
+}
+
 // Case 1: accept a late acknowledgement after context expiry.
 int late_snapshot_install_ack_accepted_test() {
     LateAckFixture fx;
@@ -2955,6 +3037,12 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "late snapshot install ack accepted test",
                late_snapshot_install_ack_accepted_test );
+
+    ts.doTest( "late snapshot install ack new member test",
+               late_snapshot_install_ack_new_member_test );
+
+    ts.doTest( "late snapshot install ack new member wrong snapshot test",
+               late_snapshot_install_ack_new_member_wrong_snapshot_test );
 
     ts.doTest( "late snapshot install ack monotonic test",
                late_snapshot_install_ack_monotonic_test );

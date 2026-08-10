@@ -92,6 +92,17 @@ protected:
     static ulong get_precommit_index(raft_server* srv) {
         return srv->precommit_index_;
     }
+
+    /// Invokes the joining-server snapshot response handler (for testing).
+    static void handle_install_snapshot_resp_new_member(raft_server* srv,
+                                                        resp_msg& resp) {
+        srv->handle_install_snapshot_resp_new_member(resp);
+    }
+
+    /// Gets the server currently being added to the cluster (for testing).
+    static ptr<peer> get_srv_to_join(raft_server* srv) {
+        return srv->srv_to_join_;
+    }
 };
 
 }

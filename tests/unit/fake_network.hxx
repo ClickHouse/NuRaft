@@ -269,6 +269,55 @@ public:
         return get_precommit_index(srv);
     }
 
+    void setServerToJoinSnapshotInSync(raft_server* srv,
+                                       ptr<snapshot> snp,
+                                       ulong timeout_ms = 10 * 1000) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        if (joiner) {
+            joiner->set_snapshot_in_sync(snp, timeout_ms);
+        }
+    }
+
+    bool hasServerToJoinSnapshotSyncCtx(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        return joiner && joiner->get_snapshot_sync_ctx();
+    }
+
+    ulong getServerToJoinSnapshotSyncCtxLastLogIdx(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        if (joiner) {
+            ptr<snapshot_sync_ctx> sync_ctx = joiner->get_snapshot_sync_ctx();
+            if (sync_ctx && sync_ctx->get_snapshot()) {
+                return sync_ctx->get_snapshot()->get_last_log_idx();
+            }
+        }
+        return 0;
+    }
+
+    bool checkServerToJoinSnapshotTimeout(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        return joiner && check_snapshot_timeout(srv, joiner);
+    }
+
+    ulong getServerToJoinNextLogIdx(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        return joiner ? joiner->get_next_log_idx() : 0;
+    }
+
+    ulong getServerToJoinMatchedIdx(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        return joiner ? joiner->get_matched_idx() : 0;
+    }
+
+    ulong getServerToJoinNextLogIdxFloor(raft_server* srv) {
+        ptr<peer> joiner = get_srv_to_join(srv);
+        return joiner ? joiner->get_next_log_idx_floor() : 0;
+    }
+
+    void handleInstallSnapshotRespNewMember(raft_server* srv, resp_msg& resp) {
+        handle_install_snapshot_resp_new_member(srv, resp);
+    }
+
     ulong getPeerSnapshotSyncCtxLastLogIdx(raft_server* srv, int32 peer_id) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);

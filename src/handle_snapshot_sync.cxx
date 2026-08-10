@@ -600,13 +600,68 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
     }
     srv_to_join_->reset_resp_timer();
 
+    // A terminal context may identify the installed snapshot. Unlike an
+    // ordinary peer, a joining server is not in `peers_`, so it reaches this
+    // handler through `ex_resp_handler_`.
+    ulong acked_snp_idx = 0;
+    bool has_acked_snp_idx = false;
+    bool ctx_is_well_formed = true;
+    if (resp.get_ctx()) {
+        ctx_is_well_formed = snp_install_done_ctx::parse(
+            *resp.get_ctx(), acked_snp_idx, has_acked_snp_idx);
+    }
+
+    // Credit a terminal acknowledgement only when it belongs to the current
+    // leader term and describes a valid, already-written snapshot boundary.
+    auto advance_joiner_to_acked_idx = [&](ulong acked_idx) -> bool {
+        if (resp.get_term() != state_->get_term()) {
+            p_wn("ignore the install of snapshot idx %" PRIu64 " acknowledged by joining peer %d: "
+                 "response term %" PRIu64 " is not the current term %" PRIu64,
+                 acked_idx, srv_to_join_->get_id(), resp.get_term(), state_->get_term());
+            return false;
+        }
+        if (acked_idx == 0 ||
+            acked_idx == std::numeric_limits<ulong>::max()) {
+            p_wn("ignore the install acknowledged by joining peer %d: "
+                 "snapshot idx %" PRIu64 " is out of range",
+                 srv_to_join_->get_id(), acked_idx);
+            return false;
+        }
+        if (acked_idx > precommit_index_) {
+            p_wn("ignore the install of snapshot idx %" PRIu64 " acknowledged by joining peer %d: "
+                 "it is beyond this server's precommit index %" PRIu64,
+                 acked_idx, srv_to_join_->get_id(), precommit_index_.load());
+            return false;
+        }
+
+        srv_to_join_->set_matched_idx(
+            std::max(srv_to_join_->get_matched_idx(), acked_idx));
+        srv_to_join_->set_next_log_idx_floor(
+            std::max(srv_to_join_->get_next_log_idx_floor(), acked_idx + 1));
+        srv_to_join_->set_next_log_idx(
+            std::max(srv_to_join_->get_next_log_idx(), acked_idx + 1));
+        return true;
+    };
+
     ptr<snapshot_sync_ctx> sync_ctx = srv_to_join_->get_snapshot_sync_ctx();
+    if (!ctx_is_well_formed) {
+        p_wn("joining peer %d sent an install snapshot response with a malformed terminal context "
+             "of %zu bytes, drop the response",
+             srv_to_join_->get_id(), resp.get_ctx()->size());
+        return;
+    }
+
     if (sync_ctx == nullptr) {
-        p_ft("SnapshotSyncContext must not be null: "
-             "src %d dst %d my id %d leader id %d, "
-             "maybe leader election happened in the meantime. "
-             "next heartbeat or append request will cover it up.",
-             resp.get_src(), resp.get_dst(), id_, leader_.load());
+        if (has_acked_snp_idx && advance_joiner_to_acked_idx(acked_snp_idx)) {
+            p_in("snapshot install is done for joining peer %d: "
+                 "late acknowledgement of snapshot idx %" PRIu64
+                 ", the sync context was already gone",
+                 srv_to_join_->get_id(), acked_snp_idx);
+            sync_log_to_new_srv(srv_to_join_->get_next_log_idx());
+        } else {
+            p_in("no snapshot sync context for joining peer %d, drop the response",
+                 srv_to_join_->get_id());
+        }
         return;
     }
 
@@ -623,13 +678,23 @@ void raft_server::handle_install_snapshot_resp_new_member(resp_msg& resp) {
         ( snp->get_type() == snapshot::logical_object &&
           resp.get_ctx() );
 
-    if (snp_install_done) {
+    if ( snp_install_done && has_acked_snp_idx &&
+         acked_snp_idx != snp->get_last_log_idx() ) {
+        p_wn("joining peer %d acknowledged the install of snapshot idx %" PRIu64 " while "
+             "snapshot idx %" PRIu64 " is in flight, "
+             "do not treat the in-flight install as done",
+             srv_to_join_->get_id(), acked_snp_idx, snp->get_last_log_idx());
+        advance_joiner_to_acked_idx(acked_snp_idx);
+
+    } else if (snp_install_done) {
         // snapshot is done
         p_in("snapshot install is done\n");
         srv_to_join_->set_next_log_idx
             ( sync_ctx->get_snapshot()->get_last_log_idx() + 1 );
         srv_to_join_->set_matched_idx
             ( sync_ctx->get_snapshot()->get_last_log_idx() );
+        srv_to_join_->set_next_log_idx_floor
+            ( sync_ctx->get_snapshot()->get_last_log_idx() + 1 );
 
         clear_snapshot_sync_ctx(*srv_to_join_);
 
