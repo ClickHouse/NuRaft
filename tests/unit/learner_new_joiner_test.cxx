@@ -425,17 +425,10 @@ int learner_to_normal_test() {
 using namespace learner_new_joiner_test;
 
 // A server joining a cluster must be sent its log pack even when asynchronous
-// snapshot IO is enabled.
+// snapshot IO is enabled; that request used to be dropped in that mode.
 //
-// `sync_log_to_new_srv` builds either a snapshot request or a log-pack
-// `sync_log_request`, then used to send it only when asynchronous snapshot IO
-// was OFF, invoking the snapshot IO thread instead. Nothing enqueues a log pack
-// with that thread, so the request was dropped, the leader's catch-up loop
-// waited for a response that could not arrive, and the configuration was never
-// committed -- the joining server never joined.
-//
-// Retains all logs and pushes the snapshot out of reach, so the join is served
-// from the LOG rather than from a snapshot: that is the branch under test.
+// Retains all logs and pushes the snapshot out of reach so the join is served
+// from the LOG rather than from a snapshot -- that is the branch that was broken.
 int log_sync_with_async_snapshot_io_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -487,10 +480,9 @@ int log_sync_with_async_snapshot_io_test() {
     }
     wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC);
 
-    // The joining server must actually have joined. Asserting that it merely made
-    // some progress is not enough: on the unfixed build it still receives the
-    // initial configuration entry and sits at log index 1, while the leader is at
-    // 12 and the new server is absent from the cluster configuration.
+    // Must actually have JOINED. "Made some progress" would not fail against the
+    // unfixed code, which still delivers the initial configuration entry and leaves
+    // the server at index 1, absent from the cluster configuration.
     CHK_NONNULL( s1.raftServer->get_srv_config(3).get() );
     CHK_GTEQ( s3.raftServer->get_last_log_idx(), leader_last - 1 );
 
