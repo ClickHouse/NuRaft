@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "debugging_options.hxx"
 #include "fake_network.hxx"
+#include "fake_executer.hxx"
 #include "raft_package_fake.hxx"
 
 #include "raft_params.hxx"
@@ -423,6 +424,86 @@ int learner_to_normal_test() {
 }  // namespace learner_new_joiner_test;
 using namespace learner_new_joiner_test;
 
+// A server joining a cluster must be sent its log pack even when asynchronous
+// snapshot IO is enabled.
+//
+// `sync_log_to_new_srv` builds either a snapshot request or a log-pack
+// `sync_log_request`, then used to send it only when asynchronous snapshot IO
+// was OFF, invoking the snapshot IO thread instead. Nothing enqueues a log pack
+// with that thread, so the request was dropped, the leader's catch-up loop
+// waited for a response that could not arrive, and the configuration was never
+// committed -- the joining server never joined.
+//
+// Retains all logs and pushes the snapshot out of reach, so the join is served
+// from the LOG rather than from a snapshot: that is the branch under test.
+int log_sync_with_async_snapshot_io_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs_old = {&s1, &s2};
+    std::vector<RaftPkg*> pkgs_new = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs_new ) );
+    CHK_Z( make_group( pkgs_old ) );
+
+    // The state machines need a driver: without one, wait_for_sm_exec below never
+    // returns.
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    for (auto& entry: pkgs_new) {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.use_bg_thread_for_snapshot_io_ = true;
+        param.reserved_log_items_ = 1000000;
+        param.snapshot_distance_ = 1000000;
+        entry->raftServer->update_params(param);
+    }
+
+    for (size_t ii = 0; ii < 10; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret = s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs_old, COMMIT_TIMEOUT_SEC) );
+
+    const uint64_t leader_last = s1.raftServer->get_last_log_idx();
+    CHK_GT( leader_last, (uint64_t)0 );
+
+    s1.raftServer->add_srv( *(s3.getTestMgr()->get_srv_config()) );
+    for (int ii = 0; ii < 20; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC);
+    for (int ii = 0; ii < 20; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC);
+
+    // The joining server must actually have joined. Asserting that it merely made
+    // some progress is not enough: on the unfixed build it still receives the
+    // initial configuration entry and sits at log index 1, while the leader is at
+    // 12 and the new server is absent from the cluster configuration.
+    CHK_NONNULL( s1.raftServer->get_srv_config(3).get() );
+    CHK_GTEQ( s3.raftServer->get_last_log_idx(), leader_last - 1 );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+    f_base->destroy();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     TestSuite ts(argc, argv);
 
@@ -442,6 +523,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "learner to normal test",
                learner_to_normal_test );
+
+    ts.doTest( "log sync with async snapshot io test",
+               log_sync_with_async_snapshot_io_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
