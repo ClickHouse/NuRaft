@@ -355,11 +355,13 @@ void raft_server::sync_log_to_new_srv(ulong start_idx) {
               ( state_->get_term(), log_pack, log_val_type::log_pack) );
     }
 
-    if (!params->use_bg_thread_for_snapshot_io_) {
-        // Synchronous IO: directly send here.
+    if (req) {
+        // Dispatch on what was built, not on the IO mode: only the snapshot branch
+        // defers to the IO thread, and nothing enqueues a log pack with
+        // `snapshot_io_mgr`, so keying this on the mode dropped the log-pack request.
         srv_to_join_->send_req(srv_to_join_, req, ex_resp_handler_);
-    } else {
-        // Asynchronous IO: invoke the thread.
+    } else if (params->use_bg_thread_for_snapshot_io_) {
+        // `create_sync_snapshot_req` queued the read; the IO thread sends it.
         snapshot_io_mgr::instance().invoke();
     }
 }
