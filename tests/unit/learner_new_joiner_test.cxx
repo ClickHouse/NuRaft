@@ -474,11 +474,11 @@ int log_sync_with_async_snapshot_io_test() {
     for (int ii = 0; ii < 20; ++ii) {
         s1.fNet->execReqResp();
     }
-    wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC);
+    CHK_Z( wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC) );
     for (int ii = 0; ii < 20; ++ii) {
         s1.fNet->execReqResp();
     }
-    wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC);
+    CHK_Z( wait_for_sm_exec(pkgs_new, COMMIT_TIMEOUT_SEC) );
 
     // Must actually have JOINED. "Made some progress" would not fail against the
     // unfixed code, which still delivers the initial configuration entry and leaves
