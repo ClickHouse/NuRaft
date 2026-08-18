@@ -100,7 +100,6 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
-        , slow_member_backpressure_max_hold_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -663,42 +662,6 @@ public:
      * from the leader for a configured time (`full_consensus_follower_limit_`).
      */
     bool use_full_consensus_among_healthy_members_;
-
-    /**
-     * (Experimental)
-     * How long, in millisecond, the leader holds the commit index back for a
-     * member that has fallen behind, before giving up on it.
-     *
-     * Without this, the commit index advances as soon as a quorum has
-     * acknowledged a log, so a member slower than the quorum is never waited
-     * for and can keep falling behind indefinitely, until it is so far behind
-     * that it needs a snapshot. While the commit index is held, clients are
-     * not acknowledged, which stops the leader from accepting new writes as
-     * fast, and the member gets a chance to catch up.
-     *
-     * A member starts being waited for when it falls behind the last log
-     * index by more than `stale_log_gap_`, and stops being waited for once
-     * the gap is one replication batch (`max_append_size_`) back under that
-     * threshold. In a healthy cluster, where every member is within a batch
-     * of the leader, nothing is ever held.
-     *
-     * The two thresholds are deliberately close: a member is pinned just
-     * under `stale_log_gap_` by many short holds, rather than being held
-     * until it has closed the whole gap, which would stall writes for the
-     * entire catch-up.
-     *
-     * A member that does not respond at all, or that is receiving a snapshot,
-     * is never waited for: it cannot catch up any faster because the commit
-     * index waits, so holding it would only stall the cluster.
-     *
-     *   - If `0`, the commit index is never held (default).
-     *   - If positive, it is held for at most that long for a given member,
-     *     after which the member is left behind until it becomes fresh again.
-     *   - If negative, it is held until the member catches up, with no time
-     *     limit. Use with care: nothing can be committed meanwhile, including
-     *     the configuration change that would remove that member.
-     */
-    int32 slow_member_backpressure_max_hold_;
 
     /**
      * (Experimental)

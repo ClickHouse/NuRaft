@@ -738,15 +738,6 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
 
     if (params->use_full_consensus_among_healthy_members_) {
         // Full consensus mode: set flag indicating the member is excluded.
-        //
-        // NOTE: Unlike `get_expected_committed_log_idx`, this is not gated on
-        //       `custom_commit_quorum_size_ == 0`. The two therefore disagree
-        //       when a custom quorum size is set: the leader commits by that
-        //       quorum while it still tells members whether they would have
-        //       been excluded by full consensus. Keeping the flag is the
-        //       conservative direction, as a member that is behind is told so;
-        //       suppressing it would make every member believe it is part of
-        //       the quorum.
         uint64_t last_resp_time_ms = p.get_resp_timer_us() / 1000;
         uint64_t expiry = params->heart_beat_interval_ *
                           raft_server::raft_limits_.full_consensus_leader_limit_;
@@ -1902,102 +1893,13 @@ ulong raft_server::get_expected_committed_log_idx() {
     }
 
     aci_params.current_commit_index_ = quick_commit_index_;
-    aci_params.expected_commit_index_ =
-        apply_slow_member_backpressure(matched_indexes[quorum_idx]);
+    aci_params.expected_commit_index_ = matched_indexes[quorum_idx];
     uint64_t adjusted_commit_index = state_machine_->adjust_commit_index(aci_params);
     if (aci_params.expected_commit_index_ != adjusted_commit_index) {
         p_tr( "commit index adjusted: %" PRIu64 " -> %" PRIu64,
               aci_params.expected_commit_index_, adjusted_commit_index );
     }
     return adjusted_commit_index;
-}
-
-uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_index) {
-    ptr<raft_params> params = ctx_->get_params();
-    int32_t max_hold = params->slow_member_backpressure_max_hold_;
-    if (!max_hold) {
-        return expected_commit_index;
-    }
-
-    if (params->custom_commit_quorum_size_) {
-        // The quorum is being overridden on purpose, e.g. recovery mode.
-        // Holding the commit index for a member would defeat that.
-        return expected_commit_index;
-    }
-
-    int32_t expiry = params->heart_beat_interval_ *
-                     raft_server::raft_limits_.full_consensus_leader_limit_;
-    uint64_t last_log_idx = log_store_->next_slot() - 1;
-    uint64_t held_commit_index = expected_commit_index;
-
-    for (auto& entry: peers_) {
-        ptr<peer>& pp = entry.second;
-        if (!is_regular_member(pp)) continue;
-
-        uint64_t matched_idx = pp->get_matched_idx();
-        uint64_t gap = last_log_idx > matched_idx ? last_log_idx - matched_idx : 0;
-
-        // A member that does not respond, or that has not responded yet after
-        // a new connection, or that is receiving a snapshot, does not catch up
-        // any faster because the commit index waits for it.
-        bool can_catch_up =
-            (int32_t)(pp->get_resp_timer_us() / 1000) <= expiry &&
-            matched_idx &&
-            !pp->get_snapshot_sync_ctx();
-
-        p_tr("backpressure: peer %d matched %" PRIu64 ", last log %" PRIu64 ", "
-             "gap %" PRIu64 ", resp %" PRIu64 " ms, expiry %d ms, snapshot %s, "
-             "can catch up %s, lagging %s",
-             pp->get_id(), matched_idx, last_log_idx, gap,
-             pp->get_resp_timer_us() / 1000, expiry,
-             pp->get_snapshot_sync_ctx() ? "YES" : "NO",
-             can_catch_up ? "YES" : "NO",
-             pp->is_lagging() ? "YES" : "NO");
-
-        // The release threshold is only one replication batch below the hold
-        // threshold, so that an episode ends as soon as the member is back
-        // under the limit. A wider band, e.g. releasing at `fresh_log_gap_`,
-        // would make every episode last until the member closed almost the
-        // whole gap, stalling writes for that long. With a narrow band the
-        // member is instead pinned just under `stale_log_gap_`: the leader is
-        // throttled to its speed in many short steps rather than one long
-        // stall, which is gentler on clients and converges just as well.
-        uint64_t hold_gap = params->stale_log_gap_;
-        uint64_t release_gap =
-            hold_gap > (uint64_t)params->max_append_size_
-            ? hold_gap - params->max_append_size_ : hold_gap / 2;
-
-        if (!can_catch_up || gap <= release_gap) {
-            if (pp->clear_lagging()) {
-                p_wn("peer %d is back within %" PRIu64 " log entries, gap "
-                     "%" PRIu64 ", stop holding the commit index for it",
-                     pp->get_id(), release_gap, gap);
-            }
-            continue;
-        }
-
-        if (gap > hold_gap && pp->set_lagging()) {
-            p_wn("peer %d fell behind by %" PRIu64 " log entries, more than "
-                 "the stale log gap %" PRIu64 ": hold the commit index for it, "
-                 "so that it can catch up",
-                 pp->get_id(), gap, hold_gap);
-        }
-
-        if (!pp->is_lagging() || pp->is_backpressure_given_up()) continue;
-
-        if (max_hold > 0 && pp->get_lagging_ms() >= (uint64_t)max_hold) {
-            pp->set_backpressure_given_up();
-            p_er("peer %d did not catch up within %d ms, gap is still "
-                 "%" PRIu64 ": leave it behind and resume committing",
-                 pp->get_id(), max_hold, gap);
-            continue;
-        }
-
-        held_commit_index = std::min(held_commit_index, matched_idx);
-    }
-
-    // The commit index must never move backwards.
-    return std::max(held_commit_index, quick_commit_index_.load());
 }
 
 void raft_server::notify_log_append_completion(bool ok) {

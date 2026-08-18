@@ -29,14 +29,6 @@ unit_test(NAME raft_server_test
     ${EXAMPLES_SRC}/in_memory_log_store.cxx
 )
 
-unit_test(NAME slow_member_backpressure_test
-    SOURCES
-    unit/slow_member_backpressure_test.cxx
-    unit/fake_network.cxx
-    ${EXAMPLES_SRC}/logger.cc
-    ${EXAMPLES_SRC}/in_memory_log_store.cxx
-)
-
 unit_test(NAME snapshot_test
     SOURCES
     unit/snapshot_test.cxx

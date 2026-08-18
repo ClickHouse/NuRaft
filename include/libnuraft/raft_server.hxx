@@ -1090,7 +1090,6 @@ protected:
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
     size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
-    uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,
                                         int32_t expiry,

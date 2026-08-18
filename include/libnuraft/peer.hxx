@@ -64,8 +64,6 @@ public:
                             timer_task_type::heartbeat_timer ) )
         , snp_sync_ctx_(nullptr)
         , lock_()
-        , lagging_(false)
-        , backpressure_given_up_(false)
         , long_pause_warnings_(0)
         , network_recoveries_(0)
         , manual_free_(false)
@@ -273,40 +271,6 @@ public:
     // Time of the last network activity from peer (including failure).
     void reset_active_timer()       { last_active_timer_.reset(); }
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
-
-    // Whether this peer has fallen so far behind that the leader holds the
-    // commit index back for it. Entering and leaving this state use two
-    // different gaps (`stale_log_gap_` and `fresh_log_gap_`), so the caller
-    // provides the hysteresis and this is a plain latch.
-    //
-    // Returns `true` if this call changed the state, for logging.
-    bool set_lagging() {
-        if (lagging_.exchange(true)) {
-            return false;
-        }
-        lagging_timer_.reset();
-        return true;
-    }
-    bool clear_lagging() {
-        backpressure_given_up_ = false;
-        return lagging_.exchange(false);
-    }
-    // Forget the state entirely, without the caller treating it as a
-    // transition. Called when this server becomes the leader, as it did not
-    // track the peers as a follower.
-    void reset_lagging() {
-        lagging_ = false;
-        backpressure_given_up_ = false;
-        lagging_timer_.reset();
-    }
-    bool is_lagging() const         { return lagging_; }
-    uint64_t get_lagging_ms()       { return lagging_timer_.get_ms(); }
-
-    // Whether the leader stopped holding the commit index for this peer
-    // because it did not catch up in time. Reset only when the peer becomes
-    // fresh again, so that it cannot immediately hold the commit again.
-    bool is_backpressure_given_up() const   { return backpressure_given_up_; }
-    void set_backpressure_given_up()        { backpressure_given_up_ = true; }
 
     void reset_long_pause_warnings()    { long_pause_warnings_ = 0; }
     void inc_long_pause_warnings()      { long_pause_warnings_.fetch_add(1); }
@@ -580,23 +544,6 @@ private:
      * Timestamp when the last active network activity was detected.
      */
     timer_helper last_active_timer_;
-
-    /**
-     * `true` if this peer has fallen behind by more than `stale_log_gap_`
-     * and the leader is holding the commit index back for it.
-     */
-    std::atomic<bool> lagging_;
-
-    /**
-     * Timestamp when this peer started lagging.
-     */
-    timer_helper lagging_timer_;
-
-    /**
-     * `true` if the leader stopped holding the commit index for this peer
-     * because it did not catch up within the configured time.
-     */
-    std::atomic<bool> backpressure_given_up_;
 
     /**
      * Counter of long pause warnings.

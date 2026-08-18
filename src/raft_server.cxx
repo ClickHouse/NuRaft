@@ -429,7 +429,6 @@ void raft_server::apply_and_log_current_params() {
           "parallel log appending: %s, "
           "streaming mode max log gap %d, max bytes %" PRIu64 ", "
           "full consensus mode: %s, "
-          "slow member backpressure max hold %d, "
           "tracking peer sm committed index: %s, "
           "max uncommitted log entries %" PRIu64,
           params->election_timeout_lower_bound_,
@@ -457,7 +456,6 @@ void raft_server::apply_and_log_current_params() {
           params->max_log_gap_in_stream_,
           params->max_bytes_in_flight_in_stream_,
           params->use_full_consensus_among_healthy_members_ ? "ON" : "OFF",
-          params->slow_member_backpressure_max_hold_,
           params->track_peers_sm_commit_idx_ ? "ON" : "OFF",
           params->max_uncommitted_log_entries_
         );
@@ -1193,9 +1191,6 @@ void raft_server::become_leader() {
             pp->set_next_log_idx(log_store_->next_slot());
             pp->set_next_log_idx_floor(0);
             pp->reset_stream();
-            // This server did not track the peers as a follower, so anything
-            // it knows about them lagging is stale.
-            pp->reset_lagging();
             enable_hb_for_peer(*pp);
             pp->set_recovered();
             pp->set_snapshot_sync_is_needed(false);
