@@ -31,6 +31,7 @@ public:
         leadership_takeover         = 2,
         request_resignation         = 3,
         request_leadership          = 4,
+        set_full_consensus_mode     = 5,
     };
 
     custom_notification_msg(type t = out_of_log_range_warning)
@@ -67,6 +68,19 @@ public:
     static ptr<force_vote_msg> deserialize(buffer& buf);
 
     ptr<buffer> serialize() const;
+};
+
+class full_consensus_mode_msg {
+public:
+    full_consensus_mode_msg(bool enable = false)
+        : enable_(enable)
+        {}
+
+    static ptr<full_consensus_mode_msg> deserialize(buffer& buf);
+
+    ptr<buffer> serialize() const;
+
+    bool enable_;
 };
 
 } // namespace nuraft;

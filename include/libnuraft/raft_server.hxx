@@ -138,6 +138,8 @@ public:
             leave_limit_ = src.leave_limit_.load();
             vote_limit_ = src.vote_limit_.load();
             busy_connection_limit_ = src.busy_connection_limit_.load();
+            full_consensus_leader_limit_ = src.full_consensus_leader_limit_.load();
+            full_consensus_follower_limit_ = src.full_consensus_follower_limit_.load();
             return *this;
         }
 
@@ -469,6 +471,24 @@ public:
     bool request_leadership(int successor_id = -1);
 
     /**
+     * Request the current leader to turn on/off full consensus mode
+     * (`use_full_consensus_among_healthy_members_`) at runtime.
+     *
+     * If this server is the leader, the mode is applied immediately.
+     * Otherwise, the request is forwarded to the current leader.
+     * After applying the mode, the leader propagates it to all peers
+     * on a best-effort basis; a peer whose connection is busy or down
+     * may miss the propagation, hence users should verify the mode
+     * on each node via `get_current_params`.
+     *
+     * @param enable If `true`, turn on full consensus mode.
+     * @return `true` if the request was applied locally or successfully
+     *         sent to the leader. It does not guarantee that the leader
+     *         has applied it.
+     */
+    bool request_full_consensus_mode(bool enable);
+
+    /**
      * Start the election timer on this server, if this server is a follower.
      * It will allow the election timer permanently, if it was disabled
      * by state manager.
@@ -752,6 +772,18 @@ public:
      * @param new_params Parameters to set.
      */
     void update_params(const raft_params& new_params);
+
+    /**
+     * Update the current Raft parameters by modifying them in place.
+     *
+     * Unlike a `get_current_params` - modify - `update_params` sequence, the
+     * read and the write happen under the same lock, so a concurrent update
+     * of an unrelated parameter cannot be lost.
+     *
+     * @param modifier Invoked with a copy of the current parameters, under
+     *                 the Raft lock. It should not block.
+     */
+    void modify_params(const std::function<void(raft_params&)>& modifier);
 
     /**
      * Get the current Raft parameters.
@@ -1234,6 +1266,14 @@ protected:
     ptr<resp_msg> handle_request_leadership_request(req_msg& req,
                                              ptr<custom_notification_msg> msg,
                                              ptr<resp_msg> resp);
+
+    ptr<resp_msg> handle_full_consensus_mode_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    void apply_full_consensus_mode(bool enable);
+
+    void broadcast_full_consensus_mode(bool enable);
 
     void remove_peer_from_peers(const ptr<peer>& pp);
 

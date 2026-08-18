@@ -136,6 +136,33 @@ ptr<buffer> force_vote_msg::serialize() const {
 }
 
 
+// --- full_consensus_mode_msg ---
+
+ptr<full_consensus_mode_msg> full_consensus_mode_msg::deserialize(buffer& buf) {
+    ptr<full_consensus_mode_msg> ret = cs_new<full_consensus_mode_msg>();
+    buffer_serializer bs(buf);
+    uint8_t version = bs.get_u8();
+    (void)version;
+    ret->enable_ = bs.get_u8() != 0;
+    return ret;
+}
+
+ptr<buffer> full_consensus_mode_msg::serialize() const {
+    //   << Format >>
+    // version                      1 byte
+    // enable flag                  1 byte
+
+    size_t len = sizeof(uint8_t) + sizeof(uint8_t);
+    ptr<buffer> ret = buffer::alloc(len);
+
+    const uint8_t CURRENT_VERSION = 0x0;
+    buffer_serializer bs(ret);
+    bs.put_u8(CURRENT_VERSION);
+    bs.put_u8(enable_ ? 1 : 0);
+    return ret;
+}
+
+
 // --- handlers ---
 
 ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
@@ -170,6 +197,9 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     }
     case custom_notification_msg::request_leadership: {
         return handle_request_leadership_request(req, msg, resp);
+    }
+    case custom_notification_msg::set_full_consensus_mode: {
+        return handle_full_consensus_mode_request(req, msg, resp);
     }
     default:
         break;
@@ -261,6 +291,70 @@ ptr<resp_msg> raft_server::handle_request_leadership_request
     return resp;
 }
 
+ptr<resp_msg> raft_server::handle_full_consensus_mode_request
+                           ( req_msg& req,
+                             ptr<custom_notification_msg> msg,
+                             ptr<resp_msg> resp )
+{
+    if (!msg->ctx_) {
+        p_er("[FULL CONSENSUS MODE] got request from peer %d "
+             "without context", req.get_src());
+        return resp;
+    }
+
+    if (req.get_term() < state_->get_term()) {
+        // A request with a stale term may come from a leader that
+        // has not yet found out that it was deposed. Ignoring it also
+        // prevents two servers believing they are leaders from
+        // re-broadcasting the mode to each other in a loop.
+        p_wn("[FULL CONSENSUS MODE] got request from peer %d "
+             "with stale term %" PRIu64 ", my term %" PRIu64 ", ignore it",
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
+    // A newer term is proof that this node is behind, and that it is not the
+    // leader anymore if it thought it was. Step down before doing anything
+    // else, as a deposed leader must not re-broadcast with its stale term.
+    update_term(req.get_term());
+
+    ptr<full_consensus_mode_msg> fc_msg =
+        full_consensus_mode_msg::deserialize(*msg->ctx_);
+
+    if (is_leader()) {
+        // A follower asks this leader to change the mode:
+        // apply it and propagate to all peers.
+        p_in("[FULL CONSENSUS MODE] got request from peer %d "
+             "to turn full consensus mode %s",
+             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
+        apply_full_consensus_mode(fc_msg->enable_);
+        broadcast_full_consensus_mode(fc_msg->enable_);
+
+    } else if (req.get_src() == leader_ || leader_ == -1) {
+        // Propagation from the current leader: apply locally.
+        //
+        // NOTE: `leader_ == -1` is accepted as well, otherwise every
+        //       propagation that races with a leader change would be dropped,
+        //       and the mode would systematically diverge right after every
+        //       election. In that window the sender cannot be verified to be
+        //       the leader, only to be in the current term, which is enough
+        //       here: the mode affects availability, not safety, and it is
+        //       best-effort by design.
+        p_in("[FULL CONSENSUS MODE] leader %d turned "
+             "full consensus mode %s",
+             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
+        apply_full_consensus_mode(fc_msg->enable_);
+
+    } else {
+        p_wn("[FULL CONSENSUS MODE] got request from peer %d, "
+             "but this node is not a leader and the request is not "
+             "from the current leader %d",
+             req.get_src(), leader_.load());
+    }
+
+    return resp;
+}
+
 
 void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     if (!resp.get_accepted()) return;
@@ -272,8 +366,17 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     }
     ptr<peer> p = it->second;
 
-    p->set_next_log_idx(resp.get_next_idx());
-    p->reset_cnt_backward_log_probe();
+    // NOTE: Only move the next log index forward. A custom notification is not
+    //       a log replication request, and its response carries the peer's
+    //       current `next_slot`, which is behind the leader's view while the
+    //       peer is catching up or receiving a snapshot. Moving the index
+    //       backwards here would make the leader re-send log entries it
+    //       already sent, or decide that the peer needs a snapshot again and
+    //       restart the transfer from the beginning.
+    if (resp.get_next_idx() > p->get_next_log_idx()) {
+        p->set_next_log_idx(resp.get_next_idx());
+        p->reset_cnt_backward_log_probe();
+    }
 }
 
 } // namespace nuraft;
