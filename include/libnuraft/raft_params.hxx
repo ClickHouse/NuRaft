@@ -101,6 +101,7 @@ struct raft_params {
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
         , slow_member_backpressure_max_hold_(0)
+        , slow_member_backpressure_gap_window_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -679,13 +680,24 @@ public:
      * A member starts being waited for when it falls behind the last log
      * index by more than `stale_log_gap_`, and stops being waited for once
      * the gap is one replication batch (`max_append_size_`) back under that
-     * threshold. In a healthy cluster, where every member is within a batch
-     * of the leader, nothing is ever held.
+     * threshold, or half of `stale_log_gap_` if it is not even a batch wide.
+     * In a healthy cluster, where every member is within a batch of the
+     * leader, nothing is ever held.
      *
      * The two thresholds are deliberately close: a member is pinned just
      * under `stale_log_gap_` by many short holds, rather than being held
      * until it has closed the whole gap, which would stall writes for the
-     * entire catch-up.
+     * entire catch-up. Note what this does and does not guarantee: while a
+     * member is being waited for, nothing beyond its matched index commits,
+     * but an episode ends while it is still up to a batch behind, so a
+     * committed entry is not necessarily on that member. The guarantee is a
+     * bound on how far behind it can fall, not inclusion in the quorum.
+     *
+     * This option bounds a single episode, not the total time a member is
+     * waited for. A member that stays slow but keeps making progress is held
+     * again and again, on purpose: that is what limits the gap. It is
+     * therefore expected that the leader runs at the speed of the slowest
+     * member for as long as that member is slow.
      *
      * A member that does not respond at all, or that is receiving a snapshot,
      * is never waited for: it cannot catch up any faster because the commit
@@ -699,6 +711,27 @@ public:
      *     the configuration change that would remove that member.
      */
     int32 slow_member_backpressure_max_hold_;
+
+    /**
+     * (Experimental)
+     * How long, in millisecond, a member's gap has to stop shrinking before
+     * the leader starts holding the commit index for it.
+     *
+     * Being far behind is not by itself a reason to wait: a member that is
+     * draining a backlog after a restart, after installing a snapshot, or
+     * right after joining is far behind and yet perfectly able to recover on
+     * its own, and waiting for it would stall the cluster for no benefit. Only
+     * a member whose gap stops improving needs the leader to slow down.
+     *
+     * Every time the gap reaches a new low the window restarts, so a member
+     * that keeps making progress is never waited for, however large its gap.
+     *
+     * If `0`, four heartbeat intervals are used. If negative, the trend is
+     * not considered at all and a member is waited for as soon as its gap
+     * crosses `stale_log_gap_`. Only meaningful when
+     * `slow_member_backpressure_max_hold_` is set.
+     */
+    int32 slow_member_backpressure_gap_window_;
 
     /**
      * (Experimental)

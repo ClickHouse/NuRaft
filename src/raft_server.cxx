@@ -409,6 +409,14 @@ void raft_server::apply_and_log_current_params() {
             p_wn("invalid election timeout upper bound detected, adjusted to %d",
                  params->election_timeout_upper_bound_);
         }
+        if (params->stale_log_gap_ < params->fresh_log_gap_) {
+            // Same adjustment as in the constructor, so that the effective
+            // value does not depend on whether the parameters were given at
+            // startup or through `update_params`.
+            params->stale_log_gap_ = params->fresh_log_gap_;
+            p_wn("stale log gap smaller than fresh log gap detected, "
+                 "adjusted to %d", params->stale_log_gap_);
+        }
     }
 
     p_in( "parameters: "

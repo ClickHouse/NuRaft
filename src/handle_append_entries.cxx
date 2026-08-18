@@ -1915,20 +1915,55 @@ ulong raft_server::get_expected_committed_log_idx() {
 uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_index) {
     ptr<raft_params> params = ctx_->get_params();
     int32_t max_hold = params->slow_member_backpressure_max_hold_;
-    if (!max_hold) {
+    uint64_t hold_gap = params->stale_log_gap_;
+    if (!max_hold || !hold_gap) {
+        // Disabled. A zero hold gap would mean waiting for every member until
+        // it has literally everything, which is never what an operator wants.
         return expected_commit_index;
     }
 
     if (params->custom_commit_quorum_size_) {
         // The quorum is being overridden on purpose, e.g. recovery mode.
-        // Holding the commit index for a member would defeat that.
+        // Holding the commit index for a member would defeat that. Forget the
+        // state as well, so that the time a member spends behind while the
+        // override is in place is not counted against its hold time.
+        for (auto& entry: peers_) {
+            entry.second->reset_lagging();
+        }
         return expected_commit_index;
     }
 
-    int32_t expiry = params->heart_beat_interval_ *
-                     raft_server::raft_limits_.full_consensus_leader_limit_;
+    // The release threshold is only one replication batch below the hold
+    // threshold, so that an episode ends as soon as the member is back under
+    // the limit. A wider band, e.g. releasing at `fresh_log_gap_`, would make
+    // every episode last until the member had closed almost the whole gap,
+    // stalling writes for that long. With a narrow band the member is instead
+    // pinned just under `stale_log_gap_`: the leader is throttled to its speed
+    // in many short steps rather than one long stall, which is gentler on
+    // clients and converges just as well.
+    //
+    // If the hold gap is not even one batch wide, half of it has to do.
+    uint64_t release_gap =
+        hold_gap > (uint64_t)params->max_append_size_
+        ? hold_gap - params->max_append_size_ : hold_gap / 2;
+
+    uint64_t expiry = (uint64_t)params->heart_beat_interval_ *
+                      raft_server::raft_limits_.full_consensus_leader_limit_;
+    int32_t gap_window = params->slow_member_backpressure_gap_window_
+                         ? params->slow_member_backpressure_gap_window_
+                         : params->heart_beat_interval_ * 4;
     uint64_t last_log_idx = log_store_->next_slot() - 1;
     uint64_t held_commit_index = expected_commit_index;
+
+    // Transitions are rate limited, as the intended steady state for a slow
+    // member is a series of short holds, which would otherwise be a pair of
+    // warnings per batch. The budget is consumed only when something is
+    // actually logged: consuming it on every evaluation would leave the
+    // warnings to be emitted by whichever evaluation happens to fall on the
+    // boundary, which is almost never one that has anything to report.
+    auto transition_log_lv = [this]() {
+        return transition_msg_timer_.timeout_and_reset() ? L_WARN : L_TRACE;
+    };
 
     for (auto& entry: peers_) {
         ptr<peer>& pp = entry.second;
@@ -1937,50 +1972,73 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         uint64_t matched_idx = pp->get_matched_idx();
         uint64_t gap = last_log_idx > matched_idx ? last_log_idx - matched_idx : 0;
 
-        // A member that does not respond, or that has not responded yet after
-        // a new connection, or that is receiving a snapshot, does not catch up
-        // any faster because the commit index waits for it.
+        // Waiting for a member only makes sense if the wait is what it needs to
+        // catch up. It is not eligible when:
+        //   - its last request failed, i.e. it is unreachable right now. The
+        //     response timer alone is not enough: it is only reset by an
+        //     accepted response, so a member that just crashed still looks
+        //     responsive for as long as the expiry.
+        //   - it has not responded within the expiry.
+        //   - it has not responded at all yet after a new connection.
+        //   - it is receiving a snapshot, which does not go any faster.
         bool can_catch_up =
-            (int32_t)(pp->get_resp_timer_us() / 1000) <= expiry &&
+            !pp->get_rpc_errs() &&
+            pp->get_resp_timer_us() / 1000 <= expiry &&
             matched_idx &&
             !pp->get_snapshot_sync_ctx();
 
         p_tr("backpressure: peer %d matched %" PRIu64 ", last log %" PRIu64 ", "
-             "gap %" PRIu64 ", resp %" PRIu64 " ms, expiry %d ms, snapshot %s, "
-             "can catch up %s, lagging %s",
+             "gap %" PRIu64 ", resp %" PRIu64 " ms, expiry %" PRIu64 " ms, "
+             "rpc errors %d, snapshot %s, can catch up %s, lagging %s, "
+             "given up %s, gap window %d ms",
              pp->get_id(), matched_idx, last_log_idx, gap,
              pp->get_resp_timer_us() / 1000, expiry,
+             pp->get_rpc_errs(),
              pp->get_snapshot_sync_ctx() ? "YES" : "NO",
              can_catch_up ? "YES" : "NO",
-             pp->is_lagging() ? "YES" : "NO");
+             pp->is_lagging() ? "YES" : "NO",
+             pp->is_backpressure_given_up() ? "YES" : "NO",
+             gap_window);
 
-        // The release threshold is only one replication batch below the hold
-        // threshold, so that an episode ends as soon as the member is back
-        // under the limit. A wider band, e.g. releasing at `fresh_log_gap_`,
-        // would make every episode last until the member closed almost the
-        // whole gap, stalling writes for that long. With a narrow band the
-        // member is instead pinned just under `stale_log_gap_`: the leader is
-        // throttled to its speed in many short steps rather than one long
-        // stall, which is gentler on clients and converges just as well.
-        uint64_t hold_gap = params->stale_log_gap_;
-        uint64_t release_gap =
-            hold_gap > (uint64_t)params->max_append_size_
-            ? hold_gap - params->max_append_size_ : hold_gap / 2;
-
-        if (!can_catch_up || gap <= release_gap) {
+        if (!can_catch_up) {
+            // Not eligible. Note that this does not clear the give-up latch:
+            // the member has not caught up, so it must not earn a fresh hold
+            // by going away and coming back.
             if (pp->clear_lagging()) {
-                p_wn("peer %d is back within %" PRIu64 " log entries, gap "
-                     "%" PRIu64 ", stop holding the commit index for it",
-                     pp->get_id(), release_gap, gap);
+                p_lv(transition_log_lv(),
+                     "peer %d cannot catch up by waiting, gap %" PRIu64 ": "
+                     "stop holding the commit index for it",
+                     pp->get_id(), gap);
             }
+            pp->reset_gap_window(gap);
             continue;
         }
 
-        if (gap > hold_gap && pp->set_lagging()) {
-            p_wn("peer %d fell behind by %" PRIu64 " log entries, more than "
-                 "the stale log gap %" PRIu64 ": hold the commit index for it, "
-                 "so that it can catch up",
-                 pp->get_id(), gap, hold_gap);
+        if (gap <= release_gap) {
+            if (pp->set_caught_up()) {
+                p_lv(transition_log_lv(),
+                     "peer %d is back within %" PRIu64 " log entries, gap "
+                     "%" PRIu64 ": stop holding the commit index for it",
+                     pp->get_id(), release_gap, gap);
+            }
+            pp->reset_gap_window(gap);
+            continue;
+        }
+
+        // Being behind is not enough: the member also has to have stopped
+        // closing the distance. A member that is draining a backlog after a
+        // restart, after a snapshot, or right after joining is far behind and
+        // recovering on its own, and waiting for it would stall the cluster
+        // for no benefit at all - with a rolling restart, once per member.
+        if (!pp->is_backpressure_given_up() &&
+            gap > hold_gap &&
+            (gap_window < 0 || pp->gap_is_not_shrinking(gap, gap_window)) &&
+            pp->set_lagging()) {
+            p_lv(transition_log_lv(),
+                 "peer %d fell behind by %" PRIu64 " log entries, more than "
+                 "the stale log gap %" PRIu64 ", and stopped catching up for "
+                 "%d ms: hold the commit index for it, so that it can catch up",
+                 pp->get_id(), gap, hold_gap, gap_window);
         }
 
         if (!pp->is_lagging() || pp->is_backpressure_given_up()) continue;
@@ -1988,8 +2046,9 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         if (max_hold > 0 && pp->get_lagging_ms() >= (uint64_t)max_hold) {
             pp->set_backpressure_given_up();
             p_er("peer %d did not catch up within %d ms, gap is still "
-                 "%" PRIu64 ": leave it behind and resume committing",
-                 pp->get_id(), max_hold, gap);
+                 "%" PRIu64 ": leave it behind and resume committing until it "
+                 "is back within %" PRIu64 " log entries",
+                 pp->get_id(), max_hold, gap, release_gap);
             continue;
         }
 

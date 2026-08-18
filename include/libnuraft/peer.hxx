@@ -31,6 +31,7 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
+#include <limits>
 
 namespace nuraft {
 
@@ -66,6 +67,7 @@ public:
         , lock_()
         , lagging_(false)
         , backpressure_given_up_(false)
+        , gap_at_window_start_(std::numeric_limits<uint64_t>::max())
         , long_pause_warnings_(0)
         , network_recoveries_(0)
         , manual_free_(false)
@@ -276,8 +278,8 @@ public:
 
     // Whether this peer has fallen so far behind that the leader holds the
     // commit index back for it. Entering and leaving this state use two
-    // different gaps (`stale_log_gap_` and `fresh_log_gap_`), so the caller
-    // provides the hysteresis and this is a plain latch.
+    // different gaps, so the caller provides the hysteresis and this is a
+    // plain latch.
     //
     // Returns `true` if this call changed the state, for logging.
     bool set_lagging() {
@@ -287,7 +289,17 @@ public:
         lagging_timer_.reset();
         return true;
     }
+    // The peer stopped being eligible to be waited for, e.g. it stopped
+    // responding. The give-up latch is deliberately kept: the peer has not
+    // caught up, so it must not earn a fresh hold by becoming ineligible and
+    // then eligible again.
     bool clear_lagging() {
+        return lagging_.exchange(false);
+    }
+
+    // The peer caught up. This is the only thing that clears the give-up
+    // latch and lets the peer be waited for again later.
+    bool set_caught_up() {
         backpressure_given_up_ = false;
         return lagging_.exchange(false);
     }
@@ -298,13 +310,41 @@ public:
         lagging_ = false;
         backpressure_given_up_ = false;
         lagging_timer_.reset();
+        gap_at_window_start_ = std::numeric_limits<uint64_t>::max();
+        gap_window_timer_.reset();
     }
     bool is_lagging() const         { return lagging_; }
     uint64_t get_lagging_ms()       { return lagging_timer_.get_ms(); }
 
+    // Whether this peer's gap has stopped shrinking, i.e. it is not merely
+    // behind but failing to close the distance.
+    //
+    // The gap at the start of the window is compared with the gap at its end:
+    // if it decreased, the peer is working through its backlog and must not be
+    // held, however large the backlog still is - that is what a peer does
+    // after a restart, after a snapshot, or right after joining. If it did not
+    // decrease, the peer is not keeping up and the leader has to slow down.
+    //
+    // Within a window there is nothing to conclude yet, so the answer is
+    // `false`: the default is not to interfere.
+    bool gap_is_not_shrinking(uint64_t gap, int32_t window_ms) {
+        if (gap_window_timer_.get_ms() < (uint64_t)window_ms) {
+            return false;
+        }
+        bool shrinking = gap < gap_at_window_start_;
+        gap_at_window_start_ = gap;
+        gap_window_timer_.reset();
+        return !shrinking;
+    }
+
+    void reset_gap_window(uint64_t gap) {
+        gap_at_window_start_ = gap;
+        gap_window_timer_.reset();
+    }
+
     // Whether the leader stopped holding the commit index for this peer
-    // because it did not catch up in time. Reset only when the peer becomes
-    // fresh again, so that it cannot immediately hold the commit again.
+    // because it did not catch up in time. Reset only by `set_caught_up`, so
+    // that the peer cannot immediately hold the commit index again.
     bool is_backpressure_given_up() const   { return backpressure_given_up_; }
     void set_backpressure_given_up()        { backpressure_given_up_ = true; }
 
@@ -597,6 +637,17 @@ private:
      * because it did not catch up within the configured time.
      */
     std::atomic<bool> backpressure_given_up_;
+
+    /**
+     * The gap this peer had when the current trend window started, which the
+     * gap at the end of the window is compared against.
+     */
+    uint64_t gap_at_window_start_;
+
+    /**
+     * When the current trend window started.
+     */
+    timer_helper gap_window_timer_;
 
     /**
      * Counter of long pause warnings.
