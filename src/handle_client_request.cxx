@@ -189,7 +189,7 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
             entry->set_term(cur_term);
 
             next_slot = store_log_entry(entry);
-            p_db("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
+            p_tr("append at log_idx %" PRIu64 ", timestamp %" PRIu64,
                  next_slot, timestamp_us);
         }
         catch (const std::exception & e)

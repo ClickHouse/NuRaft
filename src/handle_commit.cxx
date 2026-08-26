@@ -42,7 +42,7 @@ namespace nuraft {
 void raft_server::commit(ulong target_idx) {
     bool track_peers_sm_commit_idx = ctx_->get_params()->track_peers_sm_commit_idx_;
     if (target_idx > quick_commit_index_) {
-        p_db( "trigger commit upto %" PRIu64 ", current quick commit index %" PRIu64,
+        p_tr( "trigger commit upto %" PRIu64 ", current quick commit index %" PRIu64,
               target_idx, quick_commit_index_.load() );
         quick_commit_index_ = target_idx;
         lagging_sm_target_index_ = target_idx;

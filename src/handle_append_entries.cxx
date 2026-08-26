@@ -712,7 +712,7 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              end_idx, adjusted_end_idx);
     }
 
-    p_db( "append_entries for %d with LastLogIndex=%" PRIu64 ", "
+    p_tr( "append_entries for %d with LastLogIndex=%" PRIu64 ", "
           "LastLogTerm=%" PRIu64 ", EntriesLength=%zu, CommitIndex=%" PRIu64 ", "
           "Term=%" PRIu64 ", peer_last_sent_idx %" PRIu64,
           p.get_id(), last_log_idx, last_log_term,
@@ -1013,7 +1013,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         // Local counter for iterating req.log_entries().
         size_t cnt = 0;
 
-        p_db("[INIT] log_idx: %" PRIu64 ", count: %zu, "
+        p_tr("[INIT] log_idx: %" PRIu64 ", count: %zu, "
              "log_store_->next_slot(): %" PRIu64 ", "
              "req.log_entries().size(): %zu",
              log_idx, cnt, log_store_->next_slot(), req.log_entries().size());
@@ -1030,7 +1030,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 break;
             }
         }
-        p_db("[after SKIP] log_idx: %" PRIu64 ", count: %zu", log_idx, cnt);
+        p_tr("[after SKIP] log_idx: %" PRIu64 ", count: %zu", log_idx, cnt);
 
         // Rollback (only if necessary).
         // WARNING:
@@ -1140,7 +1140,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
             if (stopping_) return resp;
         }
-        p_db("[after OVWR] log_idx: %" PRIu64 ", count: %zu", log_idx, cnt);
+        p_tr("[after OVWR] log_idx: %" PRIu64 ", count: %zu", log_idx, cnt);
 
         if (rollback_in_progress) {
             p_in("last log index after rollback and overwrite: %" PRIu64,

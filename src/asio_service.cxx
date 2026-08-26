@@ -1508,7 +1508,7 @@ public:
             pending_write_reqs_.push_back(
                 cs_new<pending_req_pkg>(req, when_done, send_timeout_ms));
             immediate_action_needed = (pending_write_reqs_.size() == 1);
-            p_db("start to send msg to peer %d, start_log_idx: %" PRIu64 ", "
+            p_tr("start to send msg to peer %d, start_log_idx: %" PRIu64 ", "
                  "size: %" PRIu64 ", pending write reqs: %" PRIu64 "",
                  req->get_dst(), req->get_last_log_idx(),
                  req->log_entries().size(), pending_write_reqs_.size());
@@ -2008,7 +2008,7 @@ private:
                 return; // close_socket already drained pending_read_reqs_, don't add to it
             pending_read_reqs_.push_back(cs_new<pending_req_pkg>(req, when_done, receive_timeout_ms));
             immediate_action_needed = (pending_read_reqs_.size() == 1);
-            p_db("msg to peer %d has been write down, start_log_idx: %" PRIu64 ", "
+            p_tr("msg to peer %d has been write down, start_log_idx: %" PRIu64 ", "
                  "size: %" PRIu64 ", pending read reqs: %" PRIu64 "", req->get_dst(),
                  req->get_last_log_idx(),
                  req->log_entries().size(), pending_read_reqs_.size());
@@ -2297,7 +2297,7 @@ private:
 
                 if (!pending_read_reqs_.empty()) {
                     next_req_pkg = *pending_read_reqs_.begin();
-                    p_db("trigger next read, start_log_idx: %" PRIu64 ", "
+                    p_tr("trigger next read, start_log_idx: %" PRIu64 ", "
                         "pending read reqs: %" PRIu64 "",
                         next_req_pkg->req_->get_last_log_idx(),
                         pending_read_reqs_.size());
