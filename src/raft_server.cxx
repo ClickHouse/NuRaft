@@ -873,7 +873,7 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
     }
 
     if (resp) {
-        p_db( "Response back a %s message to %d with Accepted=%d, "
+        p_tr( "Response back a %s message to %d with Accepted=%d, "
               "Term=%" PRIu64 ", NextIndex=%" PRIu64 "",
               msg_type_to_string(resp->get_type()).c_str(),
               resp->get_dst(),
