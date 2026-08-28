@@ -691,7 +691,8 @@ public:
      * A member starts being waited for when it falls behind the last log
      * index by more than `stale_log_gap_`, and stops being waited for once
      * the gap is one replication batch (`max_append_size_`) back under that
-     * threshold, or half of `stale_log_gap_` if it is not even a batch wide.
+     * threshold, or half of `stale_log_gap_` if that threshold is not wider
+     * than a batch.
      * In a healthy cluster, where every member is within a batch of the
      * leader, nothing is ever held.
      *
@@ -734,8 +735,12 @@ public:
      * its own, and waiting for it would stall the cluster for no benefit. Only
      * a member whose gap stops improving needs the leader to slow down.
      *
-     * Every time the gap reaches a new low the window restarts, so a member
-     * that keeps making progress is never waited for, however large its gap.
+     * The gap is sampled once per window and compared with the sample at the
+     * end of the previous one, so a member that keeps making progress is never
+     * waited for, however large its gap. A gap that dips and returns within a
+     * single window is not noticed, which is the intended coarseness: the
+     * question is whether the member is closing the distance over time, not
+     * whether it did so momentarily.
      *
      * If `0`, four heartbeat intervals are used. If negative, the trend is
      * not considered at all and a member is waited for as soon as its gap

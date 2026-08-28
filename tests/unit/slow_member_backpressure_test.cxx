@@ -60,6 +60,23 @@ static void append_and_deliver_to(RaftPkg& leader,
     }
 }
 
+// The last log index of the leader's own log, i.e. what a member's gap is
+// measured against.
+static uint64_t tail(RaftPkg& leader) {
+    return leader.getTestMgr()->load_log_store()->next_slot() - 1;
+}
+
+// Whether the commit index is being held short of the log.
+//
+// Always the commit index and never the state machine index: the feature
+// clamps the former, and the latter trails it on the apply thread, so
+// asserting on it can pass while a member is wrongly held, or fail while it
+// is not.
+#define CHK_HELD(pkg) \
+    CHK_GT( tail(pkg), (pkg).raftServer->get_target_committed_log_idx() )
+#define CHK_NOT_HELD(pkg) \
+    CHK_EQ( tail(pkg), (pkg).raftServer->get_target_committed_log_idx() )
+
 // The last log index of a peer, from the leader's point of view, i.e. exactly
 // what the backpressure compares against.
 static uint64_t matched_idx_of(RaftPkg& leader, int32_t peer_id) {
@@ -110,7 +127,7 @@ int holds_commit_for_lagging_member_test() {
     // No time limit, so that only catching up releases the member.
     CHK_Z( prepare(pkgs, -1) );
 
-    uint64_t commit_idx = s1.raftServer->get_committed_log_idx();
+    uint64_t commit_idx = s1.raftServer->get_target_committed_log_idx();
 
     // S3 gets nothing, so it falls behind by more than the stale log gap,
     // while S1 and S2 alone are a majority.
@@ -119,8 +136,8 @@ int holds_commit_for_lagging_member_test() {
     // Entries keep committing until S3 is more than `stale_log_gap_` behind,
     // and then the leader starts waiting for it: the commit index stops well
     // short of the last log index, even though S1 and S2 are a majority.
-    uint64_t last_log_idx = s1.getTestMgr()->load_log_store()->next_slot() - 1;
-    uint64_t held_at = s1.raftServer->get_committed_log_idx();
+    uint64_t last_log_idx = tail(s1);
+    uint64_t held_at = s1.raftServer->get_target_committed_log_idx();
     CHK_GT( last_log_idx, held_at );
     CHK_SMEQ( held_at, commit_idx + STALE_LOG_GAP );
 
@@ -136,8 +153,10 @@ int holds_commit_for_lagging_member_test() {
     return 0;
 }
 
-// With the feature disabled, the same lagging member is simply outrun.
-int disabled_by_default_test() {
+// With no hold time configured the feature does nothing, even when it has been
+// switched on: both the switch and the hold time are required. The switch
+// itself, including its default, is covered by `runtime_toggle_test`.
+int no_hold_time_configured_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
 
@@ -152,15 +171,14 @@ int disabled_by_default_test() {
 
     CHK_Z( prepare(pkgs, 0) );
 
-    uint64_t commit_idx = s1.raftServer->get_committed_log_idx();
+    uint64_t commit_idx = s1.raftServer->get_target_committed_log_idx();
 
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "outrun");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
 
     // A majority acknowledged, so everything is committed without S3.
-    CHK_GT( s1.raftServer->get_committed_log_idx(), commit_idx );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_GT( s1.raftServer->get_target_committed_log_idx(), commit_idx );
+    CHK_NOT_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -185,13 +203,12 @@ int gives_up_after_max_hold_test() {
     const int32_t MAX_HOLD_MS = 500;
     CHK_Z( prepare(pkgs, MAX_HOLD_MS) );
 
-    uint64_t commit_idx = s1.raftServer->get_committed_log_idx();
+    uint64_t commit_idx = s1.raftServer->get_target_committed_log_idx();
 
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "giveup");
 
     // Still within the time limit: the commit index is held short of the log.
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     TestSuite::sleep_ms(MAX_HOLD_MS * 2, "wait for the leader to give up on S3");
 
@@ -199,7 +216,7 @@ int gives_up_after_max_hold_test() {
     // the leader gave up on S3 and no longer waits for it.
     append_and_deliver_to(s1, 1, {s2_addr}, "after_giveup");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -230,7 +247,7 @@ int hold_threshold_is_exact_test() {
     // S2 must have every entry for the majority index to be the tail; a busy
     // peer can leave it short, which would look like a hold.
     while (s1.fNet->execReqResp(s2_addr)) {}
-    uint64_t last_log_idx = s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    uint64_t last_log_idx = tail(s1);
     CHK_EQ( STALE_LOG_GAP, last_log_idx - matched_idx_of(s1, 3) );
     // The commit index, not the state machine index: whether anything is held
     // is decided on the commit index, and the apply thread trails it, so
@@ -243,8 +260,7 @@ int hold_threshold_is_exact_test() {
     // peer can leave it short, which would look like a hold.
     while (s1.fNet->execReqResp(s2_addr)) {}
     CHK_EQ( last_log_idx, s1.raftServer->get_target_committed_log_idx() );
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -275,7 +291,7 @@ int not_held_when_unresponsive_test() {
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
 
     // S1 and S2 are a majority and S3 cannot catch up by being waited for.
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -316,29 +332,27 @@ int release_threshold_is_below_hold_test() {
     // peer can leave it short, which would look like a hold.
     while (s1.fNet->execReqResp(s2_addr)) {}
     CHK_EQ( STALE_LOG_GAP + 1,
-            s1.getTestMgr()->load_log_store()->next_slot() - 1
+            tail(s1)
                 - matched_idx_of(s1, 3) );
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     // Bring the gap down to exactly the hold threshold, which is still above
     // the release threshold, so the member has to stay held. How many message
     // deliveries that takes is not fixed, so drive it by the gap itself.
     for (int ii = 0; ii < 40; ++ii) {
-        uint64_t current = s1.getTestMgr()->load_log_store()->next_slot() - 1
+        uint64_t current = tail(s1)
                            - matched_idx_of(s1, 3);
         if (current <= STALE_LOG_GAP) break;
         s1.fNet->execReqResp(s3_addr);
     }
     CHK_EQ( STALE_LOG_GAP,
-            s1.getTestMgr()->load_log_store()->next_slot() - 1
+            tail(s1)
                 - matched_idx_of(s1, 3) );
 
     // Nothing new is appended on purpose: replicating further would let the
     // leader decide the member needs a snapshot, which releases it for an
     // unrelated reason.
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -370,6 +384,7 @@ int learner_is_never_held_test() {
     for (RaftPkg* pkg: pkgs) {
         raft_params params = pkg->raftServer->get_current_params();
         params.return_method_ = raft_params::async_handler;
+        params.slow_member_backpressure_enabled_ = true;
         params.slow_member_backpressure_max_hold_ = -1;
         params.slow_member_backpressure_gap_window_ = -1;
         params.stale_log_gap_ = STALE_LOG_GAP;
@@ -380,7 +395,7 @@ int learner_is_never_held_test() {
     // The learner falls far behind, and the two voting members commit anyway.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "learner");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -411,7 +426,7 @@ int not_held_with_custom_quorum_size_test() {
 
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "custom");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -449,7 +464,7 @@ int not_held_while_still_catching_up_test() {
     // Build a backlog far beyond the hold threshold, as a restarted member
     // would have.
     append_and_deliver_to(s1, STALE_LOG_GAP * 4, {s2_addr}, "backlog");
-    uint64_t gap = s1.getTestMgr()->load_log_store()->next_slot() - 1
+    uint64_t gap = tail(s1)
                    - matched_idx_of(s1, 3);
     CHK_GT( gap, STALE_LOG_GAP );
 
@@ -464,7 +479,7 @@ int not_held_while_still_catching_up_test() {
         if (ii % 5 == 0) {
             TestSuite::sleep_ms(20, "let the trend window elapse");
         }
-        uint64_t last_log_idx = s1.getTestMgr()->load_log_store()->next_slot() - 1;
+        uint64_t last_log_idx = tail(s1);
         CHK_EQ( last_log_idx, s1.raftServer->get_target_committed_log_idx() );
     }
 
@@ -500,8 +515,7 @@ int rpc_error_alone_releases_lagging_member_test() {
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "pre");
     uint64_t matched_before = matched_idx_of(s1, 3);
     CHK_GT( matched_before, 0 );
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     // One more entry. Deliver only the request to S2 and keep its response,
     // so that the commit evaluation can be triggered at a chosen moment.
@@ -521,7 +535,7 @@ int rpc_error_alone_releases_lagging_member_test() {
     // S3 is unreachable, so it must not be waited for anymore.
     s1.fNet->handleRespFrom(s2_addr);
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -576,7 +590,7 @@ int never_responded_member_is_not_held_test() {
     // everything must keep committing.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr, s3_addr}, "fresh");
     CHK_Z( wait_for_sm_exec(pkgs_no_s4, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
     CHK_EQ( 0, matched_idx_of(s1, 4) );
 
@@ -623,12 +637,11 @@ int give_up_latch_survives_connection_flap_test() {
     // S3 falls behind, the hold begins and expires: the leader gives up,
     // which is proven by the commit index reaching the end of the log.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "flap_a");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
     TestSuite::sleep_ms(MAX_HOLD_MS * 2, "wait for the leader to give up on S3");
     append_and_deliver_to(s1, 1, {s2_addr}, "flap_b");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     // The flap: S3's connection fails once, making it ineligible, and then
@@ -640,7 +653,7 @@ int give_up_latch_survives_connection_flap_test() {
     // behind, because a batch is one entry.
     s1.fNet->execReqResp(s3_addr);
     s1.fNet->execReqResp(s3_addr);
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1
+    CHK_GT( tail(s1)
                 - matched_idx_of(s1, 3),
             STALE_LOG_GAP );
 
@@ -656,7 +669,7 @@ int give_up_latch_survives_connection_flap_test() {
     // be held: everything must keep committing.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "flap_d");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -694,8 +707,7 @@ int snapshot_receiver_is_not_held_test() {
     // S3 falls behind and the hold begins. The commit index that was reached
     // is past the leader's snapshot point (every 5 commits).
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "snap");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
     // Snapshots are created on the apply thread, so wait for it rather than
     // assuming it has caught up already.
     for (int ii = 0; ii < 200 && s1.getTestSm()->getNumSnapshotCreations() == 0; ++ii) {
@@ -710,13 +722,20 @@ int snapshot_receiver_is_not_held_test() {
     s1.fNet->execReqResp(s3_addr);
 
     // Still far behind, but receiving a snapshot: nothing may be held.
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1
-                - matched_idx_of(s1, 3),
-            STALE_LOG_GAP );
-    append_and_deliver_to(s1, 1, {s2_addr}, "snap_b");
-    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_GT( tail(s1) - matched_idx_of(s1, 3), STALE_LOG_GAP );
+
+    // When exactly the leader decides to send the snapshot depends on the apply
+    // thread, so drive it rather than assuming the decision has been taken: the
+    // loop ends as soon as the commit index reaches the tail, and cannot end at
+    // all if a snapshot receiver is wrongly held.
+    for (int ii = 0; ii < 40; ++ii) {
+        if (tail(s1) == s1.raftServer->get_target_committed_log_idx()) break;
+        s1.fNet->execReqResp(s3_addr);
+        append_and_deliver_to(s1, 1, {s2_addr}, "snap_b" + std::to_string(ii));
+        while (s1.fNet->execReqResp(s2_addr)) {}
+    }
+    CHK_NOT_HELD( s1 );
+    CHK_GT( tail(s1) - matched_idx_of(s1, 3), STALE_LOG_GAP );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -751,8 +770,7 @@ int held_commit_index_never_regresses_test() {
     // S3 falls behind and the hold begins: many evaluations happen while
     // S3's matched index is below the committed index.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "regress");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_committed_log_idx() );
+    CHK_HELD( s1 );
 
     CHK_Z( s1.getTestSm()->getNumCommitIndexRegressions() );
 
@@ -793,8 +811,7 @@ int gives_up_on_a_slowly_progressing_member_test() {
 
     // Fall far behind, so that a handful of single entries cannot close it.
     append_and_deliver_to(s1, STALE_LOG_GAP * 4, {s2_addr}, "slow");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_target_committed_log_idx() );
+    CHK_HELD( s1 );
 
     // Trickle: progress on every step, but never enough.
     for (int ii = 0; ii < 4; ++ii) {
@@ -802,7 +819,7 @@ int gives_up_on_a_slowly_progressing_member_test() {
         s1.fNet->execReqResp(s3_addr);
         s1.fNet->execReqResp(s3_addr);
     }
-    uint64_t gap = s1.getTestMgr()->load_log_store()->next_slot() - 1
+    uint64_t gap = tail(s1)
                    - matched_idx_of(s1, 3);
     CHK_GT( gap, STALE_LOG_GAP );
 
@@ -810,7 +827,7 @@ int gives_up_on_a_slowly_progressing_member_test() {
     // up on and everything a majority has must be committed.
     append_and_deliver_to(s1, 1, {s2_addr}, "after_slow");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
@@ -843,21 +860,20 @@ int held_again_after_catching_up_test() {
     TestSuite::sleep_ms(MAX_HOLD_MS * 2, "wait for the leader to give up");
     append_and_deliver_to(s1, 1, {s2_addr}, "round1_end");
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             s1.raftServer->get_committed_log_idx() );
 
     // Let S3 catch up completely, which is what clears the give-up.
     for (size_t ii = 0; ii < STALE_LOG_GAP * 6; ++ii) {
         s1.fNet->execReqResp(s3_addr);
     }
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
+    CHK_EQ( tail(s1),
             matched_idx_of(s1, 3) );
 
     // Round two: fall behind again. It must be held again, i.e. the commit
     // index must stop short of the log.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "round2");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_target_committed_log_idx() );
+    CHK_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -872,7 +888,9 @@ int held_again_after_catching_up_test() {
 // keep up. Tested directly: through a cluster it would depend on the exact
 // interleaving of message delivery, which says nothing about the rule itself.
 int gap_trend_test() {
-    const int32_t WINDOW_MS = 30;
+    // Wide enough that two scheduler stalls in a row cannot open a window
+    // between the first two calls.
+    const int32_t WINDOW_MS = 200;
     gap_trend trend;
 
     // Nothing to conclude before a window has passed.
@@ -954,17 +972,16 @@ int refuses_new_requests_while_holding_test() {
 
     // Push S3 past the threshold, which starts a hold.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "hold");
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_target_committed_log_idx() );
+    CHK_HELD( s1 );
 
     // Now the leader must refuse, so that the log stops growing.
     std::string refused_str = "refused";
     ptr<buffer> refused = buffer::alloc(refused_str.size() + 1);
     refused->put(refused_str);
-    uint64_t last_log_idx = s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    uint64_t last_log_idx = tail(s1);
     auto rejected = s1.raftServer->append_entries( {refused} );
     CHK_EQ( cmd_result_code::TIMEOUT, rejected->get_result_code() );
-    CHK_EQ( last_log_idx, s1.getTestMgr()->load_log_store()->next_slot() - 1 );
+    CHK_EQ( last_log_idx, tail(s1) );
 
     // Once S3 catches up the hold ends and requests are accepted again.
     for (size_t ii = 0; ii < STALE_LOG_GAP * 6; ++ii) {
@@ -1023,8 +1040,7 @@ int runtime_toggle_test() {
     // Off: a member falling behind is simply outrun.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "off");
     while (s1.fNet->execReqResp(s2_addr)) {}
-    CHK_EQ( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_target_committed_log_idx() );
+    CHK_NOT_HELD( s1 );
 
     // A follower asks for it, which has to reach the leader.
     CHK_TRUE( s3.raftServer->request_slow_member_backpressure(true) );
@@ -1041,8 +1057,7 @@ int runtime_toggle_test() {
     // On: the same lag now holds the commit index back.
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "on");
     while (s1.fNet->execReqResp(s2_addr)) {}
-    CHK_GT( s1.getTestMgr()->load_log_store()->next_slot() - 1,
-            s1.raftServer->get_target_committed_log_idx() );
+    CHK_HELD( s1 );
 
     // Off again, from the leader this time: the hold is released without the
     // member having caught up.
@@ -1055,20 +1070,202 @@ int runtime_toggle_test() {
     // commit index reaches the tail. S3 is deliberately left far behind: if
     // the hold were still in place, no amount of draining S2 would move the
     // commit index past S3's matched index.
-    uint64_t last_log_idx = s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    uint64_t last_log_idx = tail(s1);
     for (int ii = 0; ii < 40; ++ii) {
         if (s1.raftServer->get_target_committed_log_idx() == last_log_idx) break;
         // The heartbeat is what re-sends an entry to a peer that was busy with
         // the propagation when it was appended.
         s1.fTimer->invoke( timer_task_type::heartbeat_timer );
         while (s1.fNet->execReqResp(s2_addr)) {}
-        TestSuite::sleep_ms(5, "wait for the commit index to catch up");
     }
     CHK_EQ( last_log_idx, s1.raftServer->get_target_committed_log_idx() );
     CHK_GT( last_log_idx - matched_idx_of(s1, 3), STALE_LOG_GAP );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
+    return 0;
+}
+
+// The release threshold: a member is released as soon as it is back within one
+// replication batch of the hold threshold, not only when it has caught up
+// completely. Without this, a release either far too late or a batch too early
+// would go unnoticed.
+int release_happens_at_the_release_threshold_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( prepare(pkgs, -1) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.max_append_size_ = 1;
+        pkg->raftServer->update_params(params);
+    }
+    // With a one entry batch the release threshold is one below the hold
+    // threshold, so the two are adjacent and the boundary is exact.
+    const uint64_t RELEASE_GAP = STALE_LOG_GAP - 1;
+
+    append_and_deliver_to(s1, STALE_LOG_GAP + 2, {s2_addr}, "boundary");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_HELD( s1 );
+
+    // Feed the member one message at a time. Above the release threshold it
+    // must stay held; the step that brings it to or below the threshold must
+    // release it, with the member still behind.
+    bool released = false;
+    for (int ii = 0; ii < 60 && !released; ++ii) {
+        uint64_t gap = tail(s1) - matched_idx_of(s1, 3);
+        if (gap > RELEASE_GAP) {
+            CHK_HELD( s1 );
+        } else {
+            released = true;
+            break;
+        }
+        s1.fNet->execReqResp(s3_addr);
+    }
+    CHK_TRUE( released );
+    CHK_SMEQ( tail(s1) - matched_idx_of(s1, 3), RELEASE_GAP );
+    CHK_GT( tail(s1) - matched_idx_of(s1, 3), (uint64_t)0 );
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_NOT_HELD( s1 );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+// With two members behind, the commit index has to be held at the position of
+// the one that is furthest behind. Holding at either one in turn - whichever
+// the peer iteration happens to visit last - would let the leader outrun the
+// member that needs the help most.
+//
+// The commit index never moves backwards, so this is only observable when the
+// nearer member has itself passed the point where the commit index froze: then
+// holding at the nearer member would advance the commit index, and holding at
+// the further one cannot.
+int holds_at_the_furthest_lagging_member_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+    std::string s4_addr = "S4";
+    std::string s5_addr = "S5";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    RaftPkg s4(f_base, 4, s4_addr);
+    RaftPkg s5(f_base, 5, s5_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4, &s5};
+
+    CHK_Z( prepare(pkgs, -1) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.max_append_size_ = 1;
+        // No snapshots: a member far enough behind would be sent one, which
+        // excludes it for a reason unrelated to what this test checks.
+        params.snapshot_distance_ = 0;
+        pkg->raftServer->update_params(params);
+    }
+
+    // S4 and S5 stop receiving, so both fall behind and the hold engages.
+    append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr, s3_addr}, "two_a");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    while (s1.fNet->execReqResp(s3_addr)) {}
+    CHK_HELD( s1 );
+    uint64_t frozen_at = s1.raftServer->get_target_committed_log_idx();
+
+    // The tail runs far ahead while they stay behind.
+    append_and_deliver_to(s1, STALE_LOG_GAP * 8, {s2_addr, s3_addr}, "two_b");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    while (s1.fNet->execReqResp(s3_addr)) {}
+
+    // Both catch up past the point where the commit index froze, but to
+    // different positions and both still far from the tail. They are advanced
+    // by different amounts on purpose, so that holding at either one of them
+    // gives a different commit index and the choice is observable.
+    for (int ii = 0; ii < 200 && matched_idx_of(s1, 5) < frozen_at + 3; ++ii) {
+        s1.fNet->execReqResp(s5_addr);
+    }
+    for (int ii = 0; ii < 400 && matched_idx_of(s1, 4) < frozen_at + 12; ++ii) {
+        s1.fNet->execReqResp(s4_addr);
+    }
+    uint64_t furthest = matched_idx_of(s1, 5);
+    CHK_GT( furthest, frozen_at );
+    CHK_SM( furthest, matched_idx_of(s1, 4) );
+    CHK_GT( tail(s1) - matched_idx_of(s1, 4), STALE_LOG_GAP );
+
+    // Held at the member that is furthest behind, so the commit index reaches
+    // its position and no further - not the position of the nearer one.
+    append_and_deliver_to(s1, 1, {s2_addr, s3_addr}, "two_c");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    while (s1.fNet->execReqResp(s3_addr)) {}
+    CHK_EQ( furthest, s1.raftServer->get_target_committed_log_idx() );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+// A member that goes silent without its requests failing must be released too:
+// it cannot catch up while it is not answering, so waiting for it only stalls
+// the cluster. This is the responsiveness window on its own, with no rpc error
+// and a matched index already known, which is what every other test conflates.
+int silent_member_is_released_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    // Shrink the responsiveness window so silence is noticed within the test:
+    // it is `full_consensus_leader_limit` heartbeats.
+    raft_server::limits new_limits = raft_server::get_raft_limits();
+    new_limits.full_consensus_leader_limit_ = 2;
+    raft_server::set_raft_limits(new_limits);
+
+    CHK_Z( prepare(pkgs, -1) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.heart_beat_interval_ = 20;
+        params.max_append_size_ = 1;
+        pkg->raftServer->update_params(params);
+    }
+
+    // S3 falls behind and is held, with its matched index known and no errors.
+    append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "silent");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_GT( matched_idx_of(s1, 3), (uint64_t)0 );
+    CHK_HELD( s1 );
+
+    // Now it simply stops answering. Once the window passes it is no longer
+    // eligible, so the commit index proceeds on the majority.
+    TestSuite::sleep_ms(20 * 2 * 5, "let the responsiveness window pass");
+    append_and_deliver_to(s1, 1, {s2_addr}, "silent_more");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_NOT_HELD( s1 );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+
+    raft_server::limits restored;
+    raft_server::set_raft_limits(restored);
     return 0;
 }
 
@@ -1086,8 +1283,8 @@ int main(int argc, char** argv) {
     ts.doTest( "holds commit for lagging member test",
                holds_commit_for_lagging_member_test );
 
-    ts.doTest( "disabled by default test",
-               disabled_by_default_test );
+    ts.doTest( "no hold time configured test",
+               no_hold_time_configured_test );
 
     ts.doTest( "gives up after max hold test",
                gives_up_after_max_hold_test );
@@ -1133,6 +1330,15 @@ int main(int argc, char** argv) {
 
     ts.doTest( "gap trend test",
                gap_trend_test );
+
+    ts.doTest( "release happens at the release threshold test",
+               release_happens_at_the_release_threshold_test );
+
+    ts.doTest( "holds at the furthest lagging member test",
+               holds_at_the_furthest_lagging_member_test );
+
+    ts.doTest( "silent member is released test",
+               silent_member_is_released_test );
 
     ts.doTest( "refuses new requests while holding test",
                refuses_new_requests_while_holding_test );

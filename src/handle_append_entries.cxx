@@ -2061,7 +2061,7 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
 
         if (max_hold > 0 && pp->get_lagging_ms() >= (uint64_t)max_hold) {
             pp->set_backpressure_given_up();
-            p_er("peer %d did not catch up within %d ms, gap is still "
+            p_wn("peer %d did not catch up within %d ms, gap is still "
                  "%" PRIu64 ": leave it behind and resume committing until it "
                  "is back within %" PRIu64 " log entries",
                  pp->get_id(), max_hold, gap, release_gap);

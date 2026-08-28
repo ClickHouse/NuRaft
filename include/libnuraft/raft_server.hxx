@@ -1105,9 +1105,17 @@ protected:
     std::atomic<bool> holding_for_slow_member_{false};
 
     /**
-     * Rate limiter for the slow member backpressure transition messages.
+     * `true` once the slow member backpressure has been switched at runtime.
+     * Until then a new leader has nothing to re-publish, and a cluster that
+     * never uses the feature pays no extra message per election.
      */
-    timer_helper transition_msg_timer_{5000000};
+    std::atomic<bool> slow_member_backpressure_ever_switched_{false};
+
+    /**
+     * Rate limiter for the slow member backpressure transition messages,
+     * in microsecond.
+     */
+    timer_helper transition_msg_timer_{5 * 1000 * 1000};
 
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,

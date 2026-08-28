@@ -1269,14 +1269,18 @@ void raft_server::become_leader() {
         config_changing_ = true;
     }
 
-    // Re-publish the slow member backpressure setting. Propagation is
-    // best-effort and skips a busy peer - which the member being held is, by
-    // definition - so peers can hold a stale copy. Only the leader's copy has
-    // any effect, so a peer that missed a change and then wins an election
-    // would otherwise enact the setting the operator last turned off, or
-    // silently drop the one they turned on.
-    broadcast_slow_member_backpressure(
-        ctx_->get_params()->slow_member_backpressure_enabled_);
+    // Re-publish the slow member backpressure setting, so that peers converge
+    // on the setting of the server that is actually acting on it. Propagation
+    // is best-effort and skips a busy peer - which the member being held is, by
+    // definition - so peers can otherwise report a setting that stopped being
+    // true several leaders ago.
+    //
+    // Only if it was ever switched: a cluster that does not use the feature
+    // should not pay an extra message to every peer on every election.
+    if (slow_member_backpressure_ever_switched_) {
+        broadcast_slow_member_backpressure(
+            ctx_->get_params()->slow_member_backpressure_enabled_);
+    }
 
     cb_func::Param param(id_, leader_);
     ulong my_term = state_->get_term();
@@ -1634,6 +1638,7 @@ void raft_server::enable_slow_member_backpressure(bool enable) {
     modify_params([enable](raft_params& params) {
         params.slow_member_backpressure_enabled_ = enable;
     });
+    slow_member_backpressure_ever_switched_ = true;
 
     // Whatever was observed about the members while the setting was different
     // says nothing about now, and a stale timer would either deny a member its

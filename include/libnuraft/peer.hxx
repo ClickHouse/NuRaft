@@ -337,8 +337,9 @@ public:
         return lagging_.exchange(false);
     }
     // Forget the state entirely, without the caller treating it as a
-    // transition. Called when this server becomes the leader, as it did not
-    // track the peers as a follower.
+    // transition. Called when what was observed no longer applies: this server
+    // has just become the leader and did not track the peers as a follower, the
+    // feature was switched on or off, or the commit quorum is being overridden.
     void reset_lagging() {
         lagging_ = false;
         backpressure_given_up_ = false;

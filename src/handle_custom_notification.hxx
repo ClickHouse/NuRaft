@@ -31,7 +31,7 @@ public:
         leadership_takeover         = 2,
         request_resignation         = 3,
         request_leadership          = 4,
-        set_slow_member_backpressure = 6,
+        set_slow_member_backpressure = 5,
     };
 
     custom_notification_msg(type t = out_of_log_range_warning)
