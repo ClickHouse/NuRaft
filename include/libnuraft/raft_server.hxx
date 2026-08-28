@@ -471,22 +471,23 @@ public:
     bool request_leadership(int successor_id = -1);
 
     /**
-     * Request the current leader to turn on/off full consensus mode
-     * (`use_full_consensus_among_healthy_members_`) at runtime.
+     * Ask the current leader to turn the slow member backpressure on or off
+     * at runtime, i.e. whether it holds the commit index back for a member
+     * that has fallen behind.
      *
-     * If this server is the leader, the mode is applied immediately.
-     * Otherwise, the request is forwarded to the current leader.
-     * After applying the mode, the leader propagates it to all peers
-     * on a best-effort basis; a peer whose connection is busy or down
-     * may miss the propagation, hence users should verify the mode
-     * on each node via `get_current_params`.
+     * If this server is the leader, the setting is applied immediately.
+     * Otherwise the request is forwarded to the current leader. The leader
+     * then propagates it to all peers on a best-effort basis: a peer whose
+     * connection is busy or down may miss it, so the setting should be
+     * verified on each node through `get_current_params`. Only the leader's
+     * copy has any effect.
      *
-     * @param enable If `true`, turn on full consensus mode.
-     * @return `true` if the request was applied locally or successfully
-     *         sent to the leader. It does not guarantee that the leader
-     *         has applied it.
+     * @param enable If `true`, turn the backpressure on.
+     * @return `true` if the request was applied locally or sent to the leader.
+     *         It does not guarantee that the leader applied it.
      */
-    bool request_full_consensus_mode(bool enable);
+    bool request_slow_member_backpressure(bool enable);
+
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -1090,6 +1091,24 @@ protected:
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
     size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
+    uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
+
+    /**
+     * Effective limit of uncommitted log entries, which is tightened while the
+     * commit index is being held for a member that fell behind.
+     */
+    uint64_t get_max_uncommitted_log_entries() const;
+
+    /**
+     * `true` while the commit index is being held for at least one member.
+     */
+    std::atomic<bool> holding_for_slow_member_{false};
+
+    /**
+     * Rate limiter for the slow member backpressure transition messages.
+     */
+    timer_helper transition_msg_timer_{5000000};
+
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,
                                         int32_t expiry,
@@ -1128,6 +1147,14 @@ protected:
     ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
+
+    ptr<resp_msg> handle_slow_member_backpressure_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    void enable_slow_member_backpressure(bool enable);
+
+    void broadcast_slow_member_backpressure(bool enable);
     ptr<resp_msg> handle_leader_status_req(req_msg& req);
 
     void handle_join_cluster_resp(resp_msg& resp);
@@ -1266,14 +1293,6 @@ protected:
     ptr<resp_msg> handle_request_leadership_request(req_msg& req,
                                              ptr<custom_notification_msg> msg,
                                              ptr<resp_msg> resp);
-
-    ptr<resp_msg> handle_full_consensus_mode_request(req_msg& req,
-                                             ptr<custom_notification_msg> msg,
-                                             ptr<resp_msg> resp);
-
-    void apply_full_consensus_mode(bool enable);
-
-    void broadcast_full_consensus_mode(bool enable);
 
     void remove_peer_from_peers(const ptr<peer>& pp);
 

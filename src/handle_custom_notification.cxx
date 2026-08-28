@@ -136,10 +136,10 @@ ptr<buffer> force_vote_msg::serialize() const {
 }
 
 
-// --- full_consensus_mode_msg ---
+// --- slow_member_backpressure_msg ---
 
-ptr<full_consensus_mode_msg> full_consensus_mode_msg::deserialize(buffer& buf) {
-    ptr<full_consensus_mode_msg> ret = cs_new<full_consensus_mode_msg>();
+ptr<slow_member_backpressure_msg> slow_member_backpressure_msg::deserialize(buffer& buf) {
+    ptr<slow_member_backpressure_msg> ret = cs_new<slow_member_backpressure_msg>();
     buffer_serializer bs(buf);
     uint8_t version = bs.get_u8();
     (void)version;
@@ -147,7 +147,7 @@ ptr<full_consensus_mode_msg> full_consensus_mode_msg::deserialize(buffer& buf) {
     return ret;
 }
 
-ptr<buffer> full_consensus_mode_msg::serialize() const {
+ptr<buffer> slow_member_backpressure_msg::serialize() const {
     //   << Format >>
     // version                      1 byte
     // enable flag                  1 byte
@@ -198,8 +198,8 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     case custom_notification_msg::request_leadership: {
         return handle_request_leadership_request(req, msg, resp);
     }
-    case custom_notification_msg::set_full_consensus_mode: {
-        return handle_full_consensus_mode_request(req, msg, resp);
+    case custom_notification_msg::set_slow_member_backpressure: {
+        return handle_slow_member_backpressure_request(req, msg, resp);
     }
     default:
         break;
@@ -291,24 +291,23 @@ ptr<resp_msg> raft_server::handle_request_leadership_request
     return resp;
 }
 
-ptr<resp_msg> raft_server::handle_full_consensus_mode_request
+ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
                            ( req_msg& req,
                              ptr<custom_notification_msg> msg,
                              ptr<resp_msg> resp )
 {
     if (!msg->ctx_) {
-        p_er("[FULL CONSENSUS MODE] got request from peer %d "
+        p_er("[SLOW MEMBER BACKPRESSURE] got request from peer %d "
              "without context", req.get_src());
         return resp;
     }
 
     if (req.get_term() < state_->get_term()) {
-        // A request with a stale term may come from a leader that
-        // has not yet found out that it was deposed. Ignoring it also
-        // prevents two servers believing they are leaders from
-        // re-broadcasting the mode to each other in a loop.
-        p_wn("[FULL CONSENSUS MODE] got request from peer %d "
-             "with stale term %" PRIu64 ", my term %" PRIu64 ", ignore it",
+        // A stale term means the sender does not know it was deposed. Ignoring
+        // it also stops two servers that both believe they are leaders from
+        // re-broadcasting to each other.
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d with stale "
+             "term %" PRIu64 ", my term %" PRIu64 ", ignore it",
              req.get_src(), req.get_term(), state_->get_term());
         return resp;
     }
@@ -318,38 +317,34 @@ ptr<resp_msg> raft_server::handle_full_consensus_mode_request
     // else, as a deposed leader must not re-broadcast with its stale term.
     update_term(req.get_term());
 
-    ptr<full_consensus_mode_msg> fc_msg =
-        full_consensus_mode_msg::deserialize(*msg->ctx_);
+    ptr<slow_member_backpressure_msg> bp_msg =
+        slow_member_backpressure_msg::deserialize(*msg->ctx_);
 
     if (is_leader()) {
-        // A follower asks this leader to change the mode:
-        // apply it and propagate to all peers.
-        p_in("[FULL CONSENSUS MODE] got request from peer %d "
-             "to turn full consensus mode %s",
-             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
-        apply_full_consensus_mode(fc_msg->enable_);
-        broadcast_full_consensus_mode(fc_msg->enable_);
+        // A follower asks this leader to change the setting: apply it and
+        // propagate, as only the leader acts on it but every node should
+        // report it.
+        p_in("[SLOW MEMBER BACKPRESSURE] got request from peer %d to turn it %s",
+             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
+        enable_slow_member_backpressure(bp_msg->enable_);
+        broadcast_slow_member_backpressure(bp_msg->enable_);
 
     } else if (req.get_src() == leader_ || leader_ == -1) {
         // Propagation from the current leader: apply locally.
         //
         // NOTE: `leader_ == -1` is accepted as well, otherwise every
-        //       propagation that races with a leader change would be dropped,
-        //       and the mode would systematically diverge right after every
-        //       election. In that window the sender cannot be verified to be
-        //       the leader, only to be in the current term, which is enough
-        //       here: the mode affects availability, not safety, and it is
-        //       best-effort by design.
-        p_in("[FULL CONSENSUS MODE] leader %d turned "
-             "full consensus mode %s",
-             req.get_src(), fc_msg->enable_ ? "ON" : "OFF");
-        apply_full_consensus_mode(fc_msg->enable_);
+        //       propagation that races with a leader change would be dropped.
+        //       In that window the sender cannot be verified to be the leader,
+        //       only to be in the current term, which is enough here: the
+        //       setting affects availability, not safety.
+        p_in("[SLOW MEMBER BACKPRESSURE] leader %d turned it %s",
+             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
+        enable_slow_member_backpressure(bp_msg->enable_);
 
     } else {
-        p_wn("[FULL CONSENSUS MODE] got request from peer %d, "
-             "but this node is not a leader and the request is not "
-             "from the current leader %d",
-             req.get_src(), leader_.load());
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
+             "node is not a leader and the request is not from the current "
+             "leader %d", req.get_src(), leader_.load());
     }
 
     return resp;

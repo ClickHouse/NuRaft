@@ -31,10 +31,44 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
+#include <limits>
 
 namespace nuraft {
 
 class snapshot;
+
+/**
+ * Whether a peer's gap to the leader is shrinking, measured over a window.
+ *
+ * The gap at the start of the window is compared with the gap at its end: if
+ * it decreased, the peer is working through its backlog and must not be waited
+ * for, however large the backlog still is - that is what a peer does after a
+ * restart, after a snapshot, or right after joining. If it did not decrease,
+ * the peer is not keeping up.
+ *
+ * Within a window there is nothing to conclude yet, so the answer is `false`:
+ * the default is not to interfere.
+ */
+struct gap_trend {
+    bool is_not_shrinking(uint64_t gap, int32_t window_ms) {
+        if (window_timer_.get_ms() < (uint64_t)window_ms) {
+            return false;
+        }
+        bool shrinking = gap < gap_at_window_start_;
+        gap_at_window_start_ = gap;
+        window_timer_.reset();
+        return !shrinking;
+    }
+
+    void reset(uint64_t gap) {
+        gap_at_window_start_ = gap;
+        window_timer_.reset();
+    }
+
+    uint64_t gap_at_window_start_ = std::numeric_limits<uint64_t>::max();
+    timer_helper window_timer_;
+};
+
 class peer {
 public:
     peer( ptr<srv_config>& config,
@@ -64,6 +98,8 @@ public:
                             timer_task_type::heartbeat_timer ) )
         , snp_sync_ctx_(nullptr)
         , lock_()
+        , lagging_(false)
+        , backpressure_given_up_(false)
         , long_pause_warnings_(0)
         , network_recoveries_(0)
         , manual_free_(false)
@@ -271,6 +307,56 @@ public:
     // Time of the last network activity from peer (including failure).
     void reset_active_timer()       { last_active_timer_.reset(); }
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
+
+    // Whether this peer has fallen so far behind that the leader holds the
+    // commit index back for it. Entering and leaving this state use two
+    // different gaps, so the caller provides the hysteresis and this is a
+    // plain latch.
+    //
+    // Returns `true` if this call changed the state, for logging.
+    bool set_lagging() {
+        if (lagging_.exchange(true)) {
+            return false;
+        }
+        lagging_timer_.reset();
+        return true;
+    }
+    // The peer stopped being eligible to be waited for, e.g. it stopped
+    // responding. The give-up latch is deliberately kept: the peer has not
+    // caught up, so it must not earn a fresh hold by becoming ineligible and
+    // then eligible again.
+    bool clear_lagging() {
+        return lagging_.exchange(false);
+    }
+
+    // The peer caught up. This is the only thing that clears the give-up
+    // latch and lets the peer be waited for again later.
+    bool set_caught_up() {
+        backpressure_given_up_ = false;
+        return lagging_.exchange(false);
+    }
+    // Forget the state entirely, without the caller treating it as a
+    // transition. Called when this server becomes the leader, as it did not
+    // track the peers as a follower.
+    void reset_lagging() {
+        lagging_ = false;
+        backpressure_given_up_ = false;
+        lagging_timer_.reset();
+        gap_trend_.reset(std::numeric_limits<uint64_t>::max());
+    }
+    bool is_lagging() const         { return lagging_; }
+    uint64_t get_lagging_ms()       { return lagging_timer_.get_ms(); }
+
+    bool gap_is_not_shrinking(uint64_t gap, int32_t window_ms) {
+        return gap_trend_.is_not_shrinking(gap, window_ms);
+    }
+    void reset_gap_window(uint64_t gap) { gap_trend_.reset(gap); }
+
+    // Whether the leader stopped holding the commit index for this peer
+    // because it did not catch up in time. Reset only by `set_caught_up`, so
+    // that the peer cannot immediately hold the commit index again.
+    bool is_backpressure_given_up() const   { return backpressure_given_up_; }
+    void set_backpressure_given_up()        { backpressure_given_up_ = true; }
 
     void reset_long_pause_warnings()    { long_pause_warnings_ = 0; }
     void inc_long_pause_warnings()      { long_pause_warnings_.fetch_add(1); }
@@ -544,6 +630,28 @@ private:
      * Timestamp when the last active network activity was detected.
      */
     timer_helper last_active_timer_;
+
+    /**
+     * `true` if this peer has fallen behind by more than `stale_log_gap_`
+     * and the leader is holding the commit index back for it.
+     */
+    std::atomic<bool> lagging_;
+
+    /**
+     * Timestamp when this peer started lagging.
+     */
+    timer_helper lagging_timer_;
+
+    /**
+     * `true` if the leader stopped holding the commit index for this peer
+     * because it did not catch up within the configured time.
+     */
+    std::atomic<bool> backpressure_given_up_;
+
+    /**
+     * Whether this peer is closing the distance to the leader.
+     */
+    gap_trend gap_trend_;
 
     /**
      * Counter of long pause warnings.
