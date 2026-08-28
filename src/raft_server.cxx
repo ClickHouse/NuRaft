@@ -386,6 +386,13 @@ void raft_server::update_params(const raft_params& new_params) {
     }
 }
 
+void raft_server::modify_params(const std::function<void(raft_params&)>& modifier) {
+    recur_lock(lock_);
+    raft_params clone = *ctx_->get_params();
+    modifier(clone);
+    update_params(clone);
+}
+
 void raft_server::apply_and_log_current_params() {
     ptr<raft_params> params = ctx_->get_params();
 
@@ -401,6 +408,14 @@ void raft_server::apply_and_log_current_params() {
                 params->election_timeout_lower_bound_ * 2;
             p_wn("invalid election timeout upper bound detected, adjusted to %d",
                  params->election_timeout_upper_bound_);
+        }
+        if (params->stale_log_gap_ < params->fresh_log_gap_) {
+            // Same adjustment as in the constructor, so that the effective
+            // value does not depend on whether the parameters were given at
+            // startup or through `update_params`.
+            params->stale_log_gap_ = params->fresh_log_gap_;
+            p_wn("stale log gap smaller than fresh log gap detected, "
+                 "adjusted to %d", params->stale_log_gap_);
         }
     }
 
@@ -422,6 +437,7 @@ void raft_server::apply_and_log_current_params() {
           "parallel log appending: %s, "
           "streaming mode max log gap %d, max bytes %" PRIu64 ", "
           "full consensus mode: %s, "
+          "slow member backpressure max hold %d, "
           "tracking peer sm committed index: %s, "
           "max uncommitted log entries %" PRIu64,
           params->election_timeout_lower_bound_,
@@ -449,6 +465,7 @@ void raft_server::apply_and_log_current_params() {
           params->max_log_gap_in_stream_,
           params->max_bytes_in_flight_in_stream_,
           params->use_full_consensus_among_healthy_members_ ? "ON" : "OFF",
+          params->slow_member_backpressure_max_hold_,
           params->track_peers_sm_commit_idx_ ? "ON" : "OFF",
           params->max_uncommitted_log_entries_
         );
@@ -458,6 +475,19 @@ void raft_server::apply_and_log_current_params() {
 
     leadership_transfer_timer_.set_duration_ms
         (params->leadership_transfer_min_wait_time_);
+}
+
+uint64_t raft_server::get_max_uncommitted_log_entries() const {
+    ptr<raft_params> params = ctx_->get_params();
+    uint64_t configured = params->max_uncommitted_log_entries_;
+    uint64_t while_holding = params->slow_member_backpressure_max_uncommitted_;
+
+    if (!while_holding || !holding_for_slow_member_) {
+        return configured;
+    }
+    // `0` means no limit at all, so a configured limit of zero must not win
+    // over the one that applies while holding.
+    return configured ? std::min(configured, while_holding) : while_holding;
 }
 
 raft_params raft_server::get_current_params() const {
@@ -1170,6 +1200,8 @@ void raft_server::become_leader() {
              sm_commit_index_.load(),
              precommit_index_.load(),
              log_store_->next_slot() - 1);
+        holding_for_slow_member_ = false;
+
         ptr<snapshot> nil_snp;
         for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
             ptr<peer> pp = it->second;
@@ -1184,6 +1216,9 @@ void raft_server::become_leader() {
             pp->set_next_log_idx(log_store_->next_slot());
             pp->set_next_log_idx_floor(0);
             pp->reset_stream();
+            // This server did not track the peers as a follower, so anything
+            // it knows about them lagging is stale.
+            pp->reset_lagging();
             enable_hb_for_peer(*pp);
             pp->set_recovered();
             pp->set_snapshot_sync_is_needed(false);
@@ -1233,6 +1268,15 @@ void raft_server::become_leader() {
              index_at_becoming_leader_.load());
         config_changing_ = true;
     }
+
+    // Re-publish the slow member backpressure setting. Propagation is
+    // best-effort and skips a busy peer - which the member being held is, by
+    // definition - so peers can hold a stale copy. Only the leader's copy has
+    // any effect, so a peer that missed a change and then wins an election
+    // would otherwise enact the setting the operator last turned off, or
+    // silently drop the one they turned on.
+    broadcast_slow_member_backpressure(
+        ctx_->get_params()->slow_member_backpressure_enabled_);
 
     cb_func::Param param(id_, leader_);
     ulong my_term = state_->get_term();
@@ -1579,6 +1623,128 @@ bool raft_server::request_leadership(int successor_id) {
             return false;
         }
     }
+}
+
+void raft_server::enable_slow_member_backpressure(bool enable) {
+    recur_lock(lock_);
+    if (ctx_->get_params()->slow_member_backpressure_enabled_ == enable) {
+        p_in("slow member backpressure is already %s", enable ? "ON" : "OFF");
+        return;
+    }
+    modify_params([enable](raft_params& params) {
+        params.slow_member_backpressure_enabled_ = enable;
+    });
+
+    // Whatever was observed about the members while the setting was different
+    // says nothing about now, and a stale timer would either deny a member its
+    // hold time or hold one immediately.
+    for (auto& entry: peers_) {
+        entry.second->reset_lagging();
+    }
+    holding_for_slow_member_ = false;
+}
+
+void raft_server::broadcast_slow_member_backpressure(bool enable) {
+    recur_lock(lock_);
+    for (auto& entry: peers_) {
+        ptr<peer> pp = entry.second;
+
+        ptr<req_msg> req = cs_new<req_msg>
+                           ( state_->get_term(),
+                             msg_type::custom_notification_request,
+                             id_, pp->get_id(),
+                             term_for_log(log_store_->next_slot() - 1),
+                             log_store_->next_slot() - 1,
+                             quick_commit_index_.load() );
+
+        ptr<slow_member_backpressure_msg> bp_msg =
+            cs_new<slow_member_backpressure_msg>(enable);
+
+        ptr<custom_notification_msg> custom_noti =
+            cs_new<custom_notification_msg>
+            ( custom_notification_msg::set_slow_member_backpressure );
+        custom_noti->ctx_ = bp_msg->serialize();
+
+        ptr<log_entry> custom_noti_le =
+            cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+        req->log_entries().push_back(custom_noti_le);
+
+        if (pp->make_busy()) {
+            pp->send_req(pp, req, resp_handler_);
+        } else {
+            // Best-effort propagation: the peer keeps its old setting, which
+            // only affects what it reports, not what the leader does.
+            p_wn("cannot propagate slow member backpressure to peer %d, "
+                 "peer is busy", pp->get_id());
+        }
+    }
+}
+
+bool raft_server::request_slow_member_backpressure(bool enable) {
+    if (is_leader()) {
+        p_in("turning slow member backpressure %s", enable ? "ON" : "OFF");
+        enable_slow_member_backpressure(enable);
+        broadcast_slow_member_backpressure(enable);
+        return true;
+    }
+
+    if (leader_ == -1) {
+        p_er("cannot request slow member backpressure: cannot find leader");
+        return false;
+    }
+
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( state_->get_term(),
+                         msg_type::custom_notification_request,
+                         id_, leader_,
+                         term_for_log(log_store_->next_slot() - 1),
+                         log_store_->next_slot() - 1,
+                         quick_commit_index_.load() );
+
+    ptr<slow_member_backpressure_msg> bp_msg =
+        cs_new<slow_member_backpressure_msg>(enable);
+
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::set_slow_member_backpressure );
+    custom_noti->ctx_ = bp_msg->serialize();
+
+    ptr<log_entry> custom_noti_le =
+        cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+    req->log_entries().push_back(custom_noti_le);
+
+    recur_lock(lock_);
+    auto entry = peers_.find(leader_);
+    if (entry == peers_.end()) {
+        p_er("cannot request slow member backpressure: cannot find peer for "
+             "leader id %d", leader_.load());
+        return false;
+    }
+
+    ptr<peer> pp = entry->second;
+    if (pp->need_to_reconnect()) {
+        p_in("need to reconnect to peer %d", leader_.load());
+        ptr<srv_config> s_conf = get_config()->get_server(leader_);
+        if (!s_conf) {
+            p_wn("can't reconnect to peer %d: config not found", leader_.load());
+            return false;
+        }
+        if (!pp->recreate_rpc(s_conf, *ctx_)) {
+            p_wn("reconnection to peer %d failed", leader_.load());
+            return false;
+        }
+    }
+
+    if (pp->make_busy()) {
+        p_in("requesting slow member backpressure %s from leader %d",
+             enable ? "ON" : "OFF", leader_.load());
+        pp->send_req(pp, req, resp_handler_);
+        return true;
+    }
+    p_in("cannot request slow member backpressure, leader is busy");
+    return false;
 }
 
 void raft_server::become_follower() {

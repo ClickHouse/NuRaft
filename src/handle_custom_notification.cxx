@@ -136,6 +136,33 @@ ptr<buffer> force_vote_msg::serialize() const {
 }
 
 
+// --- slow_member_backpressure_msg ---
+
+ptr<slow_member_backpressure_msg> slow_member_backpressure_msg::deserialize(buffer& buf) {
+    ptr<slow_member_backpressure_msg> ret = cs_new<slow_member_backpressure_msg>();
+    buffer_serializer bs(buf);
+    uint8_t version = bs.get_u8();
+    (void)version;
+    ret->enable_ = bs.get_u8() != 0;
+    return ret;
+}
+
+ptr<buffer> slow_member_backpressure_msg::serialize() const {
+    //   << Format >>
+    // version                      1 byte
+    // enable flag                  1 byte
+
+    size_t len = sizeof(uint8_t) + sizeof(uint8_t);
+    ptr<buffer> ret = buffer::alloc(len);
+
+    const uint8_t CURRENT_VERSION = 0x0;
+    buffer_serializer bs(ret);
+    bs.put_u8(CURRENT_VERSION);
+    bs.put_u8(enable_ ? 1 : 0);
+    return ret;
+}
+
+
 // --- handlers ---
 
 ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
@@ -170,6 +197,9 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     }
     case custom_notification_msg::request_leadership: {
         return handle_request_leadership_request(req, msg, resp);
+    }
+    case custom_notification_msg::set_slow_member_backpressure: {
+        return handle_slow_member_backpressure_request(req, msg, resp);
     }
     default:
         break;
@@ -261,6 +291,65 @@ ptr<resp_msg> raft_server::handle_request_leadership_request
     return resp;
 }
 
+ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
+                           ( req_msg& req,
+                             ptr<custom_notification_msg> msg,
+                             ptr<resp_msg> resp )
+{
+    if (!msg->ctx_) {
+        p_er("[SLOW MEMBER BACKPRESSURE] got request from peer %d "
+             "without context", req.get_src());
+        return resp;
+    }
+
+    if (req.get_term() < state_->get_term()) {
+        // A stale term means the sender does not know it was deposed. Ignoring
+        // it also stops two servers that both believe they are leaders from
+        // re-broadcasting to each other.
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d with stale "
+             "term %" PRIu64 ", my term %" PRIu64 ", ignore it",
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
+    // A newer term is proof that this node is behind, and that it is not the
+    // leader anymore if it thought it was. Step down before doing anything
+    // else, as a deposed leader must not re-broadcast with its stale term.
+    update_term(req.get_term());
+
+    ptr<slow_member_backpressure_msg> bp_msg =
+        slow_member_backpressure_msg::deserialize(*msg->ctx_);
+
+    if (is_leader()) {
+        // A follower asks this leader to change the setting: apply it and
+        // propagate, as only the leader acts on it but every node should
+        // report it.
+        p_in("[SLOW MEMBER BACKPRESSURE] got request from peer %d to turn it %s",
+             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
+        enable_slow_member_backpressure(bp_msg->enable_);
+        broadcast_slow_member_backpressure(bp_msg->enable_);
+
+    } else if (req.get_src() == leader_ || leader_ == -1) {
+        // Propagation from the current leader: apply locally.
+        //
+        // NOTE: `leader_ == -1` is accepted as well, otherwise every
+        //       propagation that races with a leader change would be dropped.
+        //       In that window the sender cannot be verified to be the leader,
+        //       only to be in the current term, which is enough here: the
+        //       setting affects availability, not safety.
+        p_in("[SLOW MEMBER BACKPRESSURE] leader %d turned it %s",
+             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
+        enable_slow_member_backpressure(bp_msg->enable_);
+
+    } else {
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
+             "node is not a leader and the request is not from the current "
+             "leader %d", req.get_src(), leader_.load());
+    }
+
+    return resp;
+}
+
 
 void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     if (!resp.get_accepted()) return;
@@ -272,8 +361,17 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     }
     ptr<peer> p = it->second;
 
-    p->set_next_log_idx(resp.get_next_idx());
-    p->reset_cnt_backward_log_probe();
+    // NOTE: Only move the next log index forward. A custom notification is not
+    //       a log replication request, and its response carries the peer's
+    //       current `next_slot`, which is behind the leader's view while the
+    //       peer is catching up or receiving a snapshot. Moving the index
+    //       backwards here would make the leader re-send log entries it
+    //       already sent, or decide that the peer needs a snapshot again and
+    //       restart the transfer from the beginning.
+    if (resp.get_next_idx() > p->get_next_log_idx()) {
+        p->set_next_log_idx(resp.get_next_idx());
+        p->reset_cnt_backward_log_probe();
+    }
 }
 
 } // namespace nuraft;

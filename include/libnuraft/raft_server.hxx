@@ -138,6 +138,8 @@ public:
             leave_limit_ = src.leave_limit_.load();
             vote_limit_ = src.vote_limit_.load();
             busy_connection_limit_ = src.busy_connection_limit_.load();
+            full_consensus_leader_limit_ = src.full_consensus_leader_limit_.load();
+            full_consensus_follower_limit_ = src.full_consensus_follower_limit_.load();
             return *this;
         }
 
@@ -469,6 +471,25 @@ public:
     bool request_leadership(int successor_id = -1);
 
     /**
+     * Ask the current leader to turn the slow member backpressure on or off
+     * at runtime, i.e. whether it holds the commit index back for a member
+     * that has fallen behind.
+     *
+     * If this server is the leader, the setting is applied immediately.
+     * Otherwise the request is forwarded to the current leader. The leader
+     * then propagates it to all peers on a best-effort basis: a peer whose
+     * connection is busy or down may miss it, so the setting should be
+     * verified on each node through `get_current_params`. Only the leader's
+     * copy has any effect.
+     *
+     * @param enable If `true`, turn the backpressure on.
+     * @return `true` if the request was applied locally or sent to the leader.
+     *         It does not guarantee that the leader applied it.
+     */
+    bool request_slow_member_backpressure(bool enable);
+
+
+    /**
      * Start the election timer on this server, if this server is a follower.
      * It will allow the election timer permanently, if it was disabled
      * by state manager.
@@ -752,6 +773,18 @@ public:
      * @param new_params Parameters to set.
      */
     void update_params(const raft_params& new_params);
+
+    /**
+     * Update the current Raft parameters by modifying them in place.
+     *
+     * Unlike a `get_current_params` - modify - `update_params` sequence, the
+     * read and the write happen under the same lock, so a concurrent update
+     * of an unrelated parameter cannot be lost.
+     *
+     * @param modifier Invoked with a copy of the current parameters, under
+     *                 the Raft lock. It should not block.
+     */
+    void modify_params(const std::function<void(raft_params&)>& modifier);
 
     /**
      * Get the current Raft parameters.
@@ -1058,6 +1091,24 @@ protected:
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
     size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
+    uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
+
+    /**
+     * Effective limit of uncommitted log entries, which is tightened while the
+     * commit index is being held for a member that fell behind.
+     */
+    uint64_t get_max_uncommitted_log_entries() const;
+
+    /**
+     * `true` while the commit index is being held for at least one member.
+     */
+    std::atomic<bool> holding_for_slow_member_{false};
+
+    /**
+     * Rate limiter for the slow member backpressure transition messages.
+     */
+    timer_helper transition_msg_timer_{5000000};
+
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,
                                         int32_t expiry,
@@ -1096,6 +1147,14 @@ protected:
     ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
+
+    ptr<resp_msg> handle_slow_member_backpressure_request(req_msg& req,
+                                             ptr<custom_notification_msg> msg,
+                                             ptr<resp_msg> resp);
+
+    void enable_slow_member_backpressure(bool enable);
+
+    void broadcast_slow_member_backpressure(bool enable);
     ptr<resp_msg> handle_leader_status_req(req_msg& req);
 
     void handle_join_cluster_resp(resp_msg& resp);
