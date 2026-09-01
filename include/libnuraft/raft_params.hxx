@@ -671,7 +671,8 @@ public:
      * (Experimental)
      * If `true`, the leader holds the commit index back for a member that fell
      * behind, so that the member can catch up. Off by default, switched while
-     * the server runs with `request_slow_member_backpressure`. The other
+     * the server runs with `request_slow_member_backpressure`, and lasts for
+     * one leadership: a new leader switches it off. The other
      * `slow_member_backpressure_*` parameters are used only while this is on.
      */
     bool slow_member_backpressure_enabled_;
@@ -682,12 +683,13 @@ public:
      * member that fell more than `stale_log_gap_` entries behind, so that the
      * member can catch up. The leader then runs at that member's speed. It
      * stops a little under that limit, while the member is still behind, and
-     * never starts for a member that does not answer or gets a snapshot.
+     * never starts for a member that does not answer at all.
      *
      *   - `0` never applies backpressure (default).
      *   - Positive gives up after that long and leaves the member behind.
-     *   - Negative never gives up, so writes stop until the member catches up
-     *     or is removed from the cluster.
+     *   - Negative never gives up, so writes stop until the member catches up.
+     *     Switching the backpressure off releases it; removing the member does
+     *     not, if a configuration change is already waiting to commit.
      */
     int32 slow_member_backpressure_max_duration_;
 

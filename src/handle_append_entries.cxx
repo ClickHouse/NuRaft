@@ -1937,14 +1937,7 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         return expected_commit_index;
     }
 
-    // Backpressure ends one replication batch before the limit that starts it,
-    // so that repeated short periods keep the member a little below
-    // `stale_log_gap_`. Ending much later, at `fresh_log_gap_` for example,
-    // would block writes for the whole time the member needs to catch up. If
-    // the limit is not wider than one batch, half of the limit is used.
-    uint64_t release_gap =
-        start_gap > (uint64_t)params->max_append_size_
-        ? start_gap - params->max_append_size_ : start_gap / 2;
+    uint64_t release_gap = get_slow_member_release_gap(*params);
 
     // How long a member may stay silent and still count as responsive. This
     // reuses the limit the leader already applies to the same peers for the
@@ -1985,12 +1978,15 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         //     has just stopped still looks alive until the expiry time passes.
         //   - it did not answer within the expiry time.
         //   - it has not answered at all yet after a new connection.
-        //   - it is receiving a snapshot. Waiting does not make that faster.
+        //
+        // A member receiving a snapshot is waited for as well. The transfer is
+        // no faster for waiting, but the log stops growing, so the member does
+        // not have to catch up on everything written during it and then need
+        // another snapshot.
         bool can_catch_up =
             !pp->get_rpc_errs() &&
             pp->get_resp_timer_us() / 1000 <= expiry &&
-            matched_idx &&
-            !pp->get_snapshot_sync_ctx();
+            matched_idx;
 
         p_tr("backpressure: peer %d matched %" PRIu64 ", last log %" PRIu64 ", "
              "gap %" PRIu64 ", resp %" PRIu64 " ms, expiry %" PRIu64 " ms, "
@@ -2009,7 +2005,8 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
             // Waiting does not help. This keeps the give-up flag, see
             // `peer::set_cannot_catch_up`.
             if (pp->set_cannot_catch_up()) {
-                p_lv(transition_log_lv(),
+                int log_lv = transition_log_lv();
+                p_lv(log_lv,
                      "peer %d cannot catch up by waiting, gap %" PRIu64 ": "
                      "stop the backpressure for it",
                      pp->get_id(), gap);
@@ -2020,7 +2017,8 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
 
         if (gap <= release_gap) {
             if (pp->set_caught_up()) {
-                p_lv(transition_log_lv(),
+                int log_lv = transition_log_lv();
+                p_lv(log_lv,
                      "peer %d is back within %" PRIu64 " log entries, gap "
                      "%" PRIu64 ": stop the backpressure for it",
                      pp->get_id(), release_gap, gap);
@@ -2037,7 +2035,8 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
             gap > start_gap &&
             (gap_window < 0 || !pp->gap_is_shrinking(gap, gap_window)) &&
             pp->start_backpressure()) {
-            p_lv(transition_log_lv(),
+            int log_lv = transition_log_lv();
+            p_lv(log_lv,
                  "peer %d fell behind by %" PRIu64 " log entries, more than "
                  "the stale log gap %" PRIu64 ": start the backpressure for "
                  "it, so that it can catch up",
@@ -2065,7 +2064,10 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
     // only helps if the leader also stops taking new requests.
     slow_member_backpressure_active_ = active;
 
-    // The commit index must never move backwards.
+    // The commit index must never move backwards. A member can be behind the
+    // commit index - one receiving a snapshot always is - and committed entries
+    // have already been applied across the cluster, so the most this can do is
+    // freeze the commit index where it is.
     return std::max(clamped_commit_index, quick_commit_index_.load());
 }
 

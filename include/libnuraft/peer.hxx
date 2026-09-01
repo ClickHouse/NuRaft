@@ -646,10 +646,10 @@ private:
 
     /**
      * `true` while backpressure is active for this peer: the leader started to
-     * hold the commit index back and has not released the peer yet. It stays
-     * `true` after a give-up, when nothing is held any more, so that
-     * backpressure and its timer cannot start again before the peer has caught
-     * up.
+     * hold the commit index back and has not released the peer yet. It also
+     * stays `true` after a give-up, when the leader holds the commit index no
+     * longer, so that backpressure and its timer cannot start again before the
+     * peer has caught up.
      */
     std::atomic<bool> backpressure_active_;
 

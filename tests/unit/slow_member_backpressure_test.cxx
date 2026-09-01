@@ -84,7 +84,7 @@ static uint64_t matched_idx_of(RaftPkg& leader, int32_t peer_id) {
 }
 
 static int prepare(std::vector<RaftPkg*>& pkgs,
-                   int32_t max_hold_ms)
+                   int32_t max_duration_ms)
 {
     CHK_Z( launch_servers(pkgs) );
     CHK_Z( make_group(pkgs) );
@@ -96,7 +96,7 @@ static int prepare(std::vector<RaftPkg*>& pkgs,
         params.return_method_ = raft_params::async_handler;
         // Off by default now: an operator turns it on, so the tests do too.
         params.slow_member_backpressure_enabled_ = true;
-        params.slow_member_backpressure_max_duration_ = max_hold_ms;
+        params.slow_member_backpressure_max_duration_ = max_duration_ms;
         // The gap trend is covered separately by
         // `not_held_while_still_catching_up_test`; every other test is about
         // the threshold and the time limit, so the trend is switched off here
@@ -104,6 +104,12 @@ static int prepare(std::vector<RaftPkg*>& pkgs,
         params.slow_member_backpressure_gap_window_ = -1;
         params.stale_log_gap_ = STALE_LOG_GAP;
         params.fresh_log_gap_ = 1;
+        // These tests build a gap by appending while the commit index is held,
+        // so the append brake has to stay out of the way. Left unset it is
+        // derived from `STALE_LOG_GAP`, which is far too small here to let a
+        // gap form at all. `refuses_new_requests_while_active_test` sets its
+        // own value, because the brake is what it tests.
+        params.slow_member_backpressure_max_uncommitted_ = STALE_LOG_GAP * 100;
         pkg->raftServer->update_params(params);
     }
     return 0;
@@ -187,7 +193,7 @@ int no_hold_time_configured_test() {
 
 // A member that never catches up must be given up on, otherwise one broken
 // member would stop the cluster from committing anything at all.
-int gives_up_after_max_hold_test() {
+int gives_up_after_max_duration_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
 
@@ -294,6 +300,7 @@ int learner_is_never_held_test() {
         params.slow_member_backpressure_enabled_ = true;
         params.slow_member_backpressure_max_duration_ = -1;
         params.slow_member_backpressure_gap_window_ = -1;
+        params.slow_member_backpressure_max_uncommitted_ = STALE_LOG_GAP * 100;
         params.stale_log_gap_ = STALE_LOG_GAP;
         params.fresh_log_gap_ = 1;
         pkg->raftServer->update_params(params);
@@ -580,10 +587,17 @@ int give_up_flag_survives_reconnect_test() {
     return 0;
 }
 
-// A member that is receiving a snapshot must not be waited for: the snapshot
-// does not go any faster with the commit index held. Everything else about
-// the member is healthy, so only the snapshot check can exclude it.
-int snapshot_receiver_is_not_held_test() {
+// A member that is receiving a snapshot is waited for. The transfer itself is
+// not made faster by waiting, but while it runs the commit index stops moving
+// and the log stops growing, so the member does not also have to catch up on
+// everything written during the transfer - which is what would otherwise leave
+// it far enough behind to need another snapshot.
+//
+// What must not happen is the commit index being dragged back to the matched
+// index of a member that has not applied the snapshot yet: that index is stale
+// by construction, and entries above it are already committed and applied
+// cluster-wide. The commit index may only freeze where it is.
+int snapshot_receiver_is_held_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
 
@@ -599,7 +613,7 @@ int snapshot_receiver_is_not_held_test() {
     CHK_Z( prepare(pkgs, -1) );
 
     // One entry per batch, so that a single exchange with S3 cannot catch it
-    // up, and the exchange after it has to be a snapshot: `RaftPkg` takes a
+    // up and the exchange after it has to be a snapshot: `RaftPkg` takes a
     // snapshot every 5 commits, and S3 will be behind the latest one.
     for (RaftPkg* pkg: pkgs) {
         raft_params params = pkg->raftServer->get_current_params();
@@ -607,38 +621,38 @@ int snapshot_receiver_is_not_held_test() {
         pkg->raftServer->update_params(params);
     }
 
-    // S3 falls behind and the hold begins. The commit index that was reached
-    // is past the leader's snapshot point (every 5 commits).
     append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "snap");
     CHK_HELD( s1 );
     // Snapshots are created on the apply thread, so wait for it rather than
     // assuming it has caught up already.
-    for (int ii = 0; ii < 200 && s1.getTestSm()->getNumSnapshotCreations() == 0; ++ii) {
+    for (int ii = 0; ii < 200 && s1.getTestSm()->getNumSnapshotCreations() == 0;
+         ++ii) {
         TestSuite::sleep_ms(10, "wait for a snapshot");
     }
     CHK_GT( s1.getTestSm()->getNumSnapshotCreations(), 0 );
 
-    // One exchange: S3 acknowledges a single entry, and the leader finds out
-    // that S3's next log index is at or below the latest snapshot, so it
-    // starts sending the snapshot.
+    uint64_t frozen_at = s1.raftServer->get_target_committed_log_idx();
+    uint64_t matched_before = matched_idx_of(s1, 3);
+    // The matched index of a snapshot receiver is stale, and below the commit
+    // index: that is exactly the case the floor has to survive.
+    CHK_SM( matched_before, frozen_at );
+
+    // Two exchanges: S3 acknowledges one entry, then the leader finds that its
+    // next log index is at or below the latest snapshot and starts sending it.
     s1.fNet->execReqResp(s3_addr);
     s1.fNet->execReqResp(s3_addr);
 
-    // Still far behind, but receiving a snapshot: nothing may be held.
-    CHK_GT( tail(s1) - matched_idx_of(s1, 3), STALE_LOG_GAP );
-
-    // When exactly the leader decides to send the snapshot depends on the apply
-    // thread, so drive it rather than assuming the decision has been taken: the
-    // loop ends as soon as the commit index reaches the tail, and cannot end at
-    // all if a snapshot receiver is wrongly held.
-    for (int ii = 0; ii < 40; ++ii) {
-        if (tail(s1) == s1.raftServer->get_target_committed_log_idx()) break;
-        s1.fNet->execReqResp(s3_addr);
-        append_and_deliver_to(s1, 1, {s2_addr}, "snap_b" + std::to_string(ii));
+    // Keep writing and committing through S2 while the transfer is in
+    // progress. The commit index must stay exactly where it was: not lower,
+    // which would un-commit applied entries, and not higher, which would mean
+    // the leader is still outrunning the member it is waiting for.
+    for (int ii = 0; ii < 20; ++ii) {
+        append_and_deliver_to(s1, 1, {s2_addr}, "during" + std::to_string(ii));
         while (s1.fNet->execReqResp(s2_addr)) {}
+        CHK_EQ( frozen_at, s1.raftServer->get_target_committed_log_idx() );
     }
-    CHK_NOT_HELD( s1 );
-    CHK_GT( tail(s1) - matched_idx_of(s1, 3), STALE_LOG_GAP );
+    CHK_Z( s1.getTestSm()->getNumCommitIndexRegressions() );
+    CHK_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -650,7 +664,7 @@ int snapshot_receiver_is_not_held_test() {
 // commit index: the lagging member's matched index is usually below what has
 // already been committed, and handing that value to the state machine would
 // break the API promise that the expected index never regresses.
-int held_commit_index_never_regresses_test() {
+int commit_index_never_regresses_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
 
@@ -845,7 +859,7 @@ int gap_trend_test() {
 // client requests. Otherwise it keeps appending, the log tail runs away from
 // the member it is waiting for, and the hold achieves nothing except a growing
 // pile of unacknowledged entries.
-int refuses_new_requests_while_holding_test() {
+int refuses_new_requests_while_active_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
 
@@ -938,6 +952,7 @@ int runtime_toggle_test() {
         // an operator starts from.
         params.slow_member_backpressure_max_duration_ = -1;
         params.slow_member_backpressure_gap_window_ = -1;
+        params.slow_member_backpressure_max_uncommitted_ = STALE_LOG_GAP * 100;
         params.stale_log_gap_ = STALE_LOG_GAP;
         params.fresh_log_gap_ = 1;
         // No snapshots: a member that falls behind far enough would be sent
@@ -1147,7 +1162,16 @@ int silent_member_is_released_test() {
     std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
 
     // Shrink the responsiveness window so silence is noticed within the test:
-    // it is `full_consensus_leader_limit` heartbeats.
+    // it is `full_consensus_leader_limit` heartbeats. These limits are process
+    // global, so put them back however this test ends - an early return from a
+    // failed check would otherwise leave the shrunken window in place for
+    // every test that runs afterwards.
+    struct limits_guard {
+        explicit limits_guard(raft_server::limits saved): saved_(saved) {}
+        ~limits_guard() { raft_server::set_raft_limits(saved_); }
+        raft_server::limits saved_;
+    } guard(raft_server::get_raft_limits());
+
     raft_server::limits new_limits = raft_server::get_raft_limits();
     new_limits.full_consensus_leader_limit_ = 2;
     raft_server::set_raft_limits(new_limits);
@@ -1175,9 +1199,6 @@ int silent_member_is_released_test() {
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
-
-    raft_server::limits restored;
-    raft_server::set_raft_limits(restored);
     return 0;
 }
 
@@ -1198,8 +1219,8 @@ int main(int argc, char** argv) {
     ts.doTest( "no hold time configured test",
                no_hold_time_configured_test );
 
-    ts.doTest( "gives up after max hold test",
-               gives_up_after_max_hold_test );
+    ts.doTest( "gives up after max duration test",
+               gives_up_after_max_duration_test );
 
     ts.doTest( "hold threshold is exact test",
                hold_threshold_is_exact_test );
@@ -1222,11 +1243,11 @@ int main(int argc, char** argv) {
     ts.doTest( "give up flag survives reconnect test",
                give_up_flag_survives_reconnect_test );
 
-    ts.doTest( "snapshot receiver is not held test",
-               snapshot_receiver_is_not_held_test );
+    ts.doTest( "snapshot receiver is held test",
+               snapshot_receiver_is_held_test );
 
-    ts.doTest( "held commit index never regresses test",
-               held_commit_index_never_regresses_test );
+    ts.doTest( "commit index never regresses test",
+               commit_index_never_regresses_test );
 
     ts.doTest( "gives up on a slowly progressing member test",
                gives_up_on_a_slowly_progressing_member_test );
@@ -1246,8 +1267,8 @@ int main(int argc, char** argv) {
     ts.doTest( "silent member is released test",
                silent_member_is_released_test );
 
-    ts.doTest( "refuses new requests while holding test",
-               refuses_new_requests_while_holding_test );
+    ts.doTest( "refuses new requests while active test",
+               refuses_new_requests_while_active_test );
 
     ts.doTest( "runtime toggle test",
                runtime_toggle_test );

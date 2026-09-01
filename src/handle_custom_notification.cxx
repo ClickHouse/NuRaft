@@ -344,9 +344,10 @@ ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
         switch_slow_member_backpressure(bp_msg->enable_);
 
     } else {
-        // A server that has just lost leadership still has its old
-        // `leader_`, so a message from the new leader is dropped here. The
-        // next `become_leader` sends the setting again and fixes this.
+        // A server that has just lost leadership still has its old `leader_`,
+        // so a message from the new leader is dropped here. That is not
+        // repaired later: a new leader switches the setting off rather than
+        // publishing it, so an operator turns it on again if it is wanted.
         p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
              "node is not a leader and the request is not from the current "
              "leader %d", req.get_src(), leader_.load());

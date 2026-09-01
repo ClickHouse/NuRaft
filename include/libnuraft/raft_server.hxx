@@ -481,6 +481,9 @@ public:
      * its peers, best-effort: a peer that is busy or down can miss it. So it
      * is worth checking the value on each node with `get_current_params`.
      *
+     * The setting lasts for one leadership. A new leader switches it off, so
+     * it has to be turned on again after a leader change.
+     *
      * @param enable If `true`, turn the backpressure on.
      * @return `true` if the request was applied locally or sent to the leader,
      *         which does not guarantee that the leader applied it.
@@ -1080,10 +1083,17 @@ protected:
     uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
 
     /**
-     * The limit of uncommitted log entries that is really in use. It is
-     * smaller while backpressure is active for a member that fell behind.
+     * The limit of uncommitted log entries that is really in use. While
+     * backpressure is active it is the tighter of
+     * `max_uncommitted_log_entries_` and
+     * `slow_member_backpressure_max_uncommitted_`, where `0` means no limit.
      */
     uint64_t get_max_uncommitted_log_entries() const;
+
+    /**
+     * The gap at which backpressure for a member ends, in log entries.
+     */
+    uint64_t get_slow_member_release_gap(const raft_params& params) const;
 
     /**
      * `true` while backpressure is active for at least one member.
@@ -1091,16 +1101,11 @@ protected:
     std::atomic<bool> slow_member_backpressure_active_{false};
 
     /**
-     * `true` once the slow member backpressure was switched while the server
-     * was running. `become_leader` sends the setting again only then.
+     * Limits how often the slow member backpressure writes a log message, in
+     * microsecond. The first message is always written: it is the one that
+     * tells an operator the leader started throttling.
      */
-    std::atomic<bool> slow_member_backpressure_ever_switched_{false};
-
-    /**
-     * Limits how often the slow member backpressure writes a log message,
-     * in microsecond.
-     */
-    timer_helper slow_member_backpressure_log_timer_{5 * 1000 * 1000};
+    timer_helper slow_member_backpressure_log_timer_{5 * 1000 * 1000, true};
 
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,

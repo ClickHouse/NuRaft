@@ -402,13 +402,14 @@ void raft_server::apply_and_log_current_params() {
             p_wn("invalid election timeout upper bound detected, adjusted to %d",
                  params->election_timeout_upper_bound_);
         }
-        if (params->stale_log_gap_ < params->fresh_log_gap_) {
-            // The constructor makes the same change, so that the value in
-            // use does not depend on whether the parameters came from startup
-            // or from `update_params`.
-            params->stale_log_gap_ = params->fresh_log_gap_;
-            p_wn("stale log gap smaller than fresh log gap detected, "
-                 "adjusted to %d", params->stale_log_gap_);
+        uint64_t release_gap = get_slow_member_release_gap(*params);
+        if (params->slow_member_backpressure_enabled_ &&
+            params->slow_member_backpressure_max_uncommitted_ > release_gap) {
+            p_wn("slow member backpressure max uncommitted %" PRIu64 " is wider "
+                 "than the gap that releases a member (%" PRIu64 "), so while "
+                 "clients keep writing a member can only be released by giving "
+                 "up on it",
+                 params->slow_member_backpressure_max_uncommitted_, release_gap);
         }
     }
 
@@ -470,6 +471,22 @@ void raft_server::apply_and_log_current_params() {
         (params->leadership_transfer_min_wait_time_);
 }
 
+uint64_t raft_server::get_slow_member_release_gap(const raft_params& params) const {
+    // Backpressure ends one replication batch before the limit that starts it,
+    // so that repeated short periods keep the member a little below
+    // `stale_log_gap_`. Ending much later, at `fresh_log_gap_` for example,
+    // would block writes for the whole time the member needs to catch up. If
+    // the limit is not wider than one batch, half of the limit is used.
+    uint64_t start_gap = params.stale_log_gap_;
+    uint64_t batch = params.max_append_size_;
+    uint64_t release_gap =
+        start_gap > batch ? start_gap - batch : start_gap / 2;
+
+    // A release gap of zero would ask the member for every entry, including
+    // the uncommitted ones, which it can never have while the leader writes.
+    return release_gap ? release_gap : 1;
+}
+
 uint64_t raft_server::get_max_uncommitted_log_entries() const {
     ptr<raft_params> params = ctx_->get_params();
     uint64_t configured = params->max_uncommitted_log_entries_;
@@ -477,12 +494,18 @@ uint64_t raft_server::get_max_uncommitted_log_entries() const {
         return configured;
     }
 
+    // With no limit configured, use the gap that releases the member. The
+    // member's gap is measured from the log tail, so if the log may run
+    // further ahead of the commit index than that gap, the gap stays above the
+    // release point for as long as clients keep writing and backpressure can
+    // then only ever end by giving up. Leaving the limit alone instead would
+    // hold the commit index while the log grew without bound.
     uint64_t backpressure_limit =
         params->slow_member_backpressure_max_uncommitted_;
     if (!backpressure_limit) {
-        // Not configured, so backpressure leaves the limit alone.
-        return configured;
+        backpressure_limit = get_slow_member_release_gap(*params);
     }
+
     if (!configured) {
         // `0` means no limit at all, so it must not win over the limit that
         // backpressure asks for.
@@ -1270,18 +1293,17 @@ void raft_server::become_leader() {
         config_changing_ = true;
     }
 
-    // Send the slow member backpressure setting again, so that every peer
-    // ends up with the value of the server that really uses it. Sending is
-    // best-effort and skips a peer that is busy, and a throttled member
-    // usually is busy. Without this, a peer could keep reporting a value that stopped
-    // being true several leaders ago.
-    //
-    // Only if the setting was ever switched. A cluster that does not use the
-    // feature should not send an extra message to every peer at every
-    // election.
-    if (slow_member_backpressure_ever_switched_) {
-        broadcast_slow_member_backpressure(
-            ctx_->get_params()->slow_member_backpressure_enabled_);
+    // The slow member backpressure lasts for one leadership. Only the leader
+    // acts on the setting, and this server may have missed the message that
+    // switched it, so its own copy is not to be trusted: acting on a stale
+    // `true` would throttle the cluster again after an operator had switched
+    // it off, with nothing to show why. Switching it off here makes the loss
+    // of backpressure at a leader change certain instead of accidental, and an
+    // operator turns it on again if it is still wanted.
+    if (ctx_->get_params()->slow_member_backpressure_enabled_) {
+        p_in("slow member backpressure was on: switching it off, as it does "
+             "not carry over to a new leader");
+        switch_slow_member_backpressure(false);
     }
 
     cb_func::Param param(id_, leader_);
@@ -1640,7 +1662,6 @@ void raft_server::switch_slow_member_backpressure(bool enable) {
     raft_params params = *ctx_->get_params();
     params.slow_member_backpressure_enabled_ = enable;
     update_params(params);
-    slow_member_backpressure_ever_switched_ = true;
 
     // What was seen while the setting had the other value says nothing about
     // now. An old timer would either take time away from a member, or start
