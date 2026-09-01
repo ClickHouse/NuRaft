@@ -31,7 +31,6 @@ limitations under the License.
 
 #include <atomic>
 #include <cassert>
-#include <limits>
 
 namespace nuraft {
 
@@ -40,32 +39,38 @@ class snapshot;
 /**
  * Whether a peer's gap to the leader is shrinking, measured over a window.
  *
- * The gap at the start of the window is compared with the gap at its end: if
- * it decreased, the peer is working through its backlog and must not be waited
- * for, however large the backlog still is - that is what a peer does after a
- * restart, after a snapshot, or right after joining. If it did not decrease,
- * the peer is not keeping up.
- *
- * Within a window there is nothing to conclude yet, so the answer is `false`:
- * the default is not to interfere.
+ * The gap at the start of the window is compared with the gap at the end. If
+ * it got smaller, the peer is catching up. Before a full window has passed, or
+ * when there is no earlier gap to compare with, the answer is `true`: a peer
+ * counts as catching up until a whole window shows that it is not. So by
+ * default the leader does nothing.
  */
 struct gap_trend {
-    bool is_not_shrinking(uint64_t gap, int32_t window_ms) {
+    bool is_shrinking(uint64_t gap, int32_t window_ms) {
         if (window_timer_.get_ms() < (uint64_t)window_ms) {
-            return false;
+            return true;
         }
-        bool shrinking = gap < gap_at_window_start_;
-        gap_at_window_start_ = gap;
-        window_timer_.reset();
-        return !shrinking;
+        bool shrinking = !has_gap_at_window_start_ ||
+                         gap < gap_at_window_start_;
+        restart_window(gap);
+        return shrinking;
     }
 
-    void reset(uint64_t gap) {
+    void restart_window(uint64_t gap) {
         gap_at_window_start_ = gap;
+        has_gap_at_window_start_ = true;
         window_timer_.reset();
     }
 
-    uint64_t gap_at_window_start_ = std::numeric_limits<uint64_t>::max();
+    // Start a window with no earlier gap to compare against, so that the first
+    // window after this call always counts as catching up.
+    void forget_window() {
+        has_gap_at_window_start_ = false;
+        window_timer_.reset();
+    }
+
+    uint64_t gap_at_window_start_ = 0;
+    bool has_gap_at_window_start_ = false;
     timer_helper window_timer_;
 };
 
@@ -98,7 +103,7 @@ public:
                             timer_task_type::heartbeat_timer ) )
         , snp_sync_ctx_(nullptr)
         , lock_()
-        , lagging_(false)
+        , backpressure_active_(false)
         , backpressure_given_up_(false)
         , long_pause_warnings_(0)
         , network_recoveries_(0)
@@ -308,53 +313,61 @@ public:
     void reset_active_timer()       { last_active_timer_.reset(); }
     uint64_t get_active_timer_us()  { return last_active_timer_.get_us(); }
 
-    // Whether this peer has fallen so far behind that the leader holds the
-    // commit index back for it. Entering and leaving this state use two
-    // different gaps, so the caller provides the hysteresis and this is a
-    // plain latch.
+    // Backpressure for a peer means that the leader does not let the commit
+    // index move past this peer's matched index, so that this peer can catch
+    // up. Only the leader does this, so the state below means nothing on a
+    // follower, and `become_leader` forgets it. See
+    // `raft_params::slow_member_backpressure_max_duration_`.
     //
-    // Returns `true` if this call changed the state, for logging.
-    bool set_lagging() {
-        if (lagging_.exchange(true)) {
+    // Start backpressure for this peer. The caller decides when it starts and
+    // when it ends, using two different gaps, so this is only a flag. Returns
+    // `true` if this call changed the flag, which lets the caller log the
+    // change once.
+    bool start_backpressure() {
+        if (backpressure_active_.exchange(true)) {
             return false;
         }
-        lagging_timer_.reset();
+        backpressure_timer_.reset();
         return true;
     }
-    // The peer stopped being eligible to be waited for, e.g. it stopped
-    // responding. The give-up latch is deliberately kept: the peer has not
-    // caught up, so it must not earn a fresh hold by becoming ineligible and
-    // then eligible again.
-    bool clear_lagging() {
-        return lagging_.exchange(false);
+    // Waiting no longer helps this peer, for example because it stopped
+    // answering. The give-up flag stays set on purpose. The peer has not
+    // caught up, so backpressure must not start again just because the peer
+    // left this state and entered it again.
+    bool set_cannot_catch_up() {
+        return backpressure_active_.exchange(false);
     }
 
-    // The peer caught up. This is the only thing that clears the give-up
-    // latch and lets the peer be waited for again later.
+    // The peer caught up. This clears the give-up flag, so backpressure can
+    // start for this peer again later.
     bool set_caught_up() {
         backpressure_given_up_ = false;
-        return lagging_.exchange(false);
+        return backpressure_active_.exchange(false);
     }
-    // Forget the state entirely, without the caller treating it as a
-    // transition. Called when this server becomes the leader, as it did not
-    // track the peers as a follower.
-    void reset_lagging() {
-        lagging_ = false;
+    // Forget everything about this peer, and do not report a change. Used when
+    // the old observations no longer mean anything: this server has just become
+    // the leader and did not watch the peers while it was a follower, the
+    // feature was switched on or off, or the commit quorum size is overridden.
+    void forget_backpressure_state() {
+        backpressure_active_ = false;
         backpressure_given_up_ = false;
-        lagging_timer_.reset();
-        gap_trend_.reset(std::numeric_limits<uint64_t>::max());
+        backpressure_timer_.reset();
+        // Backpressure therefore needs two full windows after this call.
+        gap_trend_.forget_window();
     }
-    bool is_lagging() const         { return lagging_; }
-    uint64_t get_lagging_ms()       { return lagging_timer_.get_ms(); }
+    bool is_backpressure_active() const { return backpressure_active_; }
+    uint64_t get_backpressure_ms() { return backpressure_timer_.get_ms(); }
 
-    bool gap_is_not_shrinking(uint64_t gap, int32_t window_ms) {
-        return gap_trend_.is_not_shrinking(gap, window_ms);
+    bool gap_is_shrinking(uint64_t gap, int32_t window_ms) {
+        return gap_trend_.is_shrinking(gap, window_ms);
     }
-    void reset_gap_window(uint64_t gap) { gap_trend_.reset(gap); }
+    void restart_gap_window(uint64_t gap) { gap_trend_.restart_window(gap); }
 
-    // Whether the leader stopped holding the commit index for this peer
-    // because it did not catch up in time. Reset only by `set_caught_up`, so
-    // that the peer cannot immediately hold the commit index again.
+    // `true` if the leader stopped holding the commit index for this peer
+    // because the peer did not catch up in time. Cleared when the peer catches
+    // up (`set_caught_up`), and when everything is forgotten
+    // (`forget_backpressure_state`). `set_cannot_catch_up` keeps it, on
+    // purpose.
     bool is_backpressure_given_up() const   { return backpressure_given_up_; }
     void set_backpressure_given_up()        { backpressure_given_up_ = true; }
 
@@ -632,19 +645,23 @@ private:
     timer_helper last_active_timer_;
 
     /**
-     * `true` if this peer has fallen behind by more than `stale_log_gap_`
-     * and the leader is holding the commit index back for it.
+     * `true` while backpressure is active for this peer: the leader started to
+     * hold the commit index back and has not released the peer yet. It stays
+     * `true` after a give-up, when nothing is held any more, so that
+     * backpressure and its timer cannot start again before the peer has caught
+     * up.
      */
-    std::atomic<bool> lagging_;
+    std::atomic<bool> backpressure_active_;
 
     /**
-     * Timestamp when this peer started lagging.
+     * When backpressure for this peer started, which is how long the leader
+     * has been waiting for it.
      */
-    timer_helper lagging_timer_;
+    timer_helper backpressure_timer_;
 
     /**
-     * `true` if the leader stopped holding the commit index for this peer
-     * because it did not catch up within the configured time.
+     * `true` if backpressure for this peer ended because the peer did not
+     * catch up in time, see `is_backpressure_given_up`.
      */
     std::atomic<bool> backpressure_given_up_;
 

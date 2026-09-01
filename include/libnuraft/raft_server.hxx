@@ -472,22 +472,20 @@ public:
 
     /**
      * Ask the current leader to turn the slow member backpressure on or off
-     * at runtime, i.e. whether it holds the commit index back for a member
-     * that has fallen behind.
+     * while the server is running. It makes the leader hold the commit index
+     * back for a member that has fallen behind. Only the setting on the leader
+     * has an effect.
      *
-     * If this server is the leader, the setting is applied immediately.
-     * Otherwise the request is forwarded to the current leader. The leader
-     * then propagates it to all peers on a best-effort basis: a peer whose
-     * connection is busy or down may miss it, so the setting should be
-     * verified on each node through `get_current_params`. Only the leader's
-     * copy has any effect.
+     * If this server is the leader, it applies the setting at once. A follower
+     * sends the request to the leader. The leader then sends the setting to
+     * its peers, best-effort: a peer that is busy or down can miss it. So it
+     * is worth checking the value on each node with `get_current_params`.
      *
      * @param enable If `true`, turn the backpressure on.
-     * @return `true` if the request was applied locally or sent to the leader.
-     *         It does not guarantee that the leader applied it.
+     * @return `true` if the request was applied locally or sent to the leader,
+     *         which does not guarantee that the leader applied it.
      */
     bool request_slow_member_backpressure(bool enable);
-
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -773,18 +771,6 @@ public:
      * @param new_params Parameters to set.
      */
     void update_params(const raft_params& new_params);
-
-    /**
-     * Update the current Raft parameters by modifying them in place.
-     *
-     * Unlike a `get_current_params` - modify - `update_params` sequence, the
-     * read and the write happen under the same lock, so a concurrent update
-     * of an unrelated parameter cannot be lost.
-     *
-     * @param modifier Invoked with a copy of the current parameters, under
-     *                 the Raft lock. It should not block.
-     */
-    void modify_params(const std::function<void(raft_params&)>& modifier);
 
     /**
      * Get the current Raft parameters.
@@ -1094,20 +1080,27 @@ protected:
     uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
 
     /**
-     * Effective limit of uncommitted log entries, which is tightened while the
-     * commit index is being held for a member that fell behind.
+     * The limit of uncommitted log entries that is really in use. It is
+     * smaller while backpressure is active for a member that fell behind.
      */
     uint64_t get_max_uncommitted_log_entries() const;
 
     /**
-     * `true` while the commit index is being held for at least one member.
+     * `true` while backpressure is active for at least one member.
      */
-    std::atomic<bool> holding_for_slow_member_{false};
+    std::atomic<bool> slow_member_backpressure_active_{false};
 
     /**
-     * Rate limiter for the slow member backpressure transition messages.
+     * `true` once the slow member backpressure was switched while the server
+     * was running. `become_leader` sends the setting again only then.
      */
-    timer_helper transition_msg_timer_{5000000};
+    std::atomic<bool> slow_member_backpressure_ever_switched_{false};
+
+    /**
+     * Limits how often the slow member backpressure writes a log message,
+     * in microsecond.
+     */
+    timer_helper slow_member_backpressure_log_timer_{5 * 1000 * 1000};
 
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,
@@ -1147,15 +1140,15 @@ protected:
     ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
-
-    ptr<resp_msg> handle_slow_member_backpressure_request(req_msg& req,
-                                             ptr<custom_notification_msg> msg,
-                                             ptr<resp_msg> resp);
-
-    void enable_slow_member_backpressure(bool enable);
-
-    void broadcast_slow_member_backpressure(bool enable);
+    ptr<resp_msg> handle_slow_member_backpressure_request
+                  ( req_msg& req,
+                    ptr<custom_notification_msg> msg,
+                    ptr<resp_msg> resp );
     ptr<resp_msg> handle_leader_status_req(req_msg& req);
+
+    ptr<req_msg> create_slow_member_backpressure_req(int dst, bool enable);
+    void switch_slow_member_backpressure(bool enable);
+    void broadcast_slow_member_backpressure(bool enable);
 
     void handle_join_cluster_resp(resp_msg& resp);
     void handle_log_sync_resp(resp_msg& resp);

@@ -303,45 +303,50 @@ ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
     }
 
     if (req.get_term() < state_->get_term()) {
-        // A stale term means the sender does not know it was deposed. Ignoring
-        // it also stops two servers that both believe they are leaders from
-        // re-broadcasting to each other.
+        // An old term means that the sender does not know it is no longer the
+        // leader. Ignoring the message also stops two servers that both think
+        // they are the leader from sending the setting back and forth.
         p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d with stale "
              "term %" PRIu64 ", my term %" PRIu64 ", ignore it",
              req.get_src(), req.get_term(), state_->get_term());
         return resp;
     }
 
-    // A newer term is proof that this node is behind, and that it is not the
-    // leader anymore if it thought it was. Step down before doing anything
-    // else, as a deposed leader must not re-broadcast with its stale term.
+    // A newer term proves that this node is behind, and that it is not the
+    // leader any more, even if it still thinks so. Step down first: a server
+    // that is no longer the leader must not send the setting on with its old
+    // term.
     update_term(req.get_term());
 
     ptr<slow_member_backpressure_msg> bp_msg =
         slow_member_backpressure_msg::deserialize(*msg->ctx_);
 
     if (is_leader()) {
-        // A follower asks this leader to change the setting: apply it and
-        // propagate, as only the leader acts on it but every node should
-        // report it.
+        // A follower asks this leader to change the setting. Apply it here
+        // and send it on: only the leader uses the setting, but every node
+        // should report the same value.
         p_in("[SLOW MEMBER BACKPRESSURE] got request from peer %d to turn it %s",
              req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
-        enable_slow_member_backpressure(bp_msg->enable_);
+        switch_slow_member_backpressure(bp_msg->enable_);
         broadcast_slow_member_backpressure(bp_msg->enable_);
 
     } else if (req.get_src() == leader_ || leader_ == -1) {
-        // Propagation from the current leader: apply locally.
+        // The current leader sends the setting. Apply it here.
         //
-        // NOTE: `leader_ == -1` is accepted as well, otherwise every
-        //       propagation that races with a leader change would be dropped.
-        //       In that window the sender cannot be verified to be the leader,
-        //       only to be in the current term, which is enough here: the
-        //       setting affects availability, not safety.
+        // NOTE: `leader_ == -1` is accepted as well. Without that, a message
+        //       that arrives at the same time as a leader change would always
+        //       be dropped. During that short time this node cannot check that
+        //       the sender is the leader. It can only check that the sender is
+        //       in the current term. That is enough here, because the setting
+        //       changes availability and not safety.
         p_in("[SLOW MEMBER BACKPRESSURE] leader %d turned it %s",
              req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
-        enable_slow_member_backpressure(bp_msg->enable_);
+        switch_slow_member_backpressure(bp_msg->enable_);
 
     } else {
+        // A server that has just lost leadership still has its old
+        // `leader_`, so a message from the new leader is dropped here. The
+        // next `become_leader` sends the setting again and fixes this.
         p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
              "node is not a leader and the request is not from the current "
              "leader %d", req.get_src(), leader_.load());
@@ -361,17 +366,19 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     }
     ptr<peer> p = it->second;
 
-    // NOTE: Only move the next log index forward. A custom notification is not
-    //       a log replication request, and its response carries the peer's
-    //       current `next_slot`, which is behind the leader's view while the
-    //       peer is catching up or receiving a snapshot. Moving the index
-    //       backwards here would make the leader re-send log entries it
-    //       already sent, or decide that the peer needs a snapshot again and
-    //       restart the transfer from the beginning.
+    // NOTE: Only move the next log index forward. A custom notification does
+    //       not replicate log entries, but its response still carries the
+    //       peer's `next_slot`. While the peer is catching up or receiving a
+    //       snapshot, that value is lower than what the leader has already
+    //       sent. Moving the index back would make the leader send the same
+    //       entries again, or decide that the peer needs a snapshot once more
+    //       and start the transfer from the beginning. The probe counter is
+    //       reset in both cases, as it always was: the response proves that
+    //       the peer can be reached.
     if (resp.get_next_idx() > p->get_next_log_idx()) {
         p->set_next_log_idx(resp.get_next_idx());
-        p->reset_cnt_backward_log_probe();
     }
+    p->reset_cnt_backward_log_probe();
 }
 
 } // namespace nuraft;
