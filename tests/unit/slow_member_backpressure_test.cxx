@@ -226,8 +226,8 @@ int not_held_with_custom_quorum_size_test() {
 // A member whose requests fail cannot catch up by being waited for, so the
 // leader must stop waiting as soon as a request to it fails. The rpc error is
 // the only signal available at that moment: the response timer is only reset
-// by an accepted response, so a member that has just stopped still looks
-// responsive until the expiry passes.
+// by an accepted response, so a member that has just stopped still looks busy
+// until the no progress timeout passes.
 int rpc_error_alone_releases_lagging_member_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();

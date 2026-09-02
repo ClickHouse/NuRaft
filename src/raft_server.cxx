@@ -1256,13 +1256,12 @@ void raft_server::become_leader() {
         config_changing_ = true;
     }
 
-    // The slow member backpressure lasts for one leadership. Only the leader
-    // acts on the setting, and this server may have missed the message that
-    // switched it, so its own copy is not to be trusted: acting on a stale
-    // `true` would throttle the cluster again after an operator had switched
-    // it off, with nothing to show why. Switching it off here makes the loss
-    // of backpressure at a leader change certain instead of accidental, and an
-    // operator turns it on again if it is still wanted.
+    // The slow member backpressure lasts for one leadership, so a server that
+    // has just been elected must not start throttling on the strength of a
+    // setting from an earlier one. `become_follower` clears it as well, so
+    // reaching here with it still on means this server went from leader to
+    // candidate and back without ever stepping down; clearing it again costs
+    // nothing and keeps the rule simple to state.
     if (ctx_->get_params()->slow_member_backpressure_enabled_) {
         p_in("slow member backpressure was on: switching it off, as it does "
              "not carry over to a new leader");

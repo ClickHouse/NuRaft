@@ -303,19 +303,19 @@ ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
     }
 
     if (req.get_term() < state_->get_term()) {
-        // An old term means that the sender does not know it is no longer the
-        // leader. Ignoring the message also stops two servers that both think
-        // they are the leader from sending the setting back and forth.
+        // An old term means the sender is behind, so its view of who leads
+        // is not to be trusted either. Only the leader applies the setting,
+        // and a stale request is no reason to change it.
         p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d with stale "
              "term %" PRIu64 ", my term %" PRIu64 ", ignore it",
              req.get_src(), req.get_term(), state_->get_term());
         return resp;
     }
 
-    // A newer term proves that this node is behind, and that it is not the
-    // leader any more, even if it still thinks so. Step down first: a server
-    // that is no longer the leader must not send the setting on with its old
-    // term.
+    // A newer term proves that this server is behind, and that it is not the
+    // leader any more even if it still thinks so. Step down before looking at
+    // the request, so that a deposed leader does not apply a setting only a
+    // leader may hold.
     update_term(req.get_term());
 
     ptr<slow_member_backpressure_msg> bp_msg =

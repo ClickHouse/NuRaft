@@ -668,16 +668,19 @@ public:
 
     /**
      * (Experimental)
-     * If `true`, the leader does not commit an entry before every member that
-     * it can reach has it, so that a member which fell behind can catch up.
-     * Unlike `use_full_consensus_among_healthy_members_`, a member is waited
-     * for however far behind it is, including while it receives a snapshot; a
-     * member is left out only when the leader cannot reach it at all.
+     * If `true`, the leader does not commit an entry before every member it
+     * is still waiting for has it, so that a member which fell behind can
+     * catch up. Unlike `use_full_consensus_among_healthy_members_`, a member
+     * is waited for however far behind it is, including while it receives a
+     * snapshot. It is left out only when waiting cannot get it anywhere: the
+     * leader cannot reach it, or it made no progress within
+     * `slow_member_backpressure_no_progress_timeout_`.
      *
      * While this is on, writes go at the speed of the slowest member, so it is
      * off by default and meant to be switched on for a while and switched off
      * again, with `request_slow_member_backpressure`. It lasts for one
-     * leadership: a new leader switches it off.
+     * leadership: it is switched off both when a server becomes the leader and
+     * when it stops being one.
      */
     bool slow_member_backpressure_enabled_;
 
