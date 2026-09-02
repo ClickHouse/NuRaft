@@ -101,7 +101,7 @@ struct raft_params {
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
         , slow_member_backpressure_enabled_(false)
-        , slow_member_backpressure_no_progress_timeout_(30 * 1000)
+        , slow_member_backpressure_no_progress_timeout_(5 * 60 * 1000)
         , slow_member_backpressure_max_uncommitted_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
@@ -692,10 +692,12 @@ public:
      * member that is merely slow keeps resetting this, so only one that is
      * stuck stops being waited for.
      *
-     * Give it room. A member applying a large snapshot can be quiet for a
-     * long time, and it is exactly the member the backpressure exists for.
-     * A member the leader cannot reach at all is dropped straight away, by
-     * its failed requests, without waiting for this.
+     * The default is five minutes, and it is meant to be that large. A
+     * member applying a large snapshot can be quiet for minutes, and it is
+     * exactly the member the backpressure exists for; a timeout in seconds
+     * would abandon it just as waiting started to pay off. A member the
+     * leader cannot reach at all is dropped straight away, by its failed
+     * requests, without waiting for this.
      *
      * `0` means the leader never stops waiting for a member it can reach.
      */
