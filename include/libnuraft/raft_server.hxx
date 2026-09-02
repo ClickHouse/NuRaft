@@ -478,8 +478,8 @@ public:
      *
      * If this server is the leader, it applies the setting at once. A follower
      * sends the request to the leader. The leader then sends the setting to
-     * its peers, best-effort: a peer that is busy or down can miss it. So it
-     * is worth checking the value on each node with `get_current_params`.
+     * its peers, best-effort: a peer that is busy or down can miss it. Read
+     * the value on each node with `get_current_params` to see what it is.
      *
      * The setting lasts for one leadership. A new leader switches it off, so
      * it has to be turned on again after a leader change.

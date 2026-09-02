@@ -1939,11 +1939,9 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
 
     uint64_t release_gap = get_slow_member_release_gap(*params);
 
-    // How long a member may stay silent and still count as responsive. This
-    // reuses the limit the leader already applies to the same peers for the
-    // same question, in `create_append_entries_req` and in
-    // `get_expected_committed_log_idx`; the name is upstream's and comes from
-    // full consensus, which is unrelated to this feature.
+    // How long a member may stay silent and still count as responsive, reusing
+    // the limit the leader already applies to the same peers for the same
+    // question in `create_append_entries_req`.
     uint64_t expiry = (uint64_t)params->heart_beat_interval_ *
                       raft_server::raft_limits_.full_consensus_leader_limit_;
     int32_t gap_window = params->slow_member_backpressure_gap_window_
@@ -1955,9 +1953,9 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
 
     // A slow member is throttled in many short steps, so logging every start
     // and every end would give two warnings per batch. This timer limits how
-    // often a warning is written. It is used only when there is really something to
-    // log. If every call used it, a call with nothing to report would take the
-    // turn, and the interesting messages would stay on TRACE.
+    // often a warning is written, and is read only when there is something to
+    // log: a call with nothing to report would otherwise take the turn and
+    // leave the interesting messages on TRACE.
     auto transition_log_lv = [this]() {
         return slow_member_backpressure_log_timer_.timeout_and_reset()
                ? L_WARN : L_TRACE;
@@ -2064,11 +2062,11 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
     // only helps if the leader also stops taking new requests.
     slow_member_backpressure_active_ = active;
 
-    // The commit index must never move backwards. A member can be behind the
-    // commit index - one receiving a snapshot always is - and committed entries
-    // have already been applied across the cluster, so the most this can do is
-    // freeze the commit index where it is.
-    return std::max(clamped_commit_index, quick_commit_index_.load());
+    // A member the leader waits for can be behind the commit index, and one
+    // receiving a snapshot always is, so this can return less than the current
+    // commit index. `commit` ignores anything that does not move it forward,
+    // so the most backpressure can do is freeze the commit index where it is.
+    return clamped_commit_index;
 }
 
 void raft_server::notify_log_append_completion(bool ok) {

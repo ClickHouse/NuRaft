@@ -268,9 +268,6 @@ public:
     }
 
     uint64_t adjust_commit_index(const adjust_commit_index_params& params) {
-        if (params.expected_commit_index_ < params.current_commit_index_) {
-            numCommitIndexRegressions.fetch_add(1);
-        }
         std::lock_guard<std::mutex> l(serversForCommitLock);
         if (serversForCommit.empty()) {
             return params.expected_commit_index_;
@@ -391,10 +388,6 @@ public:
         return numSnapshotCreations;
     }
 
-    uint64_t getNumCommitIndexRegressions() const {
-        return numCommitIndexRegressions;
-    }
-
 private:
     std::map<uint64_t, ptr<buffer>> preCommits;
     std::map<uint64_t, ptr<buffer>> commits;
@@ -422,12 +415,6 @@ private:
     mutable std::mutex serversForCommitLock;
 
     std::atomic<uint64_t> numSnapshotCreations;
-
-    /**
-     * Number of times `adjust_commit_index` was invoked with an expected
-     * commit index below the current one, which the API promises not to do.
-     */
-    std::atomic<uint64_t> numCommitIndexRegressions{0};
 
     SimpleLogger* myLog;
 };

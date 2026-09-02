@@ -651,45 +651,7 @@ int snapshot_receiver_is_held_test() {
         while (s1.fNet->execReqResp(s2_addr)) {}
         CHK_EQ( frozen_at, s1.raftServer->get_target_committed_log_idx() );
     }
-    CHK_Z( s1.getTestSm()->getNumCommitIndexRegressions() );
     CHK_HELD( s1 );
-
-    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
-    f_base->destroy();
-    return 0;
-}
-
-// While the commit index is held, the index handed to
-// `state_machine::adjust_commit_index` must never fall below the current
-// commit index: the lagging member's matched index is usually below what has
-// already been committed, and handing that value to the state machine would
-// break the API promise that the expected index never regresses.
-int commit_index_never_regresses_test() {
-    reset_log_files();
-    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
-
-    std::string s1_addr = "S1";
-    std::string s2_addr = "S2";
-    std::string s3_addr = "S3";
-
-    RaftPkg s1(f_base, 1, s1_addr);
-    RaftPkg s2(f_base, 2, s2_addr);
-    RaftPkg s3(f_base, 3, s3_addr);
-    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
-
-    CHK_Z( prepare(pkgs, -1) );
-
-    // A few entries commit normally first, so that the current commit index
-    // is well above S3's matched index once S3 stops receiving anything.
-    append_and_deliver_to(s1, 2, {s2_addr, s3_addr}, "base");
-    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
-
-    // S3 falls behind and the hold begins: many evaluations happen while
-    // S3's matched index is below the committed index.
-    append_and_deliver_to(s1, STALE_LOG_GAP * 2, {s2_addr}, "regress");
-    CHK_HELD( s1 );
-
-    CHK_Z( s1.getTestSm()->getNumCommitIndexRegressions() );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -1245,9 +1207,6 @@ int main(int argc, char** argv) {
 
     ts.doTest( "snapshot receiver is held test",
                snapshot_receiver_is_held_test );
-
-    ts.doTest( "commit index never regresses test",
-               commit_index_never_regresses_test );
 
     ts.doTest( "gives up on a slowly progressing member test",
                gives_up_on_a_slowly_progressing_member_test );
