@@ -330,9 +330,10 @@ int never_responded_member_is_not_held_test() {
 }
 
 // A member that goes silent without its requests failing must be released too:
-// it cannot catch up while it is not answering, so waiting for it only stalls
-// the cluster. This is the responsiveness window on its own, with no rpc error
-// and a matched index already known, which is what every other test conflates.
+// it makes no progress while it is not answering, so waiting for it only
+// stalls the cluster. This is the no progress timeout on its own, with no rpc
+// error and a matched index already known, which is what every other test
+// conflates.
 int silent_member_is_released_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -346,26 +347,13 @@ int silent_member_is_released_test() {
     RaftPkg s3(f_base, 3, s3_addr);
     std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
 
-    // Shrink the responsiveness window so silence is noticed within the test:
-    // it is `full_consensus_leader_limit` heartbeats. These limits are process
-    // global, so put them back however this test ends - an early return from a
-    // failed check would otherwise leave the shrunken window in place for
-    // every test that runs afterwards.
-    struct limits_guard {
-        explicit limits_guard(raft_server::limits saved): saved_(saved) {}
-        ~limits_guard() { raft_server::set_raft_limits(saved_); }
-        raft_server::limits saved_;
-    } guard(raft_server::get_raft_limits());
-
-    raft_server::limits new_limits = raft_server::get_raft_limits();
-    new_limits.full_consensus_leader_limit_ = 2;
-    raft_server::set_raft_limits(new_limits);
-
     CHK_Z( prepare(pkgs) );
     for (RaftPkg* pkg: pkgs) {
         raft_params params = pkg->raftServer->get_current_params();
-        params.heart_beat_interval_ = 20;
-        params.max_append_size_ = 1;
+        // Short enough to pass within the test. The default is measured in
+        // tens of seconds, because a member applying a big snapshot is quiet
+        // for a long time and is exactly the one worth waiting for.
+        params.slow_member_backpressure_no_progress_timeout_ = 100;
         pkg->raftServer->update_params(params);
     }
 
@@ -376,12 +364,51 @@ int silent_member_is_released_test() {
     CHK_GT( matched_idx_of(s1, 3), (uint64_t)0 );
     CHK_HELD( s1 );
 
-    // Now it simply stops answering. Once the window passes it is no longer
-    // eligible, so the commit index proceeds on the majority.
-    TestSuite::sleep_ms(20 * 2 * 5, "let the responsiveness window pass");
+    // Now it simply stops making progress. Once the timeout passes it is no
+    // longer waited for, so the commit index proceeds on the majority.
+    TestSuite::sleep_ms(300, "let the no progress timeout pass");
     append_and_deliver_to(s1, 1, {s2_addr}, "silent_more");
     while (s1.fNet->execReqResp(s2_addr)) {}
     CHK_NOT_HELD( s1 );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+// With the no progress timeout switched off, a member that the leader can
+// still reach is waited for however long it takes. An operator who asks for
+// that has to be able to rely on it: nothing but `bpof` should end it.
+int no_progress_timeout_zero_waits_indefinitely_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( prepare(pkgs) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.slow_member_backpressure_no_progress_timeout_ = 0;
+        pkg->raftServer->update_params(params);
+    }
+
+    append_and_deliver_to(s1, LAG * 2, {s2_addr}, "forever");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_HELD( s1 );
+
+    // Long enough that any timeout short enough to be useful would have
+    // expired. S3 answers nothing, and its requests do not fail.
+    TestSuite::sleep_ms(300, "stay silent");
+    append_and_deliver_to(s1, 1, {s2_addr}, "still_forever");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_HELD( s1 );
 
     for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
     f_base->destroy();
@@ -797,6 +824,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "silent member is released test",
                silent_member_is_released_test );
+
+    ts.doTest( "no progress timeout zero waits indefinitely test",
+               no_progress_timeout_zero_waits_indefinitely_test );
 
     ts.doTest( "snapshot receiver is held test",
                snapshot_receiver_is_held_test );

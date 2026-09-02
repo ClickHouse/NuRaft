@@ -1932,11 +1932,9 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         return expected_commit_index;
     }
 
-    // How long a member may stay silent and still count as reachable, reusing
-    // the limit the leader already applies to the same peers for the same
-    // question in `create_append_entries_req`.
-    uint64_t expiry = (uint64_t)params->heart_beat_interval_ *
-                      raft_server::raft_limits_.full_consensus_leader_limit_;
+    // How long a member may make no progress at all and still be waited for.
+    // `0` means the leader waits for as long as it can reach the member.
+    int32 no_progress_timeout = params->slow_member_backpressure_no_progress_timeout_;
     uint64_t clamped_commit_index = expected_commit_index;
     int32 slowest_member = -1;
 
@@ -1946,26 +1944,31 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
 
         uint64_t matched_idx = pp->get_matched_idx();
 
-        // Waiting for a member only helps if the leader can still reach it.
-        // The leader does not wait for a member when:
-        //   - its last request failed. The response timer alone does not show
-        //     this, as it is only reset by an accepted response, so a member
-        //     that has just stopped still looks alive until the expiry passes.
-        //   - it did not answer within the expiry time.
+        // Waiting for a member only helps if waiting can still get it
+        // anywhere. The leader stops waiting for a member when:
+        //   - its last request failed, so it cannot be reached at all. The
+        //     idle time below does not show this on its own: a member that
+        //     has just stopped still looks busy until the timeout passes.
+        //   - it made no progress within the no progress timeout.
         //   - it has not answered at all yet on a new connection.
         //
-        // A member receiving a snapshot is waited for. The transfer is no
-        // faster for waiting, but the log stops growing, so the member does
-        // not have to catch up on everything written during the transfer and
-        // then need another snapshot.
-        bool can_be_reached = !pp->get_rpc_errs() &&
-                              pp->get_resp_timer_us() / 1000 <= expiry &&
-                              matched_idx;
+        // The response timer is reset only by an accepted response, and an
+        // accepted response means the member took log entries or saved a
+        // snapshot object, so the idle time measures progress rather than
+        // reachability. That is why a member receiving a snapshot is waited
+        // for: it keeps making progress, one object at a time. The transfer
+        // is no faster for waiting, but the log stops growing, so the member
+        // does not have to catch up on everything written during it and then
+        // need another snapshot.
+        uint64_t idle_ms = pp->get_resp_timer_us() / 1000;
+        bool making_progress = !no_progress_timeout ||
+                               idle_ms <= (uint64_t)no_progress_timeout;
+        bool can_be_reached = !pp->get_rpc_errs() && making_progress && matched_idx;
 
-        p_tr("backpressure: peer %d matched %" PRIu64 ", resp %" PRIu64 " ms, "
-             "expiry %" PRIu64 " ms, rpc errors %d, snapshot %s, "
+        p_tr("backpressure: peer %d matched %" PRIu64 ", idle %" PRIu64 " ms, "
+             "no progress timeout %d ms, rpc errors %d, snapshot %s, "
              "can be reached %s",
-             pp->get_id(), matched_idx, pp->get_resp_timer_us() / 1000, expiry,
+             pp->get_id(), matched_idx, idle_ms, no_progress_timeout,
              pp->get_rpc_errs(),
              pp->get_snapshot_sync_ctx() ? "YES" : "NO",
              can_be_reached ? "YES" : "NO");
