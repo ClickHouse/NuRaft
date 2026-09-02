@@ -738,6 +738,13 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
 
     if (params->use_full_consensus_among_healthy_members_) {
         // Full consensus mode: set flag indicating the member is excluded.
+        //
+        // NOTE: Unlike `get_expected_committed_log_idx`, this is not gated on
+        //       `custom_commit_quorum_size_ == 0`. So when a custom quorum
+        //       size is set, the leader commits by that quorum, but it still
+        //       tells a member that full consensus would have left it out.
+        //       This is the safer of the two mistakes: without the flag every
+        //       member would believe that it belongs to the quorum.
         uint64_t last_resp_time_ms = p.get_resp_timer_us() / 1000;
         uint64_t expiry = params->heart_beat_interval_ *
                           raft_server::raft_limits_.full_consensus_leader_limit_;
@@ -1903,13 +1910,93 @@ ulong raft_server::get_expected_committed_log_idx() {
     }
 
     aci_params.current_commit_index_ = quick_commit_index_;
-    aci_params.expected_commit_index_ = matched_indexes[quorum_idx];
+    aci_params.expected_commit_index_ =
+        apply_slow_member_backpressure(matched_indexes[quorum_idx]);
     uint64_t adjusted_commit_index = state_machine_->adjust_commit_index(aci_params);
     if (aci_params.expected_commit_index_ != adjusted_commit_index) {
         p_tr( "commit index adjusted: %" PRIu64 " -> %" PRIu64,
               aci_params.expected_commit_index_, adjusted_commit_index );
     }
     return adjusted_commit_index;
+}
+
+uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_index) {
+    ptr<raft_params> params = ctx_->get_params();
+    if (!params->slow_member_backpressure_enabled_) {
+        return expected_commit_index;
+    }
+
+    if (params->custom_commit_quorum_size_) {
+        // The quorum size is overridden on purpose, for example in recovery
+        // mode. Waiting for every member would work against that.
+        return expected_commit_index;
+    }
+
+    // How long a member may stay silent and still count as reachable, reusing
+    // the limit the leader already applies to the same peers for the same
+    // question in `create_append_entries_req`.
+    uint64_t expiry = (uint64_t)params->heart_beat_interval_ *
+                      raft_server::raft_limits_.full_consensus_leader_limit_;
+    uint64_t clamped_commit_index = expected_commit_index;
+    int32 slowest_member = -1;
+
+    for (auto& entry: peers_) {
+        ptr<peer>& pp = entry.second;
+        if (!is_regular_member(pp)) continue;
+
+        uint64_t matched_idx = pp->get_matched_idx();
+
+        // Waiting for a member only helps if the leader can still reach it.
+        // The leader does not wait for a member when:
+        //   - its last request failed. The response timer alone does not show
+        //     this, as it is only reset by an accepted response, so a member
+        //     that has just stopped still looks alive until the expiry passes.
+        //   - it did not answer within the expiry time.
+        //   - it has not answered at all yet on a new connection.
+        //
+        // A member receiving a snapshot is waited for. The transfer is no
+        // faster for waiting, but the log stops growing, so the member does
+        // not have to catch up on everything written during the transfer and
+        // then need another snapshot.
+        bool can_be_reached = !pp->get_rpc_errs() &&
+                              pp->get_resp_timer_us() / 1000 <= expiry &&
+                              matched_idx;
+
+        p_tr("backpressure: peer %d matched %" PRIu64 ", resp %" PRIu64 " ms, "
+             "expiry %" PRIu64 " ms, rpc errors %d, snapshot %s, "
+             "can be reached %s",
+             pp->get_id(), matched_idx, pp->get_resp_timer_us() / 1000, expiry,
+             pp->get_rpc_errs(),
+             pp->get_snapshot_sync_ctx() ? "YES" : "NO",
+             can_be_reached ? "YES" : "NO");
+
+        if (!can_be_reached) continue;
+
+        if (matched_idx < clamped_commit_index) {
+            clamped_commit_index = matched_idx;
+            slowest_member = pp->get_id();
+        }
+    }
+
+    // The leader waits for as long as an operator leaves the backpressure on,
+    // so writing a message on every batch would flood the log.
+    if (slowest_member >= 0 &&
+        slow_member_backpressure_log_timer_.timeout_and_reset()) {
+        uint64_t last_log_idx = log_store_->next_slot() - 1;
+        p_in("slow member backpressure: waiting for peer %d at log index "
+             "%" PRIu64 ", %" PRIu64 " entries behind the log tail; without it "
+             "the quorum would commit up to %" PRIu64,
+             slowest_member, clamped_commit_index,
+             last_log_idx > clamped_commit_index
+             ? last_log_idx - clamped_commit_index : 0,
+             expected_commit_index);
+    }
+
+    // A member can be behind the commit index, and one receiving a snapshot
+    // always is, so this can return less than the current commit index.
+    // `commit` ignores anything that does not move it forward, so the most
+    // backpressure can do is freeze the commit index where it is.
+    return clamped_commit_index;
 }
 
 void raft_server::notify_log_append_completion(bool ok) {

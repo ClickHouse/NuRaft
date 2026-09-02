@@ -100,6 +100,8 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
+        , slow_member_backpressure_enabled_(false)
+        , slow_member_backpressure_max_uncommitted_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -662,6 +664,31 @@ public:
      * from the leader for a configured time (`full_consensus_follower_limit_`).
      */
     bool use_full_consensus_among_healthy_members_;
+
+    /**
+     * (Experimental)
+     * If `true`, the leader does not commit an entry before every member that
+     * it can reach has it, so that a member which fell behind can catch up.
+     * Unlike `use_full_consensus_among_healthy_members_`, a member is waited
+     * for however far behind it is, including while it receives a snapshot; a
+     * member is left out only when the leader cannot reach it at all.
+     *
+     * While this is on, writes go at the speed of the slowest member, so it is
+     * off by default and meant to be switched on for a while and switched off
+     * again, with `request_slow_member_backpressure`. It lasts for one
+     * leadership: a new leader switches it off.
+     */
+    bool slow_member_backpressure_enabled_;
+
+    /**
+     * (Experimental)
+     * The value `max_uncommitted_log_entries_` takes while
+     * `slow_member_backpressure_enabled_` is on. Holding the commit index back
+     * does not by itself stop the leader from taking new writes, so without a
+     * tighter limit the log keeps growing and the member falls even further
+     * behind. `0` leaves the limit unchanged.
+     */
+    uint64_t slow_member_backpressure_max_uncommitted_;
 
     /**
      * (Experimental)

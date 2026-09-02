@@ -159,7 +159,7 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
     uint64_t request_entries = 0;
     uint64_t max_entries = 0;
     if (should_reject_client_request_by_uncommitted_log_entries(entries,
-                                                                params->max_uncommitted_log_entries_,
+                                                                get_max_uncommitted_log_entries(),
                                                                 current_entries,
                                                                 request_entries,
                                                                 max_entries)) {
