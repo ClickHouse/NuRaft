@@ -636,10 +636,61 @@ int refuses_new_requests_while_active_test() {
     return 0;
 }
 
+// The switch lasts for one leadership, and a server that stops leading must
+// stop reporting it. Only a leader acts on the setting, so a deposed leader
+// that kept a stale `true` would tell an operator the cluster is throttled
+// when it is not - and `mntr` is read exactly when that matters.
+int switched_off_when_leadership_is_lost_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers(pkgs) );
+    CHK_Z( make_group(pkgs) );
+
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_TRUE( s1.raftServer->request_slow_member_backpressure(true) );
+    CHK_TRUE( s1.raftServer->get_current_params()
+                  .slow_member_backpressure_enabled_ );
+
+    // Hand leadership to S3, the same way `leader_election_test` does.
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->execReqResp();
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    // Pre-vote, then vote.
+    s3.fNet->execReqResp();
+    s3.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    s3.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_TRUE( s3.raftServer->is_leader() );
+
+    // The old leader must have let go of it, and the new one must not have
+    // picked it up.
+    CHK_FALSE( s1.raftServer->get_current_params()
+                   .slow_member_backpressure_enabled_ );
+    CHK_FALSE( s3.raftServer->get_current_params()
+                   .slow_member_backpressure_enabled_ );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
 // The switch itself: off by default, a follower's request reaches the leader,
-// the leader uses it and sends it on, and turning it off releases the member.
-// Nothing else in this file covers the switch, so without this test the whole
-// switch could be removed and every other test would still pass.
+// only the leader holds it, and turning it off releases the member. Nothing
+// else in this file covers the switch, so without this test the whole switch
+// could be removed and every other test would still pass.
 int runtime_toggle_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -680,11 +731,12 @@ int runtime_toggle_test() {
     CHK_TRUE( s1.raftServer->get_current_params()
                   .slow_member_backpressure_enabled_ );
 
-    // The leader sends it on, so the other members report it too.
-    s1.fNet->execReqResp(s2_addr);
-    s1.fNet->execReqResp(s3_addr);
-    CHK_TRUE( s2.raftServer->get_current_params()
-                  .slow_member_backpressure_enabled_ );
+    // Only the leader holds it. A follower that asked for it does not set it
+    // locally, so every server reports a value it can actually act on.
+    CHK_FALSE( s2.raftServer->get_current_params()
+                   .slow_member_backpressure_enabled_ );
+    CHK_FALSE( s3.raftServer->get_current_params()
+                   .slow_member_backpressure_enabled_ );
 
     // On: the same lag now holds the commit index back.
     append_and_deliver_to(s1, LAG * 2, {s2_addr}, "on");
@@ -697,11 +749,10 @@ int runtime_toggle_test() {
     CHK_FALSE( s1.raftServer->get_current_params()
                    .slow_member_backpressure_enabled_ );
     append_and_deliver_to(s1, 1, {s2_addr}, "off_again");
-    // Turning it off also sends the setting to every peer, over the same
-    // connection as the append answers, so keep delivering S2's messages until
-    // the commit index reaches the last log entry. S3 is left far behind on
-    // purpose: if the commit index were still held, delivering S2's messages
-    // could never move it past S3's matched index.
+    // Keep delivering S2's messages until the commit index reaches the last
+    // log entry. S3 is left far behind on purpose: if the commit index were
+    // still held, delivering S2's messages could never move it past S3's
+    // matched index.
     uint64_t last_log_idx = tail(s1);
     for (int ii = 0; ii < 40; ++ii) {
         if (s1.raftServer->get_target_committed_log_idx() == last_log_idx) break;
@@ -758,6 +809,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "runtime toggle test",
                runtime_toggle_test );
+
+    ts.doTest( "switched off when leadership is lost test",
+               switched_off_when_leadership_is_lost_test );
 
     return 0;
 }

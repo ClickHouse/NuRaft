@@ -322,35 +322,19 @@ ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
         slow_member_backpressure_msg::deserialize(*msg->ctx_);
 
     if (is_leader()) {
-        // A follower asks this leader to change the setting. Apply it here
-        // and send it on: only the leader uses the setting, but every node
-        // should report the same value.
+        // A follower asks this leader to change the setting. Only the leader
+        // holds it, so applying it here is all there is to do.
         p_in("[SLOW MEMBER BACKPRESSURE] got request from peer %d to turn it %s",
-             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
-        switch_slow_member_backpressure(bp_msg->enable_);
-        broadcast_slow_member_backpressure(bp_msg->enable_);
-
-    } else if (req.get_src() == leader_ || leader_ == -1) {
-        // The current leader sends the setting. Apply it here.
-        //
-        // NOTE: `leader_ == -1` is accepted as well. Without that, a message
-        //       that arrives at the same time as a leader change would always
-        //       be dropped. During that short time this node cannot check that
-        //       the sender is the leader. It can only check that the sender is
-        //       in the current term. That is enough here, because the setting
-        //       changes availability and not safety.
-        p_in("[SLOW MEMBER BACKPRESSURE] leader %d turned it %s",
              req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
         switch_slow_member_backpressure(bp_msg->enable_);
 
     } else {
-        // A server that has just lost leadership still has its old `leader_`,
-        // so a message from the new leader is dropped here. That is not
-        // repaired later: a new leader switches the setting off rather than
-        // publishing it, so an operator turns it on again if it is wanted.
+        // Only a leader is ever sent this request, so getting one here means
+        // the sender's view of the leader is out of date. Dropping it is
+        // right: this server would not act on the setting anyway, and it must
+        // not start reporting one it cannot apply.
         p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
-             "node is not a leader and the request is not from the current "
-             "leader %d", req.get_src(), leader_.load());
+             "server is not the leader", req.get_src());
     }
 
     return resp;

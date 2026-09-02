@@ -1649,31 +1649,10 @@ ptr<req_msg> raft_server::create_slow_member_backpressure_req(int dst,
     return req;
 }
 
-void raft_server::broadcast_slow_member_backpressure(bool enable) {
-    recur_lock(lock_);
-    for (auto& entry: peers_) {
-        ptr<peer> pp = entry.second;
-
-        ptr<req_msg> req =
-            create_slow_member_backpressure_req(pp->get_id(), enable);
-
-        if (pp->make_busy()) {
-            pp->send_req(pp, req, resp_handler_);
-        } else {
-            // Best-effort: the peer keeps its old setting. That only changes
-            // what the peer reports, not what the leader does, until the peer
-            // becomes the leader itself and sends its old setting on.
-            p_wn("cannot propagate slow member backpressure to peer %d, "
-                 "peer is busy", pp->get_id());
-        }
-    }
-}
-
 bool raft_server::request_slow_member_backpressure(bool enable) {
     if (is_leader()) {
         p_in("turning slow member backpressure %s", enable ? "ON" : "OFF");
         switch_slow_member_backpressure(enable);
-        broadcast_slow_member_backpressure(enable);
         return true;
     }
 
@@ -1720,6 +1699,17 @@ void raft_server::become_follower() {
     // stop hb for all peers
     p_in("[BECOME FOLLOWER] term %" PRIu64 "", state_->get_term());
     ptr<raft_params> params = ctx_->get_params();
+
+    // Only a leader acts on the slow member backpressure, so a server that is
+    // no longer the leader must not keep reporting it as on. Together with the
+    // same reset in `become_leader`, this keeps the setting true only on a
+    // leader an operator asked, so every server reports its own copy truthfully.
+    if (params->slow_member_backpressure_enabled_) {
+        p_in("slow member backpressure was on: switching it off, as this "
+             "server is no longer the leader");
+        switch_slow_member_backpressure(false);
+        params = ctx_->get_params();
+    }
     {   std::lock_guard<std::recursive_mutex> ll(cli_lock_);
         if (params->use_bg_thread_for_snapshot_io_) {
             snapshot_io_mgr::instance().drop_reqs(this);

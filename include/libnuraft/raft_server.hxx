@@ -477,12 +477,12 @@ public:
      * has an effect.
      *
      * If this server is the leader, it applies the setting at once. A follower
-     * sends the request to the leader. The leader then sends the setting to
-     * its peers, best-effort: a peer that is busy or down can miss it. Read
-     * the value on each node with `get_current_params` to see what it is.
+     * sends the request to the leader and does not set it locally, so only the
+     * leader ever holds it: read it with `get_current_params` on the leader.
      *
-     * The setting lasts for one leadership. A new leader switches it off, so
-     * it has to be turned on again after a leader change.
+     * The setting lasts for one leadership. It is switched off both when a
+     * server becomes the leader and when it stops being the leader, so it has
+     * to be turned on again after a leader change.
      *
      * @param enable If `true`, turn the backpressure on.
      * @return `true` if the request was applied locally or sent to the leader,
@@ -1143,7 +1143,6 @@ protected:
 
     ptr<req_msg> create_slow_member_backpressure_req(int dst, bool enable);
     void switch_slow_member_backpressure(bool enable);
-    void broadcast_slow_member_backpressure(bool enable);
 
     void handle_join_cluster_resp(resp_msg& resp);
     void handle_log_sync_resp(resp_msg& resp);
