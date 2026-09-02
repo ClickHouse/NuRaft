@@ -1937,11 +1937,16 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
     int32 no_progress_timeout = params->slow_member_backpressure_no_progress_timeout_;
     uint64_t clamped_commit_index = expected_commit_index;
     int32 slowest_member = -1;
+    bool slowest_is_receiving_snapshot = false;
 
     for (auto& entry: peers_) {
         ptr<peer>& pp = entry.second;
         if (!is_regular_member(pp)) continue;
 
+        // Read the snapshot context before `matched_idx`, so that an install
+        // finishing in between is seen as the position it produced rather
+        // than as the reset value it replaced.
+        bool receiving_snapshot = pp->get_snapshot_sync_ctx() != nullptr;
         uint64_t matched_idx = pp->get_matched_idx();
 
         // Waiting for a member only helps if waiting can still get it
@@ -1950,7 +1955,9 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         //     idle time below does not show this on its own: a member that
         //     has just stopped still looks busy until the timeout passes.
         //   - it made no progress within the no progress timeout.
-        //   - it has not answered at all yet on a new connection.
+        //   - the leader does not know where it stands: it has not answered
+        //     at all yet on a new connection, and no snapshot is on its way
+        //     to it either.
         //
         // The response timer is reset only by an accepted response, and an
         // accepted response means the member took log entries or saved a
@@ -1963,21 +1970,34 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         uint64_t idle_ms = pp->get_resp_timer_us() / 1000;
         bool making_progress = !no_progress_timeout ||
                                idle_ms <= (uint64_t)no_progress_timeout;
-        bool can_be_reached = !pp->get_rpc_errs() && making_progress && matched_idx;
+        bool position_is_known = matched_idx || receiving_snapshot;
+        bool can_be_reached =
+            !pp->get_rpc_errs() && making_progress && position_is_known;
 
         p_tr("backpressure: peer %d matched %" PRIu64 ", idle %" PRIu64 " ms, "
              "no progress timeout %d ms, rpc errors %d, snapshot %s, "
              "can be reached %s",
              pp->get_id(), matched_idx, idle_ms, no_progress_timeout,
              pp->get_rpc_errs(),
-             pp->get_snapshot_sync_ctx() ? "YES" : "NO",
+             receiving_snapshot ? "YES" : "NO",
              can_be_reached ? "YES" : "NO");
 
         if (!can_be_reached) continue;
 
-        if (matched_idx < clamped_commit_index) {
-            clamped_commit_index = matched_idx;
+        // `matched_idx` is reset to zero when the connection to a member is
+        // remade, and written again only once an install completes, so a
+        // member that reconnected and now receives a snapshot reports no
+        // position for the whole transfer. Zero is not a position, it means
+        // the member holds nothing of the log yet, so hold where the leader
+        // already is: that is as far as waiting for it can go.
+        uint64_t member_bound = (receiving_snapshot && !matched_idx)
+                                ? quick_commit_index_.load()
+                                : matched_idx;
+
+        if (member_bound < clamped_commit_index) {
+            clamped_commit_index = member_bound;
             slowest_member = pp->get_id();
+            slowest_is_receiving_snapshot = receiving_snapshot && !matched_idx;
         }
     }
 
@@ -1986,13 +2006,24 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
     if (slowest_member >= 0 &&
         slow_member_backpressure_log_timer_.timeout_and_reset()) {
         uint64_t last_log_idx = log_store_->next_slot() - 1;
-        p_in("slow member backpressure: waiting for peer %d at log index "
-             "%" PRIu64 ", %" PRIu64 " entries behind the log tail; without it "
-             "the quorum would commit up to %" PRIu64,
-             slowest_member, clamped_commit_index,
-             last_log_idx > clamped_commit_index
-             ? last_log_idx - clamped_commit_index : 0,
-             expected_commit_index);
+        uint64_t behind = last_log_idx > clamped_commit_index
+                          ? last_log_idx - clamped_commit_index : 0;
+        if (slowest_is_receiving_snapshot) {
+            // The member reports no log index at all until the install
+            // finishes, so there is nothing to name but where it is held.
+            p_in("slow member backpressure: waiting for peer %d to receive a "
+                 "snapshot, holding the commit index at %" PRIu64 ", "
+                 "%" PRIu64 " entries behind the log tail; without it the "
+                 "quorum would commit up to %" PRIu64,
+                 slowest_member, clamped_commit_index, behind,
+                 expected_commit_index);
+        } else {
+            p_in("slow member backpressure: waiting for peer %d at log index "
+                 "%" PRIu64 ", %" PRIu64 " entries behind the log tail; without it "
+                 "the quorum would commit up to %" PRIu64,
+                 slowest_member, clamped_commit_index, behind,
+                 expected_commit_index);
+        }
     }
 
     // A member can be behind the commit index, and one receiving a snapshot

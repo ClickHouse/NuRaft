@@ -518,6 +518,110 @@ int snapshot_receiver_is_held_test() {
     return 0;
 }
 
+// The same as `snapshot_receiver_is_held_test`, except that the member loses
+// its connection before the transfer begins, which is how a restarted member
+// comes back. Reconnecting resets its matched index to zero, and the index is
+// written again only once the install completes, so for the whole transfer the
+// member reports no position at all.
+//
+// Zero must not be read as "nothing to wait for" here. It means that when the
+// leader has no idea where a member stands, so waiting for it could freeze the
+// commit index for nothing; but a member being sent a snapshot is not unknown,
+// the leader knows precisely that it holds nothing of the log yet. Leaving it
+// out is what lets the leader outrun a snapshot receiver and make it need
+// another snapshot as soon as the first one lands.
+int reconnected_snapshot_receiver_is_held_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    num_snapshot_chunks_saved = 0;
+    CHK_Z( launch_servers(pkgs, nullptr, false, cb_count_snapshot_chunks) );
+    CHK_Z( make_group(pkgs) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.return_method_ = raft_params::async_handler;
+        // One entry per batch, so that a single exchange with S3 cannot catch
+        // it up and the exchange after it has to be a snapshot.
+        params.max_append_size_ = 1;
+        // Off to begin with, so that the commit index can run past S3 before
+        // the transfer starts.
+        params.slow_member_backpressure_enabled_ = false;
+        pkg->raftServer->update_params(params);
+    }
+
+    // Entries commit everywhere first, so that there is a snapshot for S3 to
+    // fall behind.
+    append_and_deliver_to(s1, LAG * 2, {s2_addr, s3_addr}, "base");
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    for (int ii = 0; ii < 200 && s1.getTestSm()->getNumSnapshotCreations() == 0;
+         ++ii) {
+        TestSuite::sleep_ms(10, "wait for a snapshot");
+    }
+    CHK_GT( s1.getTestSm()->getNumSnapshotCreations(), 0 );
+
+    // S3 stops receiving and the leader commits without it.
+    append_and_deliver_to(s1, LAG * 2, {s2_addr}, "ahead");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_GT( matched_idx_of(s1, 3), (uint64_t)0 );
+
+    // S3 goes away and comes back: its requests fail, and the leader loses the
+    // connection. The next request to it is sent over a new one, and that is
+    // what resets the matched index.
+    s1.fNet->makeReqFailAll(s3_addr);
+    s1.dropPeerConnection(3);
+    append_and_deliver_to(s1, 1, {s2_addr}, "reconnect");
+    CHK_EQ( (ulong)0, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+
+    // The leader probes S3 backwards, runs out of log to send it, and starts a
+    // snapshot. Stop as soon as the first chunk is saved: the transfer has to
+    // be still in progress below.
+    for (int ii = 0; ii < 40 && !num_snapshot_chunks_saved; ++ii) {
+        s1.fNet->execReqResp(s3_addr);
+    }
+    CHK_GT( num_snapshot_chunks_saved.load(), (uint64_t)0 );
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+
+    // The whole point of the case: a transfer is in flight and the member
+    // still reports nothing. The other two exclusion reasons must not be
+    // standing in for the one under test, or this would pass without the
+    // member being waited for at all.
+    CHK_EQ( (ulong)0, s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3) );
+    CHK_Z( s1.fNet->getPeerRpcErrs(s1.raftServer.get(), 3) );
+
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.slow_member_backpressure_enabled_ = true;
+        pkg->raftServer->update_params(params);
+    }
+
+    uint64_t frozen_at = s1.raftServer->get_target_committed_log_idx();
+
+    // Keep writing and committing through S2 while the transfer is in
+    // progress. The commit index must stay exactly where it was: not lower,
+    // which would un-commit applied entries, and not higher, which would mean
+    // the leader is outrunning the member it is supposed to be waiting for.
+    for (int ii = 0; ii < 20; ++ii) {
+        append_and_deliver_to(s1, 1, {s2_addr}, "during" + std::to_string(ii));
+        while (s1.fNet->execReqResp(s2_addr)) {}
+        CHK_EQ( frozen_at, s1.raftServer->get_target_committed_log_idx() );
+    }
+    CHK_HELD( s1 );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
 // With more than one member behind, the commit index must follow the one that
 // is furthest behind, not the nearest one and not the quorum.
 int holds_at_the_furthest_lagging_member_test() {
@@ -830,6 +934,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "snapshot receiver is held test",
                snapshot_receiver_is_held_test );
+
+    ts.doTest( "reconnected snapshot receiver is held test",
+               reconnected_snapshot_receiver_is_held_test );
 
     ts.doTest( "holds at the furthest lagging member test",
                holds_at_the_furthest_lagging_member_test );

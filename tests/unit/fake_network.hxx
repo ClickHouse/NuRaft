@@ -176,6 +176,15 @@ public:
         }
     }
 
+    int32 getPeerRpcErrs(raft_server* srv, int32 peer_id) {
+        auto& peers = get_peers(srv);
+        auto it = peers.find(peer_id);
+        if (it != peers.end()) {
+            return it->second->get_rpc_errs();
+        }
+        return 0;
+    }
+
     ulong getPeerMatchedIdx(raft_server* srv, int32 peer_id) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);
