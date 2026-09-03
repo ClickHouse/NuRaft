@@ -679,6 +679,12 @@ public:
      * or it is out of the leader's log range and cannot be recovered by
      * replication at all.
      *
+     * Only regular members are waited for. A learner is not, because the
+     * commit index is decided by the members that vote, and holding it for a
+     * member that does not vote is a different bargain from the one this
+     * setting offers. A learner can therefore still drift until it needs a
+     * snapshot while this is on.
+     *
      * While this is on, writes go at the speed of the slowest member, so it is
      * off by default and meant to be switched on for a while and switched off
      * again, with `request_slow_member_backpressure`. It lasts for one
