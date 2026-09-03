@@ -1179,6 +1179,11 @@ protected:
     void reset_srv_to_join();
     void reset_srv_to_leave();
     ptr<req_msg> create_append_entries_req(ptr<peer>& pp, ulong custom_last_log_idx = 0);
+    ptr<req_msg> create_out_of_log_range_req(peer& p,
+                                             ulong term,
+                                             ulong last_log_idx,
+                                             ulong commit_idx,
+                                             ulong starting_idx);
     ptr<req_msg> create_sync_snapshot_req(ptr<peer>& pp,
                                           ulong last_log_idx,
                                           ulong term,

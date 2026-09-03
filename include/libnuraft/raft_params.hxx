@@ -674,9 +674,10 @@ public:
      * is waited for however far behind it is, including while it receives a
      * snapshot. It is left out only when waiting cannot get it anywhere: the
      * leader cannot reach it, it made no progress within
-     * `slow_member_backpressure_no_progress_timeout_`, or it has not answered
-     * at all yet on a new connection and no snapshot is on its way to it
-     * either, which leaves the leader with no idea where it stands.
+     * `slow_member_backpressure_no_progress_timeout_`, it has not answered at
+     * all yet on a new connection and no snapshot is on its way to it either,
+     * or it is out of the leader's log range and cannot be recovered by
+     * replication at all.
      *
      * While this is on, writes go at the speed of the slowest member, so it is
      * off by default and meant to be switched on for a while and switched off

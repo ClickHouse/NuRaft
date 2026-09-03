@@ -622,6 +622,93 @@ int reconnected_snapshot_receiver_is_held_test() {
     return 0;
 }
 
+// A member that is out of the leader's log range must be left out. The
+// entries it needs are gone and no snapshot covers it, so replication cannot
+// recover it however long the leader waits.
+//
+// Nothing else in the exclusion list catches it. It answers the warning the
+// leader sends, and an accepted answer is what resets the idle time, so it
+// keeps looking like it is making progress; its matched index is whatever it
+// reached before falling out of range, so it looks known; and its requests do
+// not fail, so it looks reachable. Waiting for it would pin the commit index
+// until an operator noticed and switched the backpressure off by hand.
+int out_of_log_range_member_is_not_held_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers(pkgs) );
+    CHK_Z( make_group(pkgs) );
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.return_method_ = raft_params::async_handler;
+        // Off to begin with: the log has to compact past S3 before the
+        // backpressure could hold anything.
+        params.slow_member_backpressure_enabled_ = false;
+        pkg->raftServer->update_params(params);
+    }
+
+    // Commit everywhere first, so that S3 has a position to fall behind from
+    // and the leader takes a snapshot and compacts its log.
+    append_and_deliver_to(s1, LAG * 2, {s2_addr, s3_addr}, "base");
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_GT( matched_idx_of(s1, 3), (uint64_t)0 );
+
+    // S3 stops receiving, and the leader commits and compacts without it.
+    append_and_deliver_to(s1, LAG * 4, {s2_addr}, "ahead");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    for (int ii = 0; ii < 200 && s1.getTestSm()->getNumSnapshotCreations() == 0;
+         ++ii) {
+        // Snapshots are created on the apply thread, so wait for it rather
+        // than assuming it has caught up already.
+        TestSuite::sleep_ms(10, "wait for a snapshot");
+    }
+    CHK_GT( s1.getTestSm()->getNumSnapshotCreations(), 0 );
+
+    // Take the snapshot away, so that the leader has neither the entries S3
+    // needs nor a snapshot to replace them with.
+    s1.fNet->clearLastSnapshot(s1.raftServer.get());
+
+    for (RaftPkg* pkg: pkgs) {
+        raft_params params = pkg->raftServer->get_current_params();
+        params.slow_member_backpressure_enabled_ = true;
+        pkg->raftServer->update_params(params);
+    }
+
+    // The leader finds it can send S3 nothing and warns it instead.
+    for (int ii = 0; ii < 20 &&
+                     !s3.fNet->isServerOutOfLogRange(s3.raftServer.get()); ++ii) {
+        s1.fNet->execReqResp(s3_addr);
+    }
+    CHK_TRUE( s3.fNet->isServerOutOfLogRange(s3.raftServer.get()) );
+
+    // None of the other reasons to leave a member out applies here, so this
+    // test cannot pass on one of them by accident.
+    CHK_GT( s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), 3), (ulong)0 );
+    CHK_Z( s1.fNet->getPeerRpcErrs(s1.raftServer.get(), 3) );
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+
+    // S1 and S2 are a majority, and waiting for S3 cannot get it anywhere:
+    // everything must keep committing.
+    append_and_deliver_to(s1, LAG, {s2_addr}, "after");
+    while (s1.fNet->execReqResp(s2_addr)) {}
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_NOT_HELD( s1 );
+
+    for (RaftPkg* pkg: pkgs) pkg->raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
 // With more than one member behind, the commit index must follow the one that
 // is furthest behind, not the nearest one and not the quorum.
 int holds_at_the_furthest_lagging_member_test() {
@@ -937,6 +1024,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "reconnected snapshot receiver is held test",
                reconnected_snapshot_receiver_is_held_test );
+
+    ts.doTest( "out of log range member is not held test",
+               out_of_log_range_member_is_not_held_test );
 
     ts.doTest( "holds at the furthest lagging member test",
                holds_at_the_furthest_lagging_member_test );

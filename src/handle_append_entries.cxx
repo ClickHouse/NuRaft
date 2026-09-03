@@ -479,9 +479,53 @@ bool raft_server::send_request(ptr<peer>& p,
     return true;
 }
 
+// Warns a peer that the leader can send it neither the log entries it needs
+// nor a snapshot to replace them with.
+//
+// Marking the peer is part of building the warning rather than something the
+// caller has to remember: replication cannot get such a peer anywhere, but it
+// still answers the warning, and an answer is what the idle time measures, so
+// nothing else tells a caller waiting on peers to catch up that this one never
+// will. The mark is cleared in `create_append_entries_req`, so it lasts only
+// until the leader has something to send again.
+ptr<req_msg> raft_server::create_out_of_log_range_req(peer& p,
+                                                      ulong term,
+                                                      ulong last_log_idx,
+                                                      ulong commit_idx,
+                                                      ulong starting_idx) {
+    p.set_out_of_log_range(true);
+
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( term, msg_type::custom_notification_request,
+                         id_, p.get_id(), 0, last_log_idx, commit_idx );
+
+    // Out-of-log message.
+    ptr<out_of_log_msg> ool_msg = cs_new<out_of_log_msg>();
+    ool_msg->start_idx_of_leader_ = starting_idx;
+
+    // Create a notification containing OOL message.
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::out_of_log_range_warning );
+    custom_noti->ctx_ = ool_msg->serialize();
+
+    // Wrap it using log_entry.
+    ptr<log_entry> custom_noti_le =
+        cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+    req->log_entries().push_back(custom_noti_le);
+    return req;
+}
+
 ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
                                                     ulong custom_last_log_idx) {
     peer& p = *pp;
+
+    // Recomputed below: the only branch that cannot serve this peer marks it
+    // again. Clearing here rather than on each way out keeps the mark from
+    // outliving the decision that set it, whatever paths this function grows.
+    p.set_out_of_log_range(false);
+
     ulong cur_nxt_idx(0L);
     ulong commit_idx(0L);
     ulong last_log_idx(0L);
@@ -680,28 +724,9 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              "leader's start log %" PRIu64,
              p.get_id(), last_log_idx, starting_idx);
 
-        // Send out-of-log-range notification to this follower.
-        ptr<req_msg> req = cs_new<req_msg>
-                           ( term, msg_type::custom_notification_request,
-                             id_, p.get_id(), 0, last_log_idx, commit_idx );
-
-        // Out-of-log message.
-        ptr<out_of_log_msg> ool_msg = cs_new<out_of_log_msg>();
-        ool_msg->start_idx_of_leader_ = starting_idx;
-
-        // Create a notification containing OOL message.
-        ptr<custom_notification_msg> custom_noti =
-            cs_new<custom_notification_msg>
-            ( custom_notification_msg::out_of_log_range_warning );
-        custom_noti->ctx_ = ool_msg->serialize();
-
-        // Wrap it using log_entry.
-        ptr<log_entry> custom_noti_le =
-            cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
-
-        req->log_entries().push_back(custom_noti_le);
         p.reset_cnt_backward_log_probe();
-        return req;
+        return create_out_of_log_range_req( p, term, last_log_idx,
+                                            commit_idx, starting_idx );
     }
 
     ulong last_log_term = term_for_log(last_log_idx);
@@ -1958,6 +1983,10 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         //   - the leader does not know where it stands: it has not answered
         //     at all yet on a new connection, and no snapshot is on its way
         //     to it either.
+        //   - it is out of the leader's log range, so the leader has nothing
+        //     left to send it. Such a member answers the warning it is sent,
+        //     which keeps the idle time low, but no amount of waiting
+        //     recovers it.
         //
         // The response timer is reset only by an accepted response, and an
         // accepted response means the member took log entries or saved a
@@ -1971,15 +2000,16 @@ uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_in
         bool making_progress = !no_progress_timeout ||
                                idle_ms <= (uint64_t)no_progress_timeout;
         bool position_is_known = matched_idx || receiving_snapshot;
-        bool can_be_reached =
-            !pp->get_rpc_errs() && making_progress && position_is_known;
+        bool can_be_reached = !pp->get_rpc_errs() && making_progress &&
+                              position_is_known && !pp->is_out_of_log_range();
 
         p_tr("backpressure: peer %d matched %" PRIu64 ", idle %" PRIu64 " ms, "
              "no progress timeout %d ms, rpc errors %d, snapshot %s, "
-             "can be reached %s",
+             "out of log range %s, can be reached %s",
              pp->get_id(), matched_idx, idle_ms, no_progress_timeout,
              pp->get_rpc_errs(),
              receiving_snapshot ? "YES" : "NO",
+             pp->is_out_of_log_range() ? "YES" : "NO",
              can_be_reached ? "YES" : "NO");
 
         if (!can_be_reached) continue;
