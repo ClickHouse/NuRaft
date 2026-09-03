@@ -136,6 +136,33 @@ ptr<buffer> force_vote_msg::serialize() const {
 }
 
 
+// --- slow_member_backpressure_msg ---
+
+ptr<slow_member_backpressure_msg> slow_member_backpressure_msg::deserialize(buffer& buf) {
+    ptr<slow_member_backpressure_msg> ret = cs_new<slow_member_backpressure_msg>();
+    buffer_serializer bs(buf);
+    uint8_t version = bs.get_u8();
+    (void)version;
+    ret->enable_ = bs.get_u8() != 0;
+    return ret;
+}
+
+ptr<buffer> slow_member_backpressure_msg::serialize() const {
+    //   << Format >>
+    // version                      1 byte
+    // enable flag                  1 byte
+
+    size_t len = sizeof(uint8_t) + sizeof(uint8_t);
+    ptr<buffer> ret = buffer::alloc(len);
+
+    const uint8_t CURRENT_VERSION = 0x0;
+    buffer_serializer bs(ret);
+    bs.put_u8(CURRENT_VERSION);
+    bs.put_u8(enable_ ? 1 : 0);
+    return ret;
+}
+
+
 // --- handlers ---
 
 ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
@@ -170,6 +197,9 @@ ptr<resp_msg> raft_server::handle_custom_notification_req(req_msg& req) {
     }
     case custom_notification_msg::request_leadership: {
         return handle_request_leadership_request(req, msg, resp);
+    }
+    case custom_notification_msg::set_slow_member_backpressure: {
+        return handle_slow_member_backpressure_request(req, msg, resp);
     }
     default:
         break;
@@ -261,6 +291,55 @@ ptr<resp_msg> raft_server::handle_request_leadership_request
     return resp;
 }
 
+ptr<resp_msg> raft_server::handle_slow_member_backpressure_request
+                           ( req_msg& req,
+                             ptr<custom_notification_msg> msg,
+                             ptr<resp_msg> resp )
+{
+    if (!msg->ctx_) {
+        p_er("[SLOW MEMBER BACKPRESSURE] got request from peer %d "
+             "without context", req.get_src());
+        return resp;
+    }
+
+    if (req.get_term() < state_->get_term()) {
+        // An old term means the sender is behind, so its view of who leads
+        // is not to be trusted either. Only the leader applies the setting,
+        // and a stale request is no reason to change it.
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d with stale "
+             "term %" PRIu64 ", my term %" PRIu64 ", ignore it",
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
+    // A newer term proves that this server is behind, and that it is not the
+    // leader any more even if it still thinks so. Step down before looking at
+    // the request, so that a deposed leader does not apply a setting only a
+    // leader may hold.
+    update_term(req.get_term());
+
+    ptr<slow_member_backpressure_msg> bp_msg =
+        slow_member_backpressure_msg::deserialize(*msg->ctx_);
+
+    if (is_leader()) {
+        // A follower asks this leader to change the setting. Only the leader
+        // holds it, so applying it here is all there is to do.
+        p_in("[SLOW MEMBER BACKPRESSURE] got request from peer %d to turn it %s",
+             req.get_src(), bp_msg->enable_ ? "ON" : "OFF");
+        switch_slow_member_backpressure(bp_msg->enable_);
+
+    } else {
+        // Only a leader is ever sent this request, so getting one here means
+        // the sender's view of the leader is out of date. Dropping it is
+        // right: this server would not act on the setting anyway, and it must
+        // not start reporting one it cannot apply.
+        p_wn("[SLOW MEMBER BACKPRESSURE] got request from peer %d, but this "
+             "server is not the leader", req.get_src());
+    }
+
+    return resp;
+}
+
 
 void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     if (!resp.get_accepted()) return;
@@ -272,7 +351,18 @@ void raft_server::handle_custom_notification_resp(resp_msg& resp) {
     }
     ptr<peer> p = it->second;
 
-    p->set_next_log_idx(resp.get_next_idx());
+    // NOTE: Only move the next log index forward. A custom notification does
+    //       not replicate log entries, but its response still carries the
+    //       peer's `next_slot`. While the peer is catching up or receiving a
+    //       snapshot, that value is lower than what the leader has already
+    //       sent. Moving the index back would make the leader send the same
+    //       entries again, or decide that the peer needs a snapshot once more
+    //       and start the transfer from the beginning. The probe counter is
+    //       reset in both cases, as it always was: the response proves that
+    //       the peer can be reached.
+    if (resp.get_next_idx() > p->get_next_log_idx()) {
+        p->set_next_log_idx(resp.get_next_idx());
+    }
     p->reset_cnt_backward_log_probe();
 }
 

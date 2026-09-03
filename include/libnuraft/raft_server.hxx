@@ -138,6 +138,8 @@ public:
             leave_limit_ = src.leave_limit_.load();
             vote_limit_ = src.vote_limit_.load();
             busy_connection_limit_ = src.busy_connection_limit_.load();
+            full_consensus_leader_limit_ = src.full_consensus_leader_limit_.load();
+            full_consensus_follower_limit_ = src.full_consensus_follower_limit_.load();
             return *this;
         }
 
@@ -467,6 +469,26 @@ public:
      *         the next leader due to various failures.
      */
     bool request_leadership(int successor_id = -1);
+
+    /**
+     * Ask the current leader to turn the slow member backpressure on or off
+     * while the server is running. It makes the leader hold the commit index
+     * back for a member that has fallen behind. Only the setting on the leader
+     * has an effect.
+     *
+     * If this server is the leader, it applies the setting at once. A follower
+     * sends the request to the leader and does not set it locally, so only the
+     * leader ever holds it: read it with `get_current_params` on the leader.
+     *
+     * The setting lasts for one leadership. It is switched off both when a
+     * server becomes the leader and when it stops being the leader, so it has
+     * to be turned on again after a leader change.
+     *
+     * @param enable If `true`, turn the backpressure on.
+     * @return `true` if the request was applied locally or sent to the leader,
+     *         which does not guarantee that the leader applied it.
+     */
+    bool request_slow_member_backpressure(bool enable);
 
     /**
      * Start the election timer on this server, if this server is a follower.
@@ -1058,6 +1080,23 @@ protected:
     std::list<ptr<peer>> get_not_responding_peers(int expiry = 0);
     size_t get_not_responding_peers_count(int expiry = 0, uint64_t required_log_idx = 0);
     size_t get_num_stale_peers();
+    uint64_t apply_slow_member_backpressure(uint64_t expected_commit_index);
+
+    /**
+     * The limit of uncommitted log entries that is really in use. While
+     * `slow_member_backpressure_enabled_` is on it is the tighter of
+     * `max_uncommitted_log_entries_` and
+     * `slow_member_backpressure_max_uncommitted_`, where `0` means no limit.
+     */
+    uint64_t get_max_uncommitted_log_entries() const;
+
+    /**
+     * Limits how often the slow member backpressure writes a log message, in
+     * microsecond. The first message is always written: it is the one that
+     * tells an operator the leader is throttling.
+     */
+    timer_helper slow_member_backpressure_log_timer_{5 * 1000 * 1000, true};
+
     static bool is_excluded_from_quorum(const peer& pp,
                                         int32_t resp_elapsed_ms,
                                         int32_t expiry,
@@ -1096,7 +1135,14 @@ protected:
     ptr<resp_msg> handle_priority_change_req_v2(req_msg& req);
     ptr<resp_msg> handle_reconnect_req(req_msg& req);
     ptr<resp_msg> handle_custom_notification_req(req_msg& req);
+    ptr<resp_msg> handle_slow_member_backpressure_request
+                  ( req_msg& req,
+                    ptr<custom_notification_msg> msg,
+                    ptr<resp_msg> resp );
     ptr<resp_msg> handle_leader_status_req(req_msg& req);
+
+    ptr<req_msg> create_slow_member_backpressure_req(int dst, bool enable);
+    void switch_slow_member_backpressure(bool enable);
 
     void handle_join_cluster_resp(resp_msg& resp);
     void handle_log_sync_resp(resp_msg& resp);
@@ -1133,6 +1179,11 @@ protected:
     void reset_srv_to_join();
     void reset_srv_to_leave();
     ptr<req_msg> create_append_entries_req(ptr<peer>& pp, ulong custom_last_log_idx = 0);
+    ptr<req_msg> create_out_of_log_range_req(peer& p,
+                                             ulong term,
+                                             ulong last_log_idx,
+                                             ulong commit_idx,
+                                             ulong starting_idx);
     ptr<req_msg> create_sync_snapshot_req(ptr<peer>& pp,
                                           ulong last_log_idx,
                                           ulong term,

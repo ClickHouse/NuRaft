@@ -422,6 +422,7 @@ void raft_server::apply_and_log_current_params() {
           "parallel log appending: %s, "
           "streaming mode max log gap %d, max bytes %" PRIu64 ", "
           "full consensus mode: %s, "
+          "slow member backpressure: %s, "
           "tracking peer sm committed index: %s, "
           "max uncommitted log entries %" PRIu64,
           params->election_timeout_lower_bound_,
@@ -449,6 +450,7 @@ void raft_server::apply_and_log_current_params() {
           params->max_log_gap_in_stream_,
           params->max_bytes_in_flight_in_stream_,
           params->use_full_consensus_among_healthy_members_ ? "ON" : "OFF",
+          params->slow_member_backpressure_enabled_ ? "ON" : "OFF",
           params->track_peers_sm_commit_idx_ ? "ON" : "OFF",
           params->max_uncommitted_log_entries_
         );
@@ -458,6 +460,26 @@ void raft_server::apply_and_log_current_params() {
 
     leadership_transfer_timer_.set_duration_ms
         (params->leadership_transfer_min_wait_time_);
+}
+
+uint64_t raft_server::get_max_uncommitted_log_entries() const {
+    ptr<raft_params> params = ctx_->get_params();
+    uint64_t configured = params->max_uncommitted_log_entries_;
+    if (!params->slow_member_backpressure_enabled_) {
+        return configured;
+    }
+
+    uint64_t while_backpressure_on =
+        params->slow_member_backpressure_max_uncommitted_;
+    if (!while_backpressure_on) {
+        return configured;
+    }
+    if (!configured) {
+        // `0` means no limit at all, so it must not win over the limit that
+        // backpressure asks for.
+        return while_backpressure_on;
+    }
+    return std::min(configured, while_backpressure_on);
 }
 
 raft_params raft_server::get_current_params() const {
@@ -1234,6 +1256,18 @@ void raft_server::become_leader() {
         config_changing_ = true;
     }
 
+    // The slow member backpressure lasts for one leadership, so a server that
+    // has just been elected must not start throttling on the strength of a
+    // setting from an earlier one. `become_follower` clears it as well, so
+    // reaching here with it still on means this server went from leader to
+    // candidate and back without ever stepping down; clearing it again costs
+    // nothing and keeps the rule simple to state.
+    if (ctx_->get_params()->slow_member_backpressure_enabled_) {
+        p_in("slow member backpressure was on: switching it off, as it does "
+             "not carry over to a new leader");
+        switch_slow_member_backpressure(false);
+    }
+
     cb_func::Param param(id_, leader_);
     ulong my_term = state_->get_term();
     param.ctx = &my_term;
@@ -1581,10 +1615,100 @@ bool raft_server::request_leadership(int successor_id) {
     }
 }
 
+void raft_server::switch_slow_member_backpressure(bool enable) {
+    recur_lock(lock_);
+    if (ctx_->get_params()->slow_member_backpressure_enabled_ == enable) {
+        p_in("slow member backpressure is already %s", enable ? "ON" : "OFF");
+        return;
+    }
+    raft_params params = *ctx_->get_params();
+    params.slow_member_backpressure_enabled_ = enable;
+    update_params(params);
+}
+
+ptr<req_msg> raft_server::create_slow_member_backpressure_req(int dst,
+                                                              bool enable) {
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( state_->get_term(),
+                         msg_type::custom_notification_request,
+                         id_, dst,
+                         term_for_log(log_store_->next_slot() - 1),
+                         log_store_->next_slot() - 1,
+                         quick_commit_index_.load() );
+
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::set_slow_member_backpressure );
+    custom_noti->ctx_ =
+        cs_new<slow_member_backpressure_msg>(enable)->serialize();
+
+    req->log_entries().push_back(
+        cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom) );
+
+    return req;
+}
+
+bool raft_server::request_slow_member_backpressure(bool enable) {
+    if (is_leader()) {
+        p_in("turning slow member backpressure %s", enable ? "ON" : "OFF");
+        switch_slow_member_backpressure(enable);
+        return true;
+    }
+
+    if (leader_ == -1) {
+        p_er("cannot request slow member backpressure: cannot find leader");
+        return false;
+    }
+
+    ptr<req_msg> req = create_slow_member_backpressure_req(leader_, enable);
+
+    recur_lock(lock_);
+    auto entry = peers_.find(leader_);
+    if (entry == peers_.end()) {
+        p_er("cannot request slow member backpressure: cannot find peer for "
+             "leader id %d", leader_.load());
+        return false;
+    }
+
+    ptr<peer> pp = entry->second;
+    if (pp->need_to_reconnect()) {
+        p_in("need to reconnect to peer %d", leader_.load());
+        ptr<srv_config> s_conf = get_config()->get_server(leader_);
+        if (!s_conf) {
+            p_wn("can't reconnect to peer %d: config not found", leader_.load());
+            return false;
+        }
+        if (!pp->recreate_rpc(s_conf, *ctx_)) {
+            p_wn("reconnection to peer %d failed", leader_.load());
+            return false;
+        }
+    }
+
+    if (pp->make_busy()) {
+        p_in("requesting slow member backpressure %s from leader %d",
+             enable ? "ON" : "OFF", leader_.load());
+        pp->send_req(pp, req, resp_handler_);
+        return true;
+    }
+    p_in("cannot request slow member backpressure, leader is busy");
+    return false;
+}
+
 void raft_server::become_follower() {
     // stop hb for all peers
     p_in("[BECOME FOLLOWER] term %" PRIu64 "", state_->get_term());
     ptr<raft_params> params = ctx_->get_params();
+
+    // Only a leader acts on the slow member backpressure, so a server that is
+    // no longer the leader must not keep reporting it as on. Together with the
+    // same reset in `become_leader`, this keeps the setting true only on a
+    // leader an operator asked, so every server reports its own copy truthfully.
+    if (params->slow_member_backpressure_enabled_) {
+        p_in("slow member backpressure was on: switching it off, as this "
+             "server is no longer the leader");
+        switch_slow_member_backpressure(false);
+        params = ctx_->get_params();
+    }
     {   std::lock_guard<std::recursive_mutex> ll(cli_lock_);
         if (params->use_bg_thread_for_snapshot_io_) {
             snapshot_io_mgr::instance().drop_reqs(this);

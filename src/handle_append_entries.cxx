@@ -479,9 +479,53 @@ bool raft_server::send_request(ptr<peer>& p,
     return true;
 }
 
+// Warns a peer that the leader can send it neither the log entries it needs
+// nor a snapshot to replace them with.
+//
+// Marking the peer is part of building the warning rather than something the
+// caller has to remember: replication cannot get such a peer anywhere, but it
+// still answers the warning, and an answer is what the idle time measures, so
+// nothing else tells a caller waiting on peers to catch up that this one never
+// will. The mark is cleared in `create_append_entries_req`, so it lasts only
+// until the leader has something to send again.
+ptr<req_msg> raft_server::create_out_of_log_range_req(peer& p,
+                                                      ulong term,
+                                                      ulong last_log_idx,
+                                                      ulong commit_idx,
+                                                      ulong starting_idx) {
+    p.set_out_of_log_range(true);
+
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( term, msg_type::custom_notification_request,
+                         id_, p.get_id(), 0, last_log_idx, commit_idx );
+
+    // Out-of-log message.
+    ptr<out_of_log_msg> ool_msg = cs_new<out_of_log_msg>();
+    ool_msg->start_idx_of_leader_ = starting_idx;
+
+    // Create a notification containing OOL message.
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::out_of_log_range_warning );
+    custom_noti->ctx_ = ool_msg->serialize();
+
+    // Wrap it using log_entry.
+    ptr<log_entry> custom_noti_le =
+        cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
+
+    req->log_entries().push_back(custom_noti_le);
+    return req;
+}
+
 ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
                                                     ulong custom_last_log_idx) {
     peer& p = *pp;
+
+    // Recomputed below: the only branch that cannot serve this peer marks it
+    // again. Clearing here rather than on each way out keeps the mark from
+    // outliving the decision that set it, whatever paths this function grows.
+    p.set_out_of_log_range(false);
+
     ulong cur_nxt_idx(0L);
     ulong commit_idx(0L);
     ulong last_log_idx(0L);
@@ -680,28 +724,9 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
              "leader's start log %" PRIu64,
              p.get_id(), last_log_idx, starting_idx);
 
-        // Send out-of-log-range notification to this follower.
-        ptr<req_msg> req = cs_new<req_msg>
-                           ( term, msg_type::custom_notification_request,
-                             id_, p.get_id(), 0, last_log_idx, commit_idx );
-
-        // Out-of-log message.
-        ptr<out_of_log_msg> ool_msg = cs_new<out_of_log_msg>();
-        ool_msg->start_idx_of_leader_ = starting_idx;
-
-        // Create a notification containing OOL message.
-        ptr<custom_notification_msg> custom_noti =
-            cs_new<custom_notification_msg>
-            ( custom_notification_msg::out_of_log_range_warning );
-        custom_noti->ctx_ = ool_msg->serialize();
-
-        // Wrap it using log_entry.
-        ptr<log_entry> custom_noti_le =
-            cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom);
-
-        req->log_entries().push_back(custom_noti_le);
         p.reset_cnt_backward_log_probe();
-        return req;
+        return create_out_of_log_range_req( p, term, last_log_idx,
+                                            commit_idx, starting_idx );
     }
 
     ulong last_log_term = term_for_log(last_log_idx);
@@ -738,6 +763,13 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
 
     if (params->use_full_consensus_among_healthy_members_) {
         // Full consensus mode: set flag indicating the member is excluded.
+        //
+        // NOTE: Unlike `get_expected_committed_log_idx`, this is not gated on
+        //       `custom_commit_quorum_size_ == 0`. So when a custom quorum
+        //       size is set, the leader commits by that quorum, but it still
+        //       tells a member that full consensus would have left it out.
+        //       This is the safer of the two mistakes: without the flag every
+        //       member would believe that it belongs to the quorum.
         uint64_t last_resp_time_ms = p.get_resp_timer_us() / 1000;
         uint64_t expiry = params->heart_beat_interval_ *
                           raft_server::raft_limits_.full_consensus_leader_limit_;
@@ -1903,13 +1935,132 @@ ulong raft_server::get_expected_committed_log_idx() {
     }
 
     aci_params.current_commit_index_ = quick_commit_index_;
-    aci_params.expected_commit_index_ = matched_indexes[quorum_idx];
+    aci_params.expected_commit_index_ =
+        apply_slow_member_backpressure(matched_indexes[quorum_idx]);
     uint64_t adjusted_commit_index = state_machine_->adjust_commit_index(aci_params);
     if (aci_params.expected_commit_index_ != adjusted_commit_index) {
         p_tr( "commit index adjusted: %" PRIu64 " -> %" PRIu64,
               aci_params.expected_commit_index_, adjusted_commit_index );
     }
     return adjusted_commit_index;
+}
+
+uint64_t raft_server::apply_slow_member_backpressure(uint64_t expected_commit_index) {
+    ptr<raft_params> params = ctx_->get_params();
+    if (!params->slow_member_backpressure_enabled_) {
+        return expected_commit_index;
+    }
+
+    if (params->custom_commit_quorum_size_) {
+        // The quorum size is overridden on purpose, for example in recovery
+        // mode. Waiting for every member would work against that.
+        return expected_commit_index;
+    }
+
+    // How long a member may make no progress at all and still be waited for.
+    // `0` means the leader waits for as long as it can reach the member.
+    int32 no_progress_timeout = params->slow_member_backpressure_no_progress_timeout_;
+    uint64_t clamped_commit_index = expected_commit_index;
+    int32 slowest_member = -1;
+    bool slowest_is_receiving_snapshot = false;
+
+    for (auto& entry: peers_) {
+        ptr<peer>& pp = entry.second;
+        if (!is_regular_member(pp)) continue;
+
+        // Read the snapshot context before `matched_idx`, so that an install
+        // finishing in between is seen as the position it produced rather
+        // than as the reset value it replaced.
+        bool receiving_snapshot = pp->get_snapshot_sync_ctx() != nullptr;
+        uint64_t matched_idx = pp->get_matched_idx();
+
+        // Waiting for a member only helps if waiting can still get it
+        // anywhere. The leader stops waiting for a member when:
+        //   - its last request failed, so it cannot be reached at all. The
+        //     idle time below does not show this on its own: a member that
+        //     has just stopped still looks busy until the timeout passes.
+        //   - it made no progress within the no progress timeout.
+        //   - the leader does not know where it stands: it has not answered
+        //     at all yet on a new connection, and no snapshot is on its way
+        //     to it either.
+        //   - it is out of the leader's log range, so the leader has nothing
+        //     left to send it. Such a member answers the warning it is sent,
+        //     which keeps the idle time low, but no amount of waiting
+        //     recovers it.
+        //
+        // The response timer is reset only by an accepted response, and an
+        // accepted response means the member took log entries or saved a
+        // snapshot object, so the idle time measures progress rather than
+        // reachability. That is why a member receiving a snapshot is waited
+        // for: it keeps making progress, one object at a time. The transfer
+        // is no faster for waiting, but the log stops growing, so the member
+        // does not have to catch up on everything written during it and then
+        // need another snapshot.
+        uint64_t idle_ms = pp->get_resp_timer_us() / 1000;
+        bool making_progress = !no_progress_timeout ||
+                               idle_ms <= (uint64_t)no_progress_timeout;
+        bool position_is_known = matched_idx || receiving_snapshot;
+        bool can_be_reached = !pp->get_rpc_errs() && making_progress &&
+                              position_is_known && !pp->is_out_of_log_range();
+
+        p_tr("backpressure: peer %d matched %" PRIu64 ", idle %" PRIu64 " ms, "
+             "no progress timeout %d ms, rpc errors %d, snapshot %s, "
+             "out of log range %s, can be reached %s",
+             pp->get_id(), matched_idx, idle_ms, no_progress_timeout,
+             pp->get_rpc_errs(),
+             receiving_snapshot ? "YES" : "NO",
+             pp->is_out_of_log_range() ? "YES" : "NO",
+             can_be_reached ? "YES" : "NO");
+
+        if (!can_be_reached) continue;
+
+        // `matched_idx` is reset to zero when the connection to a member is
+        // remade, and written again only once an install completes, so a
+        // member that reconnected and now receives a snapshot reports no
+        // position for the whole transfer. Zero is not a position, it means
+        // the member holds nothing of the log yet, so hold where the leader
+        // already is: that is as far as waiting for it can go.
+        uint64_t member_bound = (receiving_snapshot && !matched_idx)
+                                ? quick_commit_index_.load()
+                                : matched_idx;
+
+        if (member_bound < clamped_commit_index) {
+            clamped_commit_index = member_bound;
+            slowest_member = pp->get_id();
+            slowest_is_receiving_snapshot = receiving_snapshot && !matched_idx;
+        }
+    }
+
+    // The leader waits for as long as an operator leaves the backpressure on,
+    // so writing a message on every batch would flood the log.
+    if (slowest_member >= 0 &&
+        slow_member_backpressure_log_timer_.timeout_and_reset()) {
+        uint64_t last_log_idx = log_store_->next_slot() - 1;
+        uint64_t behind = last_log_idx > clamped_commit_index
+                          ? last_log_idx - clamped_commit_index : 0;
+        if (slowest_is_receiving_snapshot) {
+            // The member reports no log index at all until the install
+            // finishes, so there is nothing to name but where it is held.
+            p_in("slow member backpressure: waiting for peer %d to receive a "
+                 "snapshot, holding the commit index at %" PRIu64 ", "
+                 "%" PRIu64 " entries behind the log tail; without it the "
+                 "quorum would commit up to %" PRIu64,
+                 slowest_member, clamped_commit_index, behind,
+                 expected_commit_index);
+        } else {
+            p_in("slow member backpressure: waiting for peer %d at log index "
+                 "%" PRIu64 ", %" PRIu64 " entries behind the log tail; without it "
+                 "the quorum would commit up to %" PRIu64,
+                 slowest_member, clamped_commit_index, behind,
+                 expected_commit_index);
+        }
+    }
+
+    // A member can be behind the commit index, and one receiving a snapshot
+    // always is, so this can return less than the current commit index.
+    // `commit` ignores anything that does not move it forward, so the most
+    // backpressure can do is freeze the commit index where it is.
+    return clamped_commit_index;
 }
 
 void raft_server::notify_log_append_completion(bool ok) {

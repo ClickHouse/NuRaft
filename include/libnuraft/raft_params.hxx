@@ -100,6 +100,9 @@ struct raft_params {
         , use_new_joiner_type_(false)
         , use_bg_thread_for_snapshot_io_(false)
         , use_full_consensus_among_healthy_members_(false)
+        , slow_member_backpressure_enabled_(false)
+        , slow_member_backpressure_no_progress_timeout_(5 * 60 * 1000)
+        , slow_member_backpressure_max_uncommitted_(0)
         , track_peers_sm_commit_idx_(false)
         , parallel_log_appending_(false)
         , max_log_gap_in_stream_(0)
@@ -662,6 +665,56 @@ public:
      * from the leader for a configured time (`full_consensus_follower_limit_`).
      */
     bool use_full_consensus_among_healthy_members_;
+
+    /**
+     * (Experimental)
+     * If `true`, the leader does not commit an entry before every member it
+     * is still waiting for has it, so that a member which fell behind can
+     * catch up. Unlike `use_full_consensus_among_healthy_members_`, a member
+     * is waited for however far behind it is, including while it receives a
+     * snapshot. It is left out only when waiting cannot get it anywhere: the
+     * leader cannot reach it, it made no progress within
+     * `slow_member_backpressure_no_progress_timeout_`, it has not answered at
+     * all yet on a new connection and no snapshot is on its way to it either,
+     * or it is out of the leader's log range and cannot be recovered by
+     * replication at all.
+     *
+     * While this is on, writes go at the speed of the slowest member, so it is
+     * off by default and meant to be switched on for a while and switched off
+     * again, with `request_slow_member_backpressure`. It lasts for one
+     * leadership: it is switched off both when a server becomes the leader and
+     * when it stops being one.
+     */
+    bool slow_member_backpressure_enabled_;
+
+    /**
+     * (Experimental)
+     * How long, in millisecond, the leader keeps waiting for a member that
+     * makes no progress at all, before leaving it behind. Progress means an
+     * accepted response: log entries taken, or a snapshot object saved. A
+     * member that is merely slow keeps resetting this, so only one that is
+     * stuck stops being waited for.
+     *
+     * The default is five minutes, and it is meant to be that large. A
+     * member applying a large snapshot can be quiet for minutes, and it is
+     * exactly the member the backpressure exists for; a timeout in seconds
+     * would abandon it just as waiting started to pay off. A member the
+     * leader cannot reach at all is dropped straight away, by its failed
+     * requests, without waiting for this.
+     *
+     * `0` means the leader never stops waiting for a member it can reach.
+     */
+    int32 slow_member_backpressure_no_progress_timeout_;
+
+    /**
+     * (Experimental)
+     * The value `max_uncommitted_log_entries_` takes while
+     * `slow_member_backpressure_enabled_` is on. Holding the commit index back
+     * does not by itself stop the leader from taking new writes, so without a
+     * tighter limit the log keeps growing and the member falls even further
+     * behind. `0` leaves the limit unchanged.
+     */
+    uint64_t slow_member_backpressure_max_uncommitted_;
 
     /**
      * (Experimental)
