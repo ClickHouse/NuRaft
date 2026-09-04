@@ -210,7 +210,7 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
         ptr<buffer> buf = entry->get_buf_ptr();
         buf->pos(0);
         ret_value = state_machine_->pre_commit_ext
-                    ( state_machine::ext_op_params( last_idx, buf ) );
+                    ( state_machine::ext_op_params( last_idx, buf, entry ) );
 
         if (ext_params.after_precommit_) {
             req_ext_cb_params cb_params;

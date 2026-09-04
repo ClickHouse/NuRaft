@@ -395,7 +395,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
         _sys_exit(-1);
     }
     ret_value = state_machine_->commit_ext
-                ( state_machine::ext_op_params( sm_idx, buf, le->get_term() ) );
+                ( state_machine::ext_op_params( sm_idx, buf, le, le->get_term() ) );
     if (ret_value) ret_value->pos(0);
 
     auto params = ctx_->get_params();
