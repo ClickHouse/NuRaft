@@ -33,6 +33,8 @@ namespace nuraft {
 
 class cluster_config;
 class snapshot;
+class log_entry;
+
 class state_machine {
     __interface_body__(state_machine);
 
@@ -40,14 +42,17 @@ public:
     struct ext_op_params {
         ext_op_params(ulong _log_idx,
                       ptr<buffer>& _data,
+                      const ptr<log_entry>& _log_entry,
                       ulong _log_term = 0)
             : log_idx(_log_idx)
             , log_term(_log_term)
             , data(_data)
+            , log_entry(_log_entry)
             {}
         ulong log_idx;
         ulong log_term;
         ptr<buffer>& data;
+        const ptr<log_entry>& log_entry;
         // May add more parameters in the future.
     };
 
