@@ -1443,8 +1443,9 @@ public:
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
+        , streaming_mode_(_impl->get_options().streaming_mode_)
         , ssl_strand_(io_svc.get_executor())
-        , use_strand_(ssl_enabled_ && impl_->get_options().streaming_mode_)
+        , use_strand_(ssl_enabled_ && streaming_mode_)
         , l_(l)
         , send_timer_(io_svc)
         , receive_timer_(io_svc)
@@ -1486,7 +1487,7 @@ public:
     }
 
     bool supports_pipelining() const override {
-        return impl_->get_options().streaming_mode_;
+        return streaming_mode_;
     }
 
 #ifndef SSL_LIBRARY_NOT_FOUND
@@ -1514,7 +1515,7 @@ public:
                       rpc_handler& when_done,
                       uint64_t send_timeout_ms = 0) __override__
     {
-        if (impl_->get_options().streaming_mode_) {
+        if (streaming_mode_) {
             pre_send(req, when_done, send_timeout_ms);
         } else {
             register_req_send(req, when_done, send_timeout_ms);
@@ -1852,7 +1853,7 @@ private:
         // In streaming mode, all `when_done` will be invoked in `close_socket()`.
         // Otherwise, `close_socket()` will do nothing, hence `when_done`
         // should directly be invoked here.
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             ptr<resp_msg> resp;
             ptr<rpc_exception> except(cs_new<rpc_exception>(err_msg, req));
             when_done(resp, except);
@@ -1876,7 +1877,7 @@ private:
             }
         }
 #endif
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             return;
         }
 
@@ -2022,7 +2023,7 @@ private:
         if (!err) {
             set_busy_flag(/*receive=*/ false, /*busy=*/ false);
             uint64_t receive_timeout_ms = send_timeout_ms;
-            if (impl_->get_options().streaming_mode_) {
+            if (streaming_mode_) {
                 post_send(req, when_done, receive_timeout_ms);
             } else {
                 register_response_read(req, when_done, receive_timeout_ms);
@@ -2314,7 +2315,7 @@ private:
         receive_timer_.cancel();
         set_busy_flag(/*receive=*/ true, /*busy=*/ false);
 
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             ptr<rpc_exception> except;
             when_done(rsp, except);
             return;
@@ -2370,6 +2371,14 @@ private:
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
+
+    // A copy of the `streaming_mode_` option, because `close_socket`
+    // reads it while this object is being destroyed, and by then `impl_` may
+    // have outlived its own members: the `io_context` is destroyed after them,
+    // and destroying it abandons the operations that own the last reference to
+    // this client.
+    bool streaming_mode_;
+
     asio::strand<asio::io_context::executor_type> ssl_strand_;
     bool use_strand_;
     uint64_t client_id_;
