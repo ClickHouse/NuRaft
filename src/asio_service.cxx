@@ -341,8 +341,23 @@ public:
         // this is safe since we only expose ctor to cs_new
         ptr<rpc_session> self = this->shared_from_this();
 
-        cached_address_ = socket_.remote_endpoint().address().to_string();
-        cached_port_ = socket_.remote_endpoint().port();
+        // NOTE: the peer may have reset the connection between `accept` and here,
+        //       in which case there is no remote endpoint to ask for anymore.
+        //       Use the non-throwing overload: the throwing one would propagate
+        //       the error out of the accept handler.
+        ERROR_CODE ec;
+        asio::ip::tcp::endpoint remote = socket_.remote_endpoint(ec);
+        if (ec) {
+            p_er( "session %" PRIu64 " cannot get the remote endpoint: "
+                  "error %d, %s",
+                  session_id_,
+                  ec.value(),
+                  ec.message().c_str() );
+            return;
+        }
+
+        cached_address_ = remote.address().to_string();
+        cached_port_ = remote.port();
         p_in( "session %" PRIu64 " got connection from %s:%u (as a server)",
               session_id_,
               cached_address_.c_str(),
@@ -1346,24 +1361,38 @@ private:
                        ptr<rpc_session> session,
                        const ERROR_CODE& err)
     {
-        if (!err) {
-            asio::ip::tcp::no_delay option(true);
-            session->socket().set_option(option);
-            p_in("receive a incoming rpc connection");
-            session->prepare_handshake();
+        // Re-listen before touching the accepted connection: whatever happens to
+        // this one connection, the listener has to keep accepting the next ones.
+        // Anything thrown below escapes into the worker thread, and if it skipped
+        // the re-listen, this server would never accept a Raft connection again.
+        {
+            std::lock_guard<std::mutex> guard(listener_lock_);
+            if (!stopped_) {
+                // Re-listen only when not stopped,
+                // otherwise crash happens as this class or `acceptor_`
+                // may be destroyed in the meantime.
+                this->start(guard);
+            }
+        }
 
-        } else {
+        if (err) {
             p_er( "failed to accept a rpc connection due to error %d, %s",
                   err.value(), err.message().c_str() );
+            return;
         }
 
-        std::lock_guard<std::mutex> guard(listener_lock_);
-        if (!stopped_) {
-            // Re-listen only when not stopped,
-            // otherwise crash happens as this class or `acceptor_`
-            // may be destroyed in the meantime.
-            this->start(guard);
+        ERROR_CODE ec;
+        asio::ip::tcp::no_delay option(true);
+        session->socket().set_option(option, ec);
+        if (ec) {
+            p_er( "cannot set TCP_NODELAY on an accepted connection: "
+                  "error %d, %s",
+                  ec.value(), ec.message().c_str() );
+            return;
         }
+
+        p_in("receive a incoming rpc connection");
+        session->prepare_handshake();
     }
 
     void remove_session(const ptr<rpc_session>& session) {
