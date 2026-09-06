@@ -137,6 +137,7 @@ struct asio_service_options {
         , corrupted_msg_handler_(nullptr)
         , streaming_mode_(false)
         , custom_io_context_(nullptr)
+        , connection_timeout_ms_(10 * 1000)
         {}
 
     /**
@@ -310,6 +311,18 @@ struct asio_service_options {
 #else
     asio::io_context* custom_io_context_;
 #endif
+
+    /**
+     * Timeout of establishing a connection, covering the TCP connection and
+     * the SSL handshake. If the peer accepts the connection but never
+     * finishes the handshake, nothing else bounds the wait, and the request
+     * that triggered the connection is never completed: its callback is not
+     * invoked, so the caller cannot learn about it and cannot retry.
+     *
+     * It does not apply to a request that carries its own timeout in
+     * `rpc_client::send`, and it is disabled if set to zero.
+     */
+    uint64_t connection_timeout_ms_;
 };
 
 }

@@ -1784,10 +1784,19 @@ private:
                 asio::ip::tcp::resolver::results_type endpoints ) -> void
         {
             if (!err) {
-                if (send_timeout_ms != 0) {
+                // This timer covers the connection and the SSL handshake, and
+                // `handle_handshake` cancels it. Without it, a peer that accepts
+                // the connection but never finishes the handshake makes this
+                // request wait forever: `when_done` is never invoked, so the
+                // caller keeps the request in flight and never retries.
+                uint64_t connection_timeout_ms =
+                    send_timeout_ms
+                    ? send_timeout_ms
+                    : impl_->get_options().connection_timeout_ms_;
+                if (connection_timeout_ms != 0) {
                     send_timer_.expires_after
                     ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
+                      ( std::chrono::milliseconds( connection_timeout_ms ) ) );
                     send_timer_.async_wait(
                         std::bind( &asio_rpc_client::cancel_socket,
                                    this,
