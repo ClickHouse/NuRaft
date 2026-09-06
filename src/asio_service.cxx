@@ -1747,9 +1747,9 @@ public:
             send_timer_.expires_after
                    ( std::chrono::duration_cast<std::chrono::nanoseconds>
                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
-            send_timer_.async_wait( std::bind( &asio_rpc_client::cancel_socket,
-                                               this,
-                                               std::placeholders::_1 ) );
+            send_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                        self->cancel_socket(err);
+                                    } );
         }
 
         // Note: without passing `req_buf` to callback function, it will be
@@ -1798,10 +1798,9 @@ private:
                     send_timer_.expires_after
                     ( std::chrono::duration_cast<std::chrono::nanoseconds>
                       ( std::chrono::milliseconds( connection_timeout_ms ) ) );
-                    send_timer_.async_wait(
-                        std::bind( &asio_rpc_client::cancel_socket,
-                                   this,
-                                   std::placeholders::_1 ) );
+                    send_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                                self->cancel_socket(err);
+                                            } );
                 }
                 asio::async_connect
                     ( socket(),
@@ -2093,10 +2092,9 @@ private:
             receive_timer_.expires_after
             ( std::chrono::duration_cast<std::chrono::nanoseconds>
                 ( std::chrono::milliseconds( receive_timeout_ms ) ) );
-            receive_timer_.async_wait(
-                std::bind( &asio_rpc_client::cancel_socket,
-                            this,
-                            std::placeholders::_1 ) );
+            receive_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                           self->cancel_socket(err);
+                                       } );
         }
         ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
         aa::read( ssl_enabled_, ssl_socket_, socket_,
