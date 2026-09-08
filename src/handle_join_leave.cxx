@@ -165,14 +165,6 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    // Keeper will always start with a configuration defined in configuration files
-    // Until that is changed, this check would just not allow new server to join the cluster
-    //ptr<cluster_config> cur_config = get_config();
-    //if (cur_config->get_servers().size() > 1) {
-    //    p_in("this server is already in a cluster, ignore the request");
-    //    return resp;
-    //}
-
     // Handle Race Condition: Simultaneous Add Server
     // Problem: Two single-node clusters try to add each other at the same time.
     // Both set srv_to_join_ (busy state) and send JoinRequests.
@@ -205,14 +197,11 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     //   Adding server may be called multiple times while previous process is
     //   in progress. It should gracefully handle the new request and should
     //   not ruin the current request.
-    bool reset_commit_idx = true;
     if (state_->is_catching_up()) {
-        p_wn("this server is already in log syncing mode, "
-             "but let's do it again: sm idx %" PRIu64 ", quick commit idx %" PRIu64 ", "
-             "will not reset commit index",
+        p_wn("this server is already in log syncing mode, but let's do it again: "
+             "sm idx %" PRIu64 ", quick commit idx %" PRIu64,
              sm_commit_index_.load(),
              quick_commit_index_.load());
-        reset_commit_idx = false;
     }
 
     p_in("got join cluster req from leader %d", req.get_src());
@@ -220,12 +209,6 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     role_ = srv_role::follower;
     index_at_becoming_leader_ = 0;
     leader_ = req.get_src();
-
-    if (reset_commit_idx) {
-        // MONSTOR-7503: We should not reset it to 0.
-        sm_commit_index_.store( initial_commit_index_ );
-        quick_commit_index_.store( initial_commit_index_ );
-    }
 
     state_->set_voted_for(-1);
     state_->set_term(req.get_term());

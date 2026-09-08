@@ -421,6 +421,99 @@ int learner_to_normal_test() {
     return 0;
 }
 
+
+int rejoin_with_committed_state_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+    std::vector<RaftPkg*> remaining = {&s1, &s2};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ExecArgs exec_args(&s1);
+    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
+
+    // Keep every entry, so the re-invitation is served from the log: the snapshot path
+    // resets the state machine and would hide what this checks.
+    for (auto& entry: pkgs) {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.reserved_log_items_ = 1000000;
+        param.snapshot_distance_ = 1000000;
+        entry->raftServer->update_params(param);
+    }
+
+    auto commit_some = [&](size_t count) -> int {
+        for (size_t ii = 0; ii < count; ++ii) {
+            std::string test_msg = "test" + std::to_string(ii);
+            ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+            msg->put(test_msg);
+            ptr< cmd_result< ptr<buffer> > > ret = s1.raftServer->append_entries( {msg} );
+            CHK_TRUE( ret->get_accepted() );
+            s1.fNet->execReqResp();
+            s1.fNet->execReqResp();
+        }
+        return 0;
+    };
+
+    CHK_Z( commit_some(10) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    const uint64_t s3_committed_before = s3.raftServer->get_committed_log_idx();
+    CHK_GT( s3_committed_before, (uint64_t)0 );
+
+    // S3 is not restarted: it keeps its state machine, which is what the re-invitation
+    // below has to land on.
+    s1.raftServer->remove_srv( s3.getTestMgr()->get_srv_config()->get_id() );
+    for (int ii = 0; ii < 20; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(remaining, COMMIT_TIMEOUT_SEC) );
+    CHK_NULL( s1.raftServer->get_srv_config(3).get() );
+
+    CHK_Z( commit_some(10) );
+    CHK_Z( wait_for_sm_exec(remaining, COMMIT_TIMEOUT_SEC) );
+    const uint64_t leader_committed = s1.raftServer->get_committed_log_idx();
+    CHK_GT( leader_committed, s3_committed_before );
+
+    // Checked every round, not once at the end: the rewind is transient here, so a check
+    // that runs after the join settles passes against the unfixed code.
+    s1.raftServer->add_srv( *(s3.getTestMgr()->get_srv_config()) );
+    for (int ii = 0; ii < 20; ++ii) {
+        s1.fNet->execReqResp();
+        CHK_GTEQ( s3.raftServer->get_committed_log_idx(), s3_committed_before );
+    }
+
+    for (int round = 0; round < 5; ++round) {
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        for (int ii = 0; ii < 20; ++ii) {
+            s1.fNet->execReqResp();
+        }
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Compared against the leader as it stands now: the re-invitation commits a
+    // configuration entry of its own.
+    CHK_NONNULL( s1.raftServer->get_srv_config(3).get() );
+    CHK_EQ( s1.raftServer->get_committed_log_idx(),
+            s3.raftServer->get_committed_log_idx() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    fake_executer_killer(&exec_args);
+    hh.join();
+    CHK_Z( hh.getResult() );
+    f_base->destroy();
+    return 0;
+}
+
 }  // namespace learner_new_joiner_test;
 using namespace learner_new_joiner_test;
 
@@ -518,6 +611,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "log sync with async snapshot io test",
                log_sync_with_async_snapshot_io_test );
+
+    ts.doTest( "rejoin with committed state test",
+               rejoin_with_committed_state_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
