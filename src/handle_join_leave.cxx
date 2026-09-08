@@ -165,9 +165,6 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    // No membership guard here: Keeper's initial configuration lists every server, so
-    // upstream's set comparison (#504, #634, #640) rejects legitimate joins.
-
     // Handle Race Condition: Simultaneous Add Server
     // Problem: Two single-node clusters try to add each other at the same time.
     // Both set srv_to_join_ (busy state) and send JoinRequests.
@@ -212,9 +209,6 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     role_ = srv_role::follower;
     index_at_becoming_leader_ = 0;
     leader_ = req.get_src();
-
-    // The commit indices are deliberately not reset here: rewinding them below the state
-    // machine made the commit thread replay entries it had already applied.
 
     state_->set_voted_for(-1);
     state_->set_term(req.get_term());
