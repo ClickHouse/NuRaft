@@ -165,10 +165,8 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    // Deliberately no "am I already in a cluster" guard here. Keeper builds its initial
-    // configuration from a config file with every server already in it, so a new joiner's
-    // config lists all N members while the leader sends only the M already admitted, and
-    // comparing the two rejects legitimate joins.
+    // No membership guard here: Keeper's initial configuration lists every server, so
+    // upstream's set comparison (#504, #634, #640) rejects legitimate joins.
 
     // Handle Race Condition: Simultaneous Add Server
     // Problem: Two single-node clusters try to add each other at the same time.
@@ -215,12 +213,8 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     index_at_becoming_leader_ = 0;
     leader_ = req.get_src();
 
-    // Deliberately do not reset the commit indices here. The constructor already sets both
-    // from the state machine, so for a genuine new joiner this was a no-op; for a node that
-    // has committed since startup it rewound them below the state machine, which cannot
-    // rewind, so the commit thread replayed applied entries. Writing them here would also
-    // race the commit thread, whose compare-exchange then fails and silently skips both
-    // compaction and the state-machine-execution callback.
+    // The commit indices are deliberately not reset here: rewinding them below the state
+    // machine made the commit thread replay entries it had already applied.
 
     state_->set_voted_for(-1);
     state_->set_term(req.get_term());
