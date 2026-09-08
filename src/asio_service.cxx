@@ -341,8 +341,23 @@ public:
         // this is safe since we only expose ctor to cs_new
         ptr<rpc_session> self = this->shared_from_this();
 
-        cached_address_ = socket_.remote_endpoint().address().to_string();
-        cached_port_ = socket_.remote_endpoint().port();
+        // NOTE: the peer may have reset the connection between `accept` and here,
+        //       in which case there is no remote endpoint to ask for anymore.
+        //       Use the non-throwing overload: the throwing one would propagate
+        //       the error out of the accept handler.
+        ERROR_CODE ec;
+        asio::ip::tcp::endpoint remote = socket_.remote_endpoint(ec);
+        if (ec) {
+            p_er( "session %" PRIu64 " cannot get the remote endpoint: "
+                  "error %d, %s",
+                  session_id_,
+                  ec.value(),
+                  ec.message().c_str() );
+            return;
+        }
+
+        cached_address_ = remote.address().to_string();
+        cached_port_ = remote.port();
         p_in( "session %" PRIu64 " got connection from %s:%u (as a server)",
               session_id_,
               cached_address_.c_str(),
@@ -1346,24 +1361,38 @@ private:
                        ptr<rpc_session> session,
                        const ERROR_CODE& err)
     {
-        if (!err) {
-            asio::ip::tcp::no_delay option(true);
-            session->socket().set_option(option);
-            p_in("receive a incoming rpc connection");
-            session->prepare_handshake();
+        // Re-listen before touching the accepted connection: whatever happens to
+        // this one connection, the listener has to keep accepting the next ones.
+        // Anything thrown below escapes into the worker thread, and if it skipped
+        // the re-listen, this server would never accept a Raft connection again.
+        {
+            std::lock_guard<std::mutex> guard(listener_lock_);
+            if (!stopped_) {
+                // Re-listen only when not stopped,
+                // otherwise crash happens as this class or `acceptor_`
+                // may be destroyed in the meantime.
+                this->start(guard);
+            }
+        }
 
-        } else {
+        if (err) {
             p_er( "failed to accept a rpc connection due to error %d, %s",
                   err.value(), err.message().c_str() );
+            return;
         }
 
-        std::lock_guard<std::mutex> guard(listener_lock_);
-        if (!stopped_) {
-            // Re-listen only when not stopped,
-            // otherwise crash happens as this class or `acceptor_`
-            // may be destroyed in the meantime.
-            this->start(guard);
+        ERROR_CODE ec;
+        asio::ip::tcp::no_delay option(true);
+        session->socket().set_option(option, ec);
+        if (ec) {
+            p_er( "cannot set TCP_NODELAY on an accepted connection: "
+                  "error %d, %s",
+                  ec.value(), ec.message().c_str() );
+            return;
         }
+
+        p_in("receive a incoming rpc connection");
+        session->prepare_handshake();
     }
 
     void remove_session(const ptr<rpc_session>& session) {
@@ -1414,8 +1443,9 @@ public:
         , host_(host)
         , port_(port)
         , ssl_enabled_(ssl_enabled)
+        , streaming_mode_(_impl->get_options().streaming_mode_)
         , ssl_strand_(io_svc.get_executor())
-        , use_strand_(ssl_enabled_ && impl_->get_options().streaming_mode_)
+        , use_strand_(ssl_enabled_ && streaming_mode_)
         , l_(l)
         , send_timer_(io_svc)
         , receive_timer_(io_svc)
@@ -1457,7 +1487,7 @@ public:
     }
 
     bool supports_pipelining() const override {
-        return impl_->get_options().streaming_mode_;
+        return streaming_mode_;
     }
 
 #ifndef SSL_LIBRARY_NOT_FOUND
@@ -1485,7 +1515,7 @@ public:
                       rpc_handler& when_done,
                       uint64_t send_timeout_ms = 0) __override__
     {
-        if (impl_->get_options().streaming_mode_) {
+        if (streaming_mode_) {
             pre_send(req, when_done, send_timeout_ms);
         } else {
             register_req_send(req, when_done, send_timeout_ms);
@@ -1717,9 +1747,9 @@ public:
             send_timer_.expires_after
                    ( std::chrono::duration_cast<std::chrono::nanoseconds>
                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
-            send_timer_.async_wait( std::bind( &asio_rpc_client::cancel_socket,
-                                               this,
-                                               std::placeholders::_1 ) );
+            send_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                        self->cancel_socket(err);
+                                    } );
         }
 
         // Note: without passing `req_buf` to callback function, it will be
@@ -1755,14 +1785,22 @@ private:
                 asio::ip::tcp::resolver::results_type endpoints ) -> void
         {
             if (!err) {
-                if (send_timeout_ms != 0) {
+                // This timer covers the connection and the SSL handshake, and
+                // `handle_handshake` cancels it. Without it, a peer that accepts
+                // the connection but never finishes the handshake makes this
+                // request wait forever: `when_done` is never invoked, so the
+                // caller keeps the request in flight and never retries.
+                uint64_t connection_timeout_ms =
+                    send_timeout_ms
+                    ? send_timeout_ms
+                    : impl_->get_options().connection_timeout_ms_;
+                if (connection_timeout_ms != 0) {
                     send_timer_.expires_after
                     ( std::chrono::duration_cast<std::chrono::nanoseconds>
-                      ( std::chrono::milliseconds( send_timeout_ms ) ) );
-                    send_timer_.async_wait(
-                        std::bind( &asio_rpc_client::cancel_socket,
-                                   this,
-                                   std::placeholders::_1 ) );
+                      ( std::chrono::milliseconds( connection_timeout_ms ) ) );
+                    send_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                                self->cancel_socket(err);
+                                            } );
                 }
                 asio::async_connect
                     ( socket(),
@@ -1814,7 +1852,7 @@ private:
         // In streaming mode, all `when_done` will be invoked in `close_socket()`.
         // Otherwise, `close_socket()` will do nothing, hence `when_done`
         // should directly be invoked here.
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             ptr<resp_msg> resp;
             ptr<rpc_exception> except(cs_new<rpc_exception>(err_msg, req));
             when_done(resp, except);
@@ -1838,7 +1876,7 @@ private:
             }
         }
 #endif
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             return;
         }
 
@@ -1984,7 +2022,7 @@ private:
         if (!err) {
             set_busy_flag(/*receive=*/ false, /*busy=*/ false);
             uint64_t receive_timeout_ms = send_timeout_ms;
-            if (impl_->get_options().streaming_mode_) {
+            if (streaming_mode_) {
                 post_send(req, when_done, receive_timeout_ms);
             } else {
                 register_response_read(req, when_done, receive_timeout_ms);
@@ -2054,10 +2092,9 @@ private:
             receive_timer_.expires_after
             ( std::chrono::duration_cast<std::chrono::nanoseconds>
                 ( std::chrono::milliseconds( receive_timeout_ms ) ) );
-            receive_timer_.async_wait(
-                std::bind( &asio_rpc_client::cancel_socket,
-                            this,
-                            std::placeholders::_1 ) );
+            receive_timer_.async_wait( [self](const ERROR_CODE& err) {
+                                           self->cancel_socket(err);
+                                       } );
         }
         ptr<buffer> resp_buf(buffer::alloc(RPC_RESP_HEADER_SIZE));
         aa::read( ssl_enabled_, ssl_socket_, socket_,
@@ -2276,7 +2313,7 @@ private:
         receive_timer_.cancel();
         set_busy_flag(/*receive=*/ true, /*busy=*/ false);
 
-        if (!impl_->get_options().streaming_mode_) {
+        if (!streaming_mode_) {
             ptr<rpc_exception> except;
             when_done(rsp, except);
             return;
@@ -2332,6 +2369,14 @@ private:
     std::string host_;
     std::string port_;
     bool ssl_enabled_;
+
+    // A copy of the `streaming_mode_` option, because `close_socket`
+    // reads it while this object is being destroyed, and by then `impl_` may
+    // have outlived its own members: the `io_context` is destroyed after them,
+    // and destroying it abandons the operations that own the last reference to
+    // this client.
+    bool streaming_mode_;
+
     asio::strand<asio::io_context::executor_type> ssl_strand_;
     bool use_strand_;
     uint64_t client_id_;

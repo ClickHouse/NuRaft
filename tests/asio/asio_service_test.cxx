@@ -36,6 +36,7 @@ limitations under the License.
     using asio_error_code = asio::error_code;
 #endif
 
+#include <future>
 #include <unordered_map>
 
 #include <stdio.h>
@@ -2078,6 +2079,94 @@ int custom_io_context_test() {
 }
 
 
+#if !SSL_LIBRARY_NOT_FOUND
+int connection_timeout_test() {
+    reset_log_files();
+
+    const uint16_t MUTE_PORT = 20090;
+
+    // A listener that accepts connections and then says nothing, so that the
+    // SSL handshake of whoever connects to it never finishes.
+    asio::io_context mute_io_context;
+    asio::ip::tcp::acceptor mute_acceptor
+        ( mute_io_context,
+          asio::ip::tcp::endpoint( asio::ip::make_address("127.0.0.1"),
+                                   MUTE_PORT ) );
+    std::list<asio::ip::tcp::socket> mute_sockets;
+    std::function<void()> accept_next = [&]() {
+        mute_sockets.emplace_back(mute_io_context);
+        mute_acceptor.async_accept
+            ( mute_sockets.back(),
+              [&](const asio_error_code& err) {
+                  if (err) return;
+                  accept_next();
+              } );
+    };
+    accept_next();
+    std::thread mute_worker([&]() { mute_io_context.run(); });
+
+    // Stop the listener on every exit path, including a failed check.
+    struct mute_listener_guard {
+        asio::ip::tcp::acceptor& acceptor_;
+        asio::io_context& io_context_;
+        std::thread& worker_;
+        ~mute_listener_guard() {
+            acceptor_.close();
+            io_context_.stop();
+            if (worker_.joinable()) worker_.join();
+        }
+    } guard{mute_acceptor, mute_io_context, mute_worker};
+
+    ptr<logger_wrapper> log_wrap = cs_new<logger_wrapper>("./client.log");
+    ptr<logger> log_inst = log_wrap;
+
+    asio_service::options asio_opt;
+    asio_opt.thread_pool_size_ = 2;
+    asio_opt.enable_ssl_ = true;
+    asio_opt.skip_verification_ = true;
+    asio_opt.server_cert_file_ = "./cert.pem";
+    asio_opt.root_cert_file_ = "./cert.pem"; // self-signed.
+    asio_opt.server_key_file_ = "./key.pem";
+    asio_opt.connection_timeout_ms_ = 1000;
+
+    ptr<asio_service> svc = cs_new<asio_service>(asio_opt, log_inst);
+    ptr<rpc_client> client =
+        svc->create_client( "tcp://127.0.0.1:" + std::to_string(MUTE_PORT) );
+
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( (ulong)0, msg_type::ping_request, 1, 2,
+                         (ulong)0, (ulong)0, (ulong)0 );
+
+    std::promise<ptr<rpc_exception>> promise;
+    std::future<ptr<rpc_exception>> future = promise.get_future();
+    rpc_handler handler = [&promise]( ptr<resp_msg>& resp,
+                                      ptr<rpc_exception>& err ) {
+        (void)resp;
+        promise.set_value(err);
+    };
+
+    timer_helper tt;
+    client->send(req, handler);
+
+    // Without the connection timeout, the handler is never invoked.
+    CHK_TRUE( future.wait_for(std::chrono::seconds(10)) ==
+              std::future_status::ready );
+    uint64_t elapsed_ms = tt.get_us() / 1000;
+    ptr<rpc_exception> result_err = future.get();
+    CHK_NONNULL( result_err.get() );
+    _msg( "the request failed after %zu ms: %s\n",
+          (size_t)elapsed_ms, result_err->what() );
+    CHK_SM( elapsed_ms, (uint64_t)10000 );
+
+    client.reset();
+    svc->stop();
+    svc.reset();
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+#endif
+
 }  // namespace asio_service_test;
 using namespace asio_service_test;
 
@@ -2169,6 +2258,11 @@ int main(int argc, char** argv) {
 
     ts.doTest( "custom io_context test",
                custom_io_context_test );
+
+#if !SSL_LIBRARY_NOT_FOUND
+    ts.doTest( "connection timeout test",
+               connection_timeout_test );
+#endif
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
