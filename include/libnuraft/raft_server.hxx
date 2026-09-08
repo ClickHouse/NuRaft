@@ -1358,12 +1358,6 @@ protected:
     std::atomic<uint64_t> index_at_becoming_leader_;
 
     /**
-     * (Read-only)
-     * Initial commit index when this server started.
-     */
-    ulong initial_commit_index_;
-
-    /**
      * `true` if this server is seeing alive leader.
      */
     std::atomic<bool> hb_alive_;
