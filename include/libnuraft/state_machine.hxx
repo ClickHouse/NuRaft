@@ -47,12 +47,12 @@ public:
             : log_idx(_log_idx)
             , log_term(_log_term)
             , data(_data)
-            , log_entry(_log_entry)
+            , entry(_log_entry)
             {}
         ulong log_idx;
         ulong log_term;
         ptr<buffer>& data;
-        const ptr<log_entry>& log_entry;
+        const ptr<log_entry>& entry;
         // May add more parameters in the future.
     };
 
