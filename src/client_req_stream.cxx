@@ -45,7 +45,8 @@ void client_req_stream::append(std::vector< ptr<buffer> > logs)
 
     state_->in_flight_.fetch_add(1);
 
-    auto handle_result = [state = state_](bool success)
+    ptr<State> state = state_;
+    auto handle_result = [state](bool success)
     {
         if (!success) state->abandoned_.store(true);
         size_t prev_in_flight = state->in_flight_.fetch_sub(1);
@@ -67,7 +68,7 @@ void client_req_stream::append(std::vector< ptr<buffer> > logs)
         if (resp && resp->has_async_cb()) {
             ptr< cmd_result< ptr<buffer> > > ret = resp->call_async_cb();
             ret->when_ready(
-                [handle_result = std::move(handle_result)]
+                [handle_result]
                 ( cmd_result<ptr<buffer>, ptr<std::exception>>& res,
                     ptr<std::exception>& exp ) {
                     bool success = !exp && res.get_accepted() &&
@@ -89,7 +90,7 @@ void client_req_stream::append(std::vector< ptr<buffer> > logs)
     }
 
     rpc_handler handler =
-        [handle_result = std::move(handle_result)]
+        [handle_result]
         (ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
             bool success = !err && resp && resp->get_accepted() &&
                 resp->get_result_code() == cmd_result_code::OK;

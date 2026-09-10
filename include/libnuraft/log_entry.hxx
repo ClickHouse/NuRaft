@@ -130,6 +130,13 @@ public:
         return term;
     }
 
+    /**
+     * Arbitrary user data that the application can attach to the in-memory log entry,
+     * e.g. a cached deserialization of the payload. Not serialized, not replicated,
+     * ignored by NuRaft.
+     */
+    ptr<void> user_data;
+
 private:
     /**
      * The term number when this log entry was generated.

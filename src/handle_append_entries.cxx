@@ -1094,7 +1094,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 if (old_entry->get_val_type() == log_val_type::app_log) {
                     buf->pos(0);
                     state_machine_->rollback_ext
-                        ( state_machine::ext_op_params( idx, buf ) );
+                        ( state_machine::ext_op_params( idx, buf, old_entry ) );
                     p_in( "rollback log %" PRIu64 ", term %" PRIu64,
                           idx, old_entry->get_term() );
 
@@ -1128,7 +1128,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 ptr<buffer> buf = entry->get_buf_ptr();
                 buf->pos(0);
                 state_machine_->pre_commit_ext
-                    ( state_machine::ext_op_params( log_idx, buf ) );
+                    ( state_machine::ext_op_params( log_idx, buf, entry ) );
 
             } else if(entry->get_val_type() == log_val_type::conf) {
                 p_in("receive a config change from leader at %" PRIu64, log_idx);
@@ -1167,7 +1167,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                 ptr<buffer> buf = entry->get_buf_ptr();
                 buf->pos(0);
                 state_machine_->pre_commit_ext
-                    ( state_machine::ext_op_params( idx_for_entry, buf ) );
+                    ( state_machine::ext_op_params( idx_for_entry, buf, entry ) );
             }
 
             if (stopping_) return resp;
