@@ -86,6 +86,7 @@ public:
         , last_streamed_log_idx_(0)
         , bytes_in_flight_(0)
         , snapshot_sync_is_needed_(false)
+        , out_of_log_range_(false)
         , self_mark_down_(false)
         , l_(logger)
     {
@@ -446,6 +447,13 @@ public:
         return snapshot_sync_is_needed_;
     }
 
+    void set_out_of_log_range(bool to) {
+        out_of_log_range_ = to;
+    }
+    bool is_out_of_log_range() const {
+        return out_of_log_range_;
+    }
+
     bool is_self_mark_down() const {
         return self_mark_down_;
     }
@@ -721,6 +729,15 @@ private:
      * `next_log_idx_` is within the range, we should send a snapshot.
      */
     std::atomic<bool> snapshot_sync_is_needed_;
+
+    /**
+     * Set to `true` when the leader found that it can send this peer neither
+     * the log entries it needs nor a snapshot, and warned it that it is out
+     * of the leader's log range. Such a peer cannot be recovered by
+     * replication at all, so anything that waits for peers to catch up has to
+     * leave it out. Cleared as soon as the leader can serve it again.
+     */
+    std::atomic<bool> out_of_log_range_;
 
     /**
      * If `true`, this peer marks itself down.
