@@ -287,7 +287,8 @@ public:
     bool is_manual_free()       { return manual_free_; }
 
     bool recreate_rpc(ptr<srv_config>& config,
-                      context& ctx);
+                      context& ctx,
+                      bool force = false);
 
     void reset_rpc() {
         std::lock_guard<std::mutex> l(rpc_protector_);
