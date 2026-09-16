@@ -280,7 +280,8 @@ void peer::try_set_free(msg_type type, bool streaming) {
 }
 
 bool peer::recreate_rpc(ptr<srv_config>& config,
-                        context& ctx)
+                        context& ctx,
+                        bool force)
 {
     if (abandoned_) {
         p_tr("peer %d is abandoned", config->get_id());
@@ -307,7 +308,7 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
 
     // To avoid too frequent reconnection attempt,
     // we use exponential backoff (x2) from 1 ms to heartbeat interval.
-    if (backoff_timer_disabled || reconn_backoff_.timeout()) {
+    if (force || backoff_timer_disabled || reconn_backoff_.timeout()) {
         reconn_backoff_.reset();
         size_t new_duration_ms = reconn_backoff_.get_duration_us() / 1000;
         new_duration_ms = std::min( hb_interval_, (int32)new_duration_ms * 2 );

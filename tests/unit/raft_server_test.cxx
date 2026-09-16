@@ -822,6 +822,69 @@ int remove_and_then_add_test() {
     return 0;
 }
 
+int rejoin_clears_busy_peers_before_leadership_takeover_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Remove S2, but keep its process and peer objects alive.
+    s1.raftServer->remove_srv(s2.myId);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Simulate callbacks from old clients that never arrive. Without the
+    // join repair, these flags survive and prevent S2 from requesting votes.
+    CHK_TRUE( s2.fNet->makePeerBusy(s2.raftServer.get(), s1.myId) );
+    CHK_TRUE( s2.fNet->makePeerBusy(s2.raftServer.get(), s3.myId) );
+
+    // Re-add the still-running S2. The accepted `join_cluster_request` must
+    // replace its old peer clients before log synchronization continues.
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    s1.fNet->execReqResp();
+    CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s1.myId) );
+    CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s3.myId) );
+
+    // Finish log synchronization and commit the new configuration.
+    for (size_t ii = 0; ii < 4; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_EQ(3, s2.raftServer->get_config()->get_servers().size());
+
+    // A later forced takeover must be able to send votes and win quorum.
+    s1.raftServer->yield_leadership(false, s2.myId);
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 int multiple_config_change_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2330,6 +2393,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "remove and then add test",
                remove_and_then_add_test );
+
+    ts.doTest( "rejoin clears busy peers before leadership takeover test",
+               rejoin_clears_busy_peers_before_leadership_takeover_test );
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );

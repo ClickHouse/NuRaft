@@ -228,6 +228,25 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     ctx_->state_mgr_->save_config(*c_config);
     reconfigure(c_config);
 
+    // Replace stale busy RPC clients after a running member rejoins.
+    for (peer_itor it = peers_.begin(); it != peers_.end(); ++it)
+    {
+        ptr<peer> pp = it->second;
+        if (!pp->is_busy())
+        {
+            continue;
+        }
+        ptr<srv_config> s_config = c_config->get_server(pp->get_id());
+        if (s_config)
+        {
+            if (!pp->recreate_rpc(s_config, *ctx_, true))
+            {
+                p_wn("failed to reset RPC client for peer %d during join",
+                     pp->get_id());
+            }
+        }
+    }
+
     resp->accept( quick_commit_index_.load() + 1 );
     return resp;
 }

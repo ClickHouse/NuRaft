@@ -108,6 +108,20 @@ public:
         }
     }
 
+    bool makePeerBusy(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() && entry->second->make_busy();
+    }
+
+    bool isPeerBusy(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() && entry->second->is_busy();
+    }
+
     bool isOnline() const { return online; }
 
     void stop();
