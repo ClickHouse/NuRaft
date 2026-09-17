@@ -965,6 +965,27 @@ bool raft_server::is_stale_rpc_result(ptr<resp_msg>& resp,
 
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+
+    ptr<peer> source_peer;
+    if (resp) {
+        source_peer = resp->get_peer();
+    } else if (err) {
+        source_peer = err->get_peer();
+    }
+
+    // A callback retains the peer that issued its request. A reconfiguration
+    // may remove that peer while its RPC is in flight, leaving its RPC client
+    // generation current on the detached peer object. Do not let such a
+    // callback affect the current cluster membership.
+    if (source_peer) {
+        peer_itor entry = peers_.find(source_peer->get_id());
+        if (entry == peers_.end() || entry->second != source_peer) {
+            p_wn("ignore RPC result from peer %d that is no longer current",
+                 source_peer->get_id());
+            return;
+        }
+    }
+
     if (is_stale_rpc_result(resp, err)) {
         return;
     }
