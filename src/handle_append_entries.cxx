@@ -1465,7 +1465,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         // busy flag was intentionally held by `handle_rpc_result()` until
         // the peer's log positions were updated; release it now, before
         // any follow-up send.
-        p->consume_deferred_free();
+        p->consume_deferred_free(resp.get_rpc_client_id());
 
         bool sm_committed_idx_updated = false;
         if (resp.get_ctx() &&
@@ -1715,7 +1715,7 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         // busy flag was intentionally held by `handle_rpc_result()` until
         // the peer's log positions were updated; release it now, before
         // any follow-up send.
-        p->consume_deferred_free();
+        p->consume_deferred_free(resp.get_rpc_client_id());
     }
 
     if (!config_changing_ && p->get_config().is_new_joiner()) {

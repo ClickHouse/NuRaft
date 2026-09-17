@@ -124,6 +124,39 @@ public:
         return entry != peers.end() && entry->second->is_busy();
     }
 
+    void setPeerFree(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        if (entry != peers.end()) {
+            entry->second->set_free();
+        }
+    }
+
+    uint64_t markPeerDeferredFree(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() ? mark_peer_deferred_free(entry->second) : 0;
+    }
+
+    bool consumePeerDeferredFree(raft_server* srv,
+                                 int peer_id,
+                                 uint64_t rpc_client_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() &&
+               entry->second->consume_deferred_free(rpc_client_id);
+    }
+
+    bool forceRecreatePeerRpc(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() && force_recreate_peer_rpc(srv, entry->second);
+    }
+
     void requestPreVote(raft_server* srv)
     {
         request_prevote(srv);

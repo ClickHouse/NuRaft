@@ -118,6 +118,12 @@ protected:
     static void request_prevote(raft_server* srv) {
         srv->request_prevote();
     }
+
+    /// Models a callback that has deferred release of a peer's busy flag.
+    static uint64_t mark_peer_deferred_free(ptr<peer>& pp);
+
+    /// Forces RPC-client recreation for a current peer (for testing).
+    static bool force_recreate_peer_rpc(raft_server* srv, ptr<peer>& pp);
 };
 
 }

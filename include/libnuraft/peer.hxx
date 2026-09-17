@@ -55,7 +55,7 @@ public:
         , matched_idx_(0)
         , next_log_idx_floor_(0)
         , busy_flag_(false)
-        , deferred_free_(false)
+        , deferred_free_rpc_id_(0)
         , pending_commit_flag_(false)
         , hb_enabled_(false)
         , hb_task_( cs_new< timer_task<int32>,
@@ -409,9 +409,9 @@ public:
      * an expensive redundant read (and network send), especially with
      * changelog read-ahead enabled.
      *
-     * To avoid that, `peer::handle_rpc_result()` calls
-     * `mark_deferred_free()` instead of `try_set_free()` for this one
-     * case, transferring free-ownership of the busy flag to
+     * To avoid that, `peer::handle_rpc_result()` records the originating RPC
+     * client instead of calling `try_set_free()` for this one case,
+     * transferring free-ownership of the busy flag to
      * `raft_server::handle_append_entries_resp()`. That function calls
      * `consume_deferred_free()` right after updating the peer's log
      * positions in the accepted case, and again after adjusting them
@@ -426,13 +426,30 @@ public:
      * response. That call is a no-op if the flag has already been
      * consumed, which is the common case.
      */
+    // Retained for callers that consume the deferred release immediately on
+    // the current client. RPC callbacks use the ID-aware overload below.
     void mark_deferred_free() {
-        deferred_free_.store(true);
+        std::lock_guard<std::mutex> l(rpc_protector_);
+        deferred_free_rpc_id_ = rpc_ ? rpc_->get_id() : 0;
     }
 
     bool consume_deferred_free() {
-        bool exp = true;
-        if (deferred_free_.compare_exchange_strong(exp, false)) {
+        std::lock_guard<std::mutex> l(rpc_protector_);
+        uint64_t rpc_client_id = rpc_ ? rpc_->get_id() : 0;
+        if (deferred_free_rpc_id_ &&
+            deferred_free_rpc_id_ == rpc_client_id) {
+            deferred_free_rpc_id_ = 0;
+            set_free();
+            return true;
+        }
+        return false;
+    }
+
+    bool consume_deferred_free(uint64_t rpc_client_id) {
+        std::lock_guard<std::mutex> l(rpc_protector_);
+        if (deferred_free_rpc_id_ &&
+            deferred_free_rpc_id_ == rpc_client_id) {
+            deferred_free_rpc_id_ = 0;
             set_free();
             return true;
         }
@@ -469,6 +486,8 @@ public:
     }
 
 private:
+    friend class raft_server_handler;
+
     void handle_rpc_result(ptr<peer> myself,
                            uint64_t my_rpc_client_id,
                            ptr<req_msg>& req,
@@ -559,13 +578,12 @@ private:
     std::atomic<bool> busy_flag_;
 
     /**
-     * `true` if the release of `busy_flag_` for the in-flight
-     * non-streamed `append_entries_request` has been deferred from
-     * `peer::handle_rpc_result()` to
-     * `raft_server::handle_append_entries_resp()`. See
-     * `mark_deferred_free()` / `consume_deferred_free()` above.
+     * RPC client ID that owns the deferred release of `busy_flag_` for an
+     * in-flight non-streamed `append_entries_request`, or zero if none.
+     * Access is protected by `rpc_protector_`; an old callback must not
+     * release busy for a request sent on a newer client.
      */
-    std::atomic<bool> deferred_free_;
+    uint64_t deferred_free_rpc_id_;
 
     /**
      * `true` if we need to send follow-up request immediately
