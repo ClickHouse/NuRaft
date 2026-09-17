@@ -1161,6 +1161,7 @@ protected:
                       ptr<req_msg>& msg,
                       rpc_handler& m_handler,
                       bool streaming = false);
+    bool is_stale_rpc_result(ptr<resp_msg>& resp, ptr<rpc_exception>& err);
     void handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err);
     void handle_append_entries_resp(resp_msg& resp);
     void handle_install_snapshot_resp(resp_msg& resp);

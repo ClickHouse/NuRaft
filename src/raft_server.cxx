@@ -941,8 +941,54 @@ void raft_server::reset_peer_info() {
     }
 }
 
+bool raft_server::is_stale_rpc_result(ptr<resp_msg>& resp,
+                                      ptr<rpc_exception>& err) {
+    ptr<peer> source_peer;
+    uint64_t rpc_client_id = 0;
+    if (resp) {
+        source_peer = resp->get_peer();
+        rpc_client_id = resp->get_rpc_client_id();
+    } else if (err) {
+        source_peer = err->get_peer();
+        rpc_client_id = err->get_rpc_client_id();
+    }
+
+    if (!source_peer || !rpc_client_id ||
+        source_peer->is_current_rpc(rpc_client_id)) {
+        return false;
+    }
+
+    p_wn("ignore stale RPC result from peer %d, client id %" PRIu64,
+         source_peer->get_id(), rpc_client_id);
+    return true;
+}
+
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+
+    ptr<peer> source_peer;
+    if (resp) {
+        source_peer = resp->get_peer();
+    } else if (err) {
+        source_peer = err->get_peer();
+    }
+
+    // A callback retains the peer that issued its request. A reconfiguration
+    // may remove that peer while its RPC is in flight, leaving its RPC client
+    // generation current on the detached peer object. Do not let such a
+    // callback affect the current cluster membership.
+    if (source_peer) {
+        peer_itor entry = peers_.find(source_peer->get_id());
+        if (entry == peers_.end() || entry->second != source_peer) {
+            p_wn("ignore RPC result from peer %d that is no longer current",
+                 source_peer->get_id());
+            return;
+        }
+    }
+
+    if (is_stale_rpc_result(resp, err)) {
+        return;
+    }
     if (err) {
         ptr<req_msg> req = err->req();
         if (!req) {
@@ -1837,6 +1883,9 @@ ptr<resp_msg> raft_server::handle_ext_msg(req_msg& req, std::unique_lock<std::re
 
 void raft_server::handle_ext_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+    if (is_stale_rpc_result(resp, err)) {
+        return;
+    }
     if (err) {
         handle_ext_resp_err(*err);
         return;

@@ -835,6 +835,20 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     CHK_Z( launch_servers( pkgs ) );
     CHK_Z( make_group( pkgs ) );
 
+    // Leave a pre-vote response pending on S2's current RPC client. It must
+    // become stale when the rejoin request replaces that busy client.
+    ulong stale_prevote_term = s2.raftServer->get_term();
+    s2.fNet->requestPreVote(s2.raftServer.get());
+    CHK_TRUE( s2.fNet->delieverReqTo(s1.myEndpoint) );
+    ptr<resp_msg> stale_prevote_resp = cs_new<resp_msg>(
+        stale_prevote_term,
+        msg_type::pre_vote_response,
+        s1.myId,
+        s2.myId);
+    stale_prevote_resp->accept(1);
+    CHK_TRUE( s2.fNet->replaceLastPendingResp(
+        s1.myEndpoint, stale_prevote_resp) );
+
     // Remove S2, but keep its process and peer objects alive.
     s1.raftServer->remove_srv(s2.myId);
     s1.fNet->execReqResp();
@@ -842,17 +856,21 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     s1.fNet->execReqResp();
     CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
 
-    // Simulate callbacks from old clients that never arrive. Without the
-    // join repair, these flags survive and prevent S2 from requesting votes.
-    CHK_TRUE( s2.fNet->makePeerBusy(s2.raftServer.get(), s1.myId) );
-    CHK_TRUE( s2.fNet->makePeerBusy(s2.raftServer.get(), s3.myId) );
-
     // Re-add the still-running S2. The accepted `join_cluster_request` must
     // replace its old peer clients before log synchronization continues.
     s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
     s1.fNet->execReqResp();
     CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s1.myId) );
     CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s3.myId) );
+
+    // The delayed response belongs to the election epoch before rejoin. It
+    // must not initiate a vote while S2 is catching up with the cluster.
+    CHK_TRUE( s2.raftServer->is_catching_up() );
+    ulong rejoin_term = s2.raftServer->get_term();
+    CHK_TRUE( s2.fNet->handleStaleRespFrom(s1.myEndpoint) );
+    CHK_EQ( rejoin_term, s2.raftServer->get_term() );
+    CHK_TRUE( s2.raftServer->is_catching_up() );
+    CHK_FALSE( s2.raftServer->is_leader() );
 
     // Finish log synchronization and commit the new configuration.
     for (size_t ii = 0; ii < 4; ++ii)
@@ -880,6 +898,74 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
     s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int removed_peer_response_during_rejoin_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Keep an accepted pre-vote response from S3 in flight on S2's original
+    // peer object. S3 will later be removed from S2's configuration.
+    ulong stale_prevote_term = s2.raftServer->get_term();
+    s2.fNet->requestPreVote(s2.raftServer.get());
+    CHK_TRUE( s2.fNet->delieverReqTo(s3.myEndpoint) );
+    ptr<resp_msg> stale_prevote_resp = cs_new<resp_msg>(
+        stale_prevote_term,
+        msg_type::pre_vote_response,
+        s3.myId,
+        s2.myId);
+    stale_prevote_resp->accept(1);
+    CHK_TRUE( s2.fNet->replaceLastPendingResp(
+        s3.myEndpoint, stale_prevote_resp) );
+
+    // Remove S2, then S3, so S1's active configuration becomes {S1} while
+    // S2 retains its old peer object for S3.
+    s1.raftServer->remove_srv(s2.myId);
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    s1.raftServer->remove_srv(s3.myId);
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Rejoin S2 into {S1, S2}. The join request reconfigures S2 and removes
+    // S3 from peers_, but the callback above still owns the old S3 object.
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    s1.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_catching_up() );
+
+    // Start a pre-vote in the rejoined configuration without delivering S1's
+    // request. An accepted response from removed S3 must not complete it and
+    // start an election while S2 is catching up.
+    s2.fNet->requestPreVote(s2.raftServer.get());
+    ulong rejoin_term = s2.raftServer->get_term();
+    CHK_TRUE( s2.fNet->handleRespFrom(s3.myEndpoint) );
+    CHK_EQ( rejoin_term, s2.raftServer->get_term() );
+    CHK_TRUE( s2.raftServer->is_catching_up() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
     f_base->destroy();
 
     return 0;
@@ -2397,6 +2483,9 @@ int main(int argc, char** argv) {
     ts.doTest( "rejoin clears busy peers before leadership takeover test",
                rejoin_clears_busy_peers_before_leadership_takeover_test );
 
+    ts.doTest( "removed peer response during rejoin test",
+               removed_peer_response_during_rejoin_test );
+
     ts.doTest( "multiple config change test",
                multiple_config_change_test );
 
@@ -2467,4 +2556,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-

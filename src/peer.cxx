@@ -143,7 +143,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
                           stale_resps,
                           limit );
                 }
-
+                return;
             } else {
                 // WARNING:
                 //   `set_free()` should be protected by `rpc_protector_`, otherwise
@@ -171,6 +171,7 @@ void peer::handle_rpc_result( ptr<peer> myself,
         }
         ptr<rpc_exception> no_except;
         resp->set_peer(myself);
+        resp->set_rpc_client_id(my_rpc_client_id);
         try {
             pending_result->set_result(resp, no_except);
         } catch (...) {
@@ -191,6 +192,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
     } else {
         // Failed.
 
+        if (!is_current_rpc(my_rpc_client_id)) {
+            p_wn("[EDGE CASE] got stale RPC error from %d, will ignore it.",
+                 get_id());
+            return;
+        }
+
         // NOTE: Explicit failure is also treated as an activity
         //       of that connection.
         reset_active_timer();
@@ -199,6 +206,8 @@ void peer::handle_rpc_result( ptr<peer> myself,
             slow_down_hb();
         }
         ptr<resp_msg> no_resp;
+        err->set_peer(myself);
+        err->set_rpc_client_id(my_rpc_client_id);
         pending_result->set_result(no_resp, err);
 
         // Destroy this connection, we MUST NOT re-use existing socket.
@@ -334,6 +343,12 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         p_ts("skip reconnect this time");
     }
     return false;
+}
+
+bool peer::is_current_rpc(uint64_t rpc_client_id)
+{
+    std::lock_guard<std::mutex> l(rpc_protector_);
+    return rpc_ && rpc_->get_id() == rpc_client_id;
 }
 
 void peer::shutdown() {

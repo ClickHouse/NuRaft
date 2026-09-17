@@ -103,6 +103,11 @@ protected:
     static ptr<peer> get_srv_to_join(raft_server* srv) {
         return srv->srv_to_join_;
     }
+
+    /// Starts a pre-vote round (for testing).
+    static void request_prevote(raft_server* srv) {
+        srv->request_prevote();
+    }
 };
 
 }
