@@ -88,6 +88,8 @@ public:
     bool handleRespFrom(const std::string& endpoint,
                         bool random_order = false);
 
+    bool handleStaleRespFrom(const std::string& endpoint);
+
     void handleAllFrom(const std::string& endpoint);
 
     size_t getNumPendingReqs(const std::string& endpoint);
@@ -120,6 +122,11 @@ public:
         auto& peers = get_peers(srv);
         auto entry = peers.find(peer_id);
         return entry != peers.end() && entry->second->is_busy();
+    }
+
+    void requestPreVote(raft_server* srv)
+    {
+        request_prevote(srv);
     }
 
     bool isOnline() const { return online; }

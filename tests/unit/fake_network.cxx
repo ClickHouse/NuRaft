@@ -302,6 +302,31 @@ bool FakeNetwork::handleRespFrom(const std::string& endpoint,
     return true;
 }
 
+bool FakeNetwork::handleStaleRespFrom(const std::string& endpoint)
+{
+    ptr<FakeClient> conn;
+    for (auto& entry: staleClients)
+    {
+        if (entry->dstNet->getEndpoint() == endpoint &&
+            !entry->pendingResps.empty())
+        {
+            conn = entry;
+            break;
+        }
+    }
+    if (!conn)
+    {
+        return false;
+    }
+
+    auto pkg_entry = conn->pendingResps.begin();
+    RespPkg pkg = *pkg_entry;
+    ptr<rpc_exception> exp;
+    pkg.whenDone(pkg.resp, exp);
+    conn->pendingResps.erase(pkg_entry);
+    return true;
+}
+
 void FakeNetwork::handleAllFrom(const std::string& endpoint) {
     while (handleRespFrom(endpoint));
 }

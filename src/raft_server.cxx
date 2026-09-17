@@ -941,8 +941,33 @@ void raft_server::reset_peer_info() {
     }
 }
 
+bool raft_server::is_stale_rpc_result(ptr<resp_msg>& resp,
+                                      ptr<rpc_exception>& err) {
+    ptr<peer> source_peer;
+    uint64_t rpc_client_id = 0;
+    if (resp) {
+        source_peer = resp->get_peer();
+        rpc_client_id = resp->get_rpc_client_id();
+    } else if (err) {
+        source_peer = err->get_peer();
+        rpc_client_id = err->get_rpc_client_id();
+    }
+
+    if (!source_peer || !rpc_client_id ||
+        source_peer->is_current_rpc(rpc_client_id)) {
+        return false;
+    }
+
+    p_wn("ignore stale RPC result from peer %d, client id %" PRIu64,
+         source_peer->get_id(), rpc_client_id);
+    return true;
+}
+
 void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+    if (is_stale_rpc_result(resp, err)) {
+        return;
+    }
     if (err) {
         ptr<req_msg> req = err->req();
         if (!req) {
@@ -1837,6 +1862,9 @@ ptr<resp_msg> raft_server::handle_ext_msg(req_msg& req, std::unique_lock<std::re
 
 void raft_server::handle_ext_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+    if (is_stale_rpc_result(resp, err)) {
+        return;
+    }
     if (err) {
         handle_ext_resp_err(*err);
         return;

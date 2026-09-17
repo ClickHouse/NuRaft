@@ -57,6 +57,7 @@ public:
         , async_cb_func_(nullptr)
         , result_code_(cmd_result_code::OK)
         , extra_flags_(0x0)
+        , rpc_client_id_(0)
         {}
 
     __nocopy__(resp_msg);
@@ -102,6 +103,14 @@ public:
 
     ptr<peer> get_peer() const {
         return peer_;
+    }
+
+    void set_rpc_client_id(uint64_t rpc_client_id) {
+        rpc_client_id_ = rpc_client_id;
+    }
+
+    uint64_t get_rpc_client_id() const {
+        return rpc_client_id_;
     }
 
     void set_cb(resp_cb _func) {
@@ -158,6 +167,9 @@ private:
     resp_async_cb async_cb_func_;
     cmd_result_code result_code_;
     uint64_t extra_flags_;
+
+    // Local RPC client generation. It is not serialized.
+    uint64_t rpc_client_id_;
 };
 
 }

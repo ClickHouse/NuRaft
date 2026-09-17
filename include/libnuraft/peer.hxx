@@ -290,6 +290,8 @@ public:
                       context& ctx,
                       bool force = false);
 
+    bool is_current_rpc(uint64_t rpc_client_id);
+
     void reset_rpc() {
         std::lock_guard<std::mutex> l(rpc_protector_);
         rpc_.reset();

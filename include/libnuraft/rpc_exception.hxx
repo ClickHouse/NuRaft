@@ -29,15 +29,24 @@ limitations under the License.
 
 namespace nuraft {
 
+class peer;
 class req_msg;
 class rpc_exception : public std::exception {
 public:
     rpc_exception(const std::string& err, ptr<req_msg> req)
-        : req_(req), err_(err.c_str()) {}
+        : req_(req), err_(err.c_str()), rpc_client_id_(0) {}
 
     __nocopy__(rpc_exception);
 public:
     ptr<req_msg> req() const { return req_; }
+
+    void set_peer(ptr<peer> peer) { peer_ = peer; }
+    ptr<peer> get_peer() const { return peer_; }
+
+    void set_rpc_client_id(uint64_t rpc_client_id) {
+        rpc_client_id_ = rpc_client_id;
+    }
+    uint64_t get_rpc_client_id() const { return rpc_client_id_; }
 
     virtual const char* what() const throw() __override__ {
         return err_.c_str();
@@ -45,6 +54,8 @@ public:
 private:
     ptr<req_msg> req_;
     std::string err_;
+    ptr<peer> peer_;
+    uint64_t rpc_client_id_;
 };
 
 }
