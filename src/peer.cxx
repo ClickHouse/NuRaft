@@ -157,7 +157,9 @@ void peer::handle_rpc_result( ptr<peer> myself,
                     // updated `next_log_idx_`/`matched_idx_` from this
                     // response (see the comment on `deferred_free_` in
                     // peer.hxx).
-                    mark_deferred_free();
+                    // `rpc_protector_` is held here. Associate the deferred
+                    // release with the client that delivered this response.
+                    deferred_free_rpc_id_ = my_rpc_client_id;
                 } else {
                     try_set_free(req->get_type(), streaming);
                 }
@@ -177,14 +179,14 @@ void peer::handle_rpc_result( ptr<peer> myself,
         } catch (...) {
             // Safety net: never leave a deferred busy flag set if the
             // handler throws before consuming it.
-            consume_deferred_free();
+            consume_deferred_free(my_rpc_client_id);
             throw;
         }
         // Safety net for response types / early-return paths in
         // `raft_server::handle_append_entries_resp()` that never reach
         // their own `consume_deferred_free()` call. No-op if the flag
         // was already consumed there, which is the common case.
-        consume_deferred_free();
+        consume_deferred_free(my_rpc_client_id);
 
         reconn_backoff_.reset();
         reconn_backoff_.set_duration_ms(1);
@@ -334,6 +336,9 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
 
         reset_stream();
         reset_bytes_in_flight();
+        // A callback from the replaced client must not release busy for a
+        // request sent through the new client.
+        deferred_free_rpc_id_ = 0;
         set_free();
         set_manual_free();
         reset_cnt_backward_log_probe();

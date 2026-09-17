@@ -228,14 +228,13 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     ctx_->state_mgr_->save_config(*c_config);
     reconfigure(c_config);
 
-    // Replace stale busy RPC clients after a running member rejoins.
+    // A rejoin starts a new configuration epoch.  Replace every retained
+    // peer client so callbacks started before the join cannot affect it.
+    // A successful vote callback may already have cleared busy_flag_ while
+    // waiting to acquire raft_server::lock_.
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it)
     {
         ptr<peer> pp = it->second;
-        if (!pp->is_busy())
-        {
-            continue;
-        }
         ptr<srv_config> s_config = c_config->get_server(pp->get_id());
         if (s_config)
         {

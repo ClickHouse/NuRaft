@@ -24,6 +24,18 @@ limitations under the License.
 
 namespace nuraft {
 
+uint64_t raft_server_handler::mark_peer_deferred_free(ptr<peer>& pp) {
+    std::lock_guard<std::mutex> l(pp->rpc_protector_);
+    pp->deferred_free_rpc_id_ = pp->rpc_ ? pp->rpc_->get_id() : 0;
+    return pp->deferred_free_rpc_id_;
+}
+
+bool raft_server_handler::force_recreate_peer_rpc(raft_server* srv,
+                                                   ptr<peer>& pp) {
+    ptr<srv_config> config = srv->get_config()->get_server(pp->get_id());
+    return config && pp->recreate_rpc(config, *srv->ctx_, true);
+}
+
 // === FakeNetworkBase
 
 FakeNetworkBase::FakeNetworkBase() {

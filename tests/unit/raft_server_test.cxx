@@ -849,6 +849,12 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     CHK_TRUE( s2.fNet->replaceLastPendingResp(
         s1.myEndpoint, stale_prevote_resp) );
 
+    // Model the window in the real callback where try_set_free() has run,
+    // but handle_peer_resp() is still blocked on raft_server::lock_. The
+    // response remains attached to the old client despite no peer being busy.
+    s2.fNet->setPeerFree(s2.raftServer.get(), s1.myId);
+    s2.fNet->setPeerFree(s2.raftServer.get(), s3.myId);
+
     // Remove S2, but keep its process and peer objects alive.
     s1.raftServer->remove_srv(s2.myId);
     s1.fNet->execReqResp();
@@ -894,6 +900,51 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     s1.fNet->execReqResp();
     s2.fNet->execReqResp();
     CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int deferred_free_from_replaced_rpc_cannot_free_new_request_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Model a non-streamed append response that has deferred its release of
+    // busy_flag_, followed by recreation of its RPC client before the stale
+    // callback completes.
+    s1.fNet->setPeerFree(s1.raftServer.get(), s2.myId);
+    CHK_TRUE( s1.fNet->makePeerBusy(s1.raftServer.get(), s2.myId) );
+    uint64_t old_rpc_id =
+        s1.fNet->markPeerDeferredFree(s1.raftServer.get(), s2.myId);
+    CHK_TRUE(old_rpc_id);
+    CHK_TRUE( s1.fNet->forceRecreatePeerRpc(s1.raftServer.get(), s2.myId) );
+
+    // A new request owns the deferred release on the replacement client. A
+    // late callback from the old client must not clear its busy flag.
+    CHK_TRUE( s1.fNet->makePeerBusy(s1.raftServer.get(), s2.myId) );
+    uint64_t new_rpc_id =
+        s1.fNet->markPeerDeferredFree(s1.raftServer.get(), s2.myId);
+    CHK_TRUE(new_rpc_id);
+    CHK_TRUE(old_rpc_id != new_rpc_id);
+    CHK_FALSE( s1.fNet->consumePeerDeferredFree(
+        s1.raftServer.get(), s2.myId, old_rpc_id) );
+    CHK_TRUE( s1.fNet->isPeerBusy(s1.raftServer.get(), s2.myId) );
+    CHK_TRUE( s1.fNet->consumePeerDeferredFree(
+        s1.raftServer.get(), s2.myId, new_rpc_id) );
+    CHK_FALSE( s1.fNet->isPeerBusy(s1.raftServer.get(), s2.myId) );
 
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
@@ -966,6 +1017,63 @@ int removed_peer_response_during_rejoin_test()
     s2.raftServer->shutdown();
     s3.raftServer->shutdown();
 
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_joiner_response_after_role_change_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Create enough committed log entries for adding S2 to require a
+    // sync_log_request instead of immediately proposing the new config.
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_EQ(1, s1.fNet->getNumPendingResps(s2.myEndpoint));
+
+    // Abandon the S2 join while its sync_log_response is still pending, then
+    // regain leadership and start adding S3.
+    s1.fNet->forceBecomeFollower(s1.raftServer.get());
+    s1.fNet->forceBecomeLeader(s1.raftServer.get());
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    ptr<raft_result> add_s3 =
+        s1.raftServer->add_srv(*s3.getTestMgr()->get_srv_config());
+    CHK_TRUE( add_s3->get_accepted() );
+    ulong s3_next_log_idx =
+        s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get());
+    ulong s3_matched_idx =
+        s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get());
+
+    // The response retained S2's old peer object. It must be rejected instead
+    // of applying S2's progress to the current S3 join.
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+    CHK_EQ( s3_next_log_idx,
+            s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()) );
+    CHK_EQ( s3_matched_idx,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
     f_base->destroy();
 
     return 0;
@@ -2483,8 +2591,14 @@ int main(int argc, char** argv) {
     ts.doTest( "rejoin clears busy peers before leadership takeover test",
                rejoin_clears_busy_peers_before_leadership_takeover_test );
 
+    ts.doTest( "deferred free from replaced RPC cannot free new request test",
+               deferred_free_from_replaced_rpc_cannot_free_new_request_test );
+
     ts.doTest( "removed peer response during rejoin test",
                removed_peer_response_during_rejoin_test );
+
+    ts.doTest( "stale joiner response after role change test",
+               stale_joiner_response_after_role_change_test );
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );

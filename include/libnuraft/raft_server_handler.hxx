@@ -104,10 +104,26 @@ protected:
         return srv->srv_to_join_;
     }
 
+    /// Forces a server to become a follower (for testing).
+    static void become_follower(raft_server* srv) {
+        srv->become_follower();
+    }
+
+    /// Forces a server to become a leader (for testing).
+    static void become_leader(raft_server* srv) {
+        srv->become_leader();
+    }
+
     /// Starts a pre-vote round (for testing).
     static void request_prevote(raft_server* srv) {
         srv->request_prevote();
     }
+
+    /// Models a callback that has deferred release of a peer's busy flag.
+    static uint64_t mark_peer_deferred_free(ptr<peer>& pp);
+
+    /// Forces RPC-client recreation for a current peer (for testing).
+    static bool force_recreate_peer_rpc(raft_server* srv, ptr<peer>& pp);
 };
 
 }
