@@ -104,6 +104,16 @@ protected:
         return srv->srv_to_join_;
     }
 
+    /// Forces a server to become a follower (for testing).
+    static void become_follower(raft_server* srv) {
+        srv->become_follower();
+    }
+
+    /// Forces a server to become a leader (for testing).
+    static void become_leader(raft_server* srv) {
+        srv->become_leader();
+    }
+
     /// Starts a pre-vote round (for testing).
     static void request_prevote(raft_server* srv) {
         srv->request_prevote();

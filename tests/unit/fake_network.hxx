@@ -344,6 +344,14 @@ public:
         return joiner ? joiner->get_next_log_idx_floor() : 0;
     }
 
+    void forceBecomeFollower(raft_server* srv) {
+        become_follower(srv);
+    }
+
+    void forceBecomeLeader(raft_server* srv) {
+        become_leader(srv);
+    }
+
     void handleInstallSnapshotRespNewMember(raft_server* srv, resp_msg& resp) {
         handle_install_snapshot_resp_new_member(srv, resp);
     }

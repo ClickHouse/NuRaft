@@ -971,6 +971,63 @@ int removed_peer_response_during_rejoin_test()
     return 0;
 }
 
+int stale_joiner_response_after_role_change_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Create enough committed log entries for adding S2 to require a
+    // sync_log_request instead of immediately proposing the new config.
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_EQ(1, s1.fNet->getNumPendingResps(s2.myEndpoint));
+
+    // Abandon the S2 join while its sync_log_response is still pending, then
+    // regain leadership and start adding S3.
+    s1.fNet->forceBecomeFollower(s1.raftServer.get());
+    s1.fNet->forceBecomeLeader(s1.raftServer.get());
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    ptr<raft_result> add_s3 =
+        s1.raftServer->add_srv(*s3.getTestMgr()->get_srv_config());
+    CHK_TRUE( add_s3->get_accepted() );
+    ulong s3_next_log_idx =
+        s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get());
+    ulong s3_matched_idx =
+        s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get());
+
+    // The response retained S2's old peer object. It must be rejected instead
+    // of applying S2's progress to the current S3 join.
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+    CHK_EQ( s3_next_log_idx,
+            s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()) );
+    CHK_EQ( s3_matched_idx,
+            s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 int multiple_config_change_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2485,6 +2542,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "removed peer response during rejoin test",
                removed_peer_response_during_rejoin_test );
+
+    ts.doTest( "stale joiner response after role change test",
+               stale_joiner_response_after_role_change_test );
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );

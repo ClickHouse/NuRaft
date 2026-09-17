@@ -1227,7 +1227,10 @@ void raft_server::become_leader() {
         role_ = srv_role::leader;
         leader_ = id_;
         self_mark_down_ = excluded_from_the_quorum_ = false;
-        srv_to_join_.reset();
+        if (srv_to_join_)
+        {
+            reset_srv_to_join();
+        }
         leadership_transfer_timer_.set_duration_ms
             (params->leadership_transfer_min_wait_time_);
         leadership_transfer_timer_.reset();
@@ -1769,14 +1772,10 @@ void raft_server::become_follower() {
             }
         }
 
-        if (srv_to_join_) {
-            ptr<snapshot_sync_ctx> sync_ctx = srv_to_join_->get_snapshot_sync_ctx();
-            if ( sync_ctx &&
-                 sync_ctx->is_async_snapshot_transfer_started() ) {
-                clear_snapshot_sync_ctx(*srv_to_join_);
-            }
+        if (srv_to_join_)
+        {
+            reset_srv_to_join();
         }
-        srv_to_join_.reset();
         role_ = srv_role::follower;
         index_at_becoming_leader_ = 0;
 
