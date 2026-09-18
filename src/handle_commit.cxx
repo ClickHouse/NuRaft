@@ -1048,6 +1048,8 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
             enable_hb_for_peer(*p);
             if (srv_to_join_ && srv_to_join_->get_id() == p->get_id()) {
                 p->set_next_log_idx(srv_to_join_->get_next_log_idx());
+                clear_snapshot_sync_ctx(*srv_to_join_);
+                srv_to_join_->shutdown();
                 srv_to_join_.reset();
             }
         }

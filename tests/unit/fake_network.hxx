@@ -389,6 +389,15 @@ public:
         handle_install_snapshot_resp_new_member(srv, resp);
     }
 
+    ptr<peer> getServerToJoin(raft_server* srv) {
+        return get_srv_to_join(srv);
+    }
+
+    void handleExtendedResp(raft_server* srv, ptr<resp_msg> resp) {
+        ptr<rpc_exception> err;
+        handle_ext_resp(srv, resp, err);
+    }
+
     ulong getPeerSnapshotSyncCtxLastLogIdx(raft_server* srv, int32 peer_id) {
         auto& peers = get_peers(srv);
         auto it = peers.find(peer_id);

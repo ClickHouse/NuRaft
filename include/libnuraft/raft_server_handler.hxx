@@ -99,6 +99,13 @@ protected:
         srv->handle_install_snapshot_resp_new_member(resp);
     }
 
+    /// Invokes the extended response handler (for testing).
+    static void handle_ext_resp(raft_server* srv,
+                                ptr<resp_msg>& resp,
+                                ptr<rpc_exception>& err) {
+        srv->handle_ext_resp(resp, err);
+    }
+
     /// Gets the server currently being added to the cluster (for testing).
     static ptr<peer> get_srv_to_join(raft_server* srv) {
         return srv->srv_to_join_;

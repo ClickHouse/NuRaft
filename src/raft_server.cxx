@@ -1882,6 +1882,27 @@ ptr<resp_msg> raft_server::handle_ext_msg(req_msg& req, std::unique_lock<std::re
 
 void raft_server::handle_ext_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) {
     recur_lock(lock_);
+
+    ptr<peer> source_peer;
+    if (resp) {
+        source_peer = resp->get_peer();
+    } else if (err) {
+        source_peer = err->get_peer();
+    }
+
+    // Extended callbacks may belong either to a regular member or to the
+    // server currently being added. A completed or cancelled join can leave
+    // a callback holding an older peer object with the same server ID. Do not
+    // let that callback affect a later membership operation.
+    if (source_peer && source_peer != srv_to_join_) {
+        peer_itor entry = peers_.find(source_peer->get_id());
+        if (entry == peers_.end() || entry->second != source_peer) {
+            p_wn("ignore extended RPC result from peer %d that is no longer current",
+                 source_peer->get_id());
+            return;
+        }
+    }
+
     if (is_stale_rpc_result(resp, err)) {
         return;
     }

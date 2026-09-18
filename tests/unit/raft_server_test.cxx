@@ -1079,6 +1079,68 @@ int stale_joiner_response_after_role_change_test()
     return 0;
 }
 
+int completed_join_response_cannot_affect_later_join_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers(pkgs) );
+
+    // Retain the temporary peer object used to add S2. Committing the
+    // membership change replaces it with a different peer in `peers_`.
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    ptr<peer> completed_joiner =
+        s1.fNet->getServerToJoin(s1.raftServer.get());
+    CHK_NONNULL(completed_joiner.get());
+
+    // Join request/response, configuration commit, then notify S2.
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_TRUE(completed_joiner->is_abandoned());
+
+    // Start adding S3. It is now the only peer that an extended log-sync
+    // response is allowed to update.
+    ptr<raft_result> add_s3 =
+        s1.raftServer->add_srv(*s3.getTestMgr()->get_srv_config());
+    CHK_TRUE(add_s3->get_accepted());
+    ulong s3_next_log_idx =
+        s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get());
+    ulong s3_matched_idx =
+        s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get());
+
+    // Model a delayed sync response from the completed S2 join. The peer
+    // object is detached, but its RPC generation may still be current.
+    ptr<resp_msg> delayed_resp = cs_new<resp_msg>(
+        s1.raftServer->get_term(),
+        msg_type::sync_log_response,
+        s2.myId,
+        s1.myId,
+        s3_next_log_idx + 1);
+    delayed_resp->accept(s3_next_log_idx + 1);
+    delayed_resp->set_peer(completed_joiner);
+    s1.fNet->handleExtendedResp(s1.raftServer.get(), delayed_resp);
+
+    CHK_EQ(s3_next_log_idx,
+           s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()));
+    CHK_EQ(s3_matched_idx,
+           s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()));
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 int multiple_config_change_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2599,6 +2661,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "stale joiner response after role change test",
                stale_joiner_response_after_role_change_test );
+
+    ts.doTest( "completed join response cannot affect later join test",
+               completed_join_response_cannot_affect_later_join_test );
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );
