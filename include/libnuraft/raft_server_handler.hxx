@@ -50,6 +50,58 @@ protected:
     }
 
     /**
+     * Sets a pending server removal (for testing).
+     */
+    static void set_srv_to_leave(raft_server* srv,
+                                 const ptr<peer>& peer,
+                                 ulong target_idx) {
+        srv->srv_to_leave_ = peer;
+        srv->srv_to_leave_target_idx_ = target_idx;
+    }
+
+    /**
+     * Gets a pending server removal (for testing).
+     */
+    static ptr<peer> get_srv_to_leave(raft_server* srv) {
+        return srv->srv_to_leave_;
+    }
+
+    /**
+     * Checks if a configuration change is pending (for testing).
+     */
+    static bool is_config_changing(raft_server* srv) {
+        return srv->config_changing_;
+    }
+
+    /**
+     * Gets the pending configuration (for testing).
+     */
+    static ptr<cluster_config> get_uncommitted_config(raft_server* srv) {
+        return srv->uncommitted_config_;
+    }
+
+    /**
+     * Starts the normal leader-side removal operation (for testing).
+     */
+    static void remove_server_from_cluster(raft_server* srv, int32 srv_id) {
+        srv->rm_srv_from_cluster(srv_id);
+    }
+
+    /**
+     * Gets the number of voting members (for testing).
+     */
+    static int32 get_num_voting_members(raft_server* srv) {
+        return srv->get_num_voting_members();
+    }
+
+    /**
+     * Gets the remaining self-removal timeout steps (for testing).
+     */
+    static int32 get_steps_to_down(raft_server* srv) {
+        return srv->steps_to_down_;
+    }
+
+    /**
      * Clear the last snapshot pointer in a raft_server (for testing).
      */
     static void clear_last_snapshot(raft_server* srv) {

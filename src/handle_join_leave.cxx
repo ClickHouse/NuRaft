@@ -31,6 +31,7 @@ limitations under the License.
 
 #include <cassert>
 #include <sstream>
+#include <stdexcept>
 
 namespace nuraft {
 
@@ -206,6 +207,9 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
 
     p_in("got join cluster req from leader %d", req.get_src());
     state_->set_catching_up(true);
+    // Accepting a join supersedes the pending self-removal. Without this
+    // reset, the next election timeout can abandon the new peer epoch again.
+    steps_to_down_ = 0;
     role_ = srv_role::follower;
     index_at_becoming_leader_ = 0;
     leader_ = req.get_src();
@@ -226,24 +230,53 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
     //          this server will remove itself immediately by replaying
     //          previous config which does not include this server.
     ctx_->state_mgr_->save_config(*c_config);
+
+    // A join starts a new membership epoch. Discard every pending membership
+    // change from the previous leadership epoch before reconfiguring.
+    // `reset_srv_to_leave` shuts down its retained peer, so the replacement
+    // pass below creates a new peer object if the incoming configuration
+    // still contains it.
+    if (srv_to_leave_)
+    {
+        reset_srv_to_leave();
+    }
+    config_changing_ = false;
+    uncommitted_config_.reset();
     reconfigure(c_config);
 
-    // A rejoin starts a new configuration epoch.  Replace every retained
-    // peer client so callbacks started before the join cannot affect it.
-    // A successful vote callback may already have cleared busy_flag_ while
-    // waiting to acquire raft_server::lock_.
-    for (peer_itor it = peers_.begin(); it != peers_.end(); ++it)
+    // Replace every retained peer at the membership boundary. In addition to
+    // RPC state, a peer contains leave flags, replication cursors, snapshot
+    // state, and heartbeat counters that must not cross into the new epoch.
+    // Old callbacks remain attached to detached, abandoned objects.
+    for (auto it = peers_.begin(); it != peers_.end(); ++it)
     {
         ptr<peer> pp = it->second;
         ptr<srv_config> s_config = c_config->get_server(pp->get_id());
-        if (s_config)
+        if (!s_config)
         {
-            if (!pp->recreate_rpc(s_config, *ctx_, true))
-            {
-                p_wn("failed to reset RPC client for peer %d during join",
-                     pp->get_id());
-            }
+            throw std::logic_error("retained peer is missing from join configuration");
         }
+
+        if (!pp->is_abandoned())
+        {
+            pp->enable_hb(false);
+        }
+        clear_snapshot_sync_ctx(*pp);
+        pp->shutdown();
+
+        timer_task<int32>::executor exec =
+            std::bind( &raft_server::handle_hb_timeout,
+                       this,
+                       std::placeholders::_1 );
+        ptr<peer> replacement = cs_new< peer,
+                                          ptr<srv_config>&,
+                                          context&,
+                                          timer_task<int32>::executor&,
+                                          ptr<logger>& >
+                                        ( s_config, *ctx_, exec, l_ );
+        replacement->set_next_log_idx(log_store_->next_slot());
+        it->second = replacement;
+        p_in("replaced peer %d during join", pp->get_id());
     }
 
     resp->accept( quick_commit_index_.load() + 1 );
@@ -663,6 +696,7 @@ void raft_server::reset_srv_to_join() {
 }
 
 void raft_server::reset_srv_to_leave() {
+    clear_snapshot_sync_ctx(*srv_to_leave_);
     srv_to_leave_->shutdown();
     srv_to_leave_.reset();
     srv_to_leave_target_idx_ = 0;
