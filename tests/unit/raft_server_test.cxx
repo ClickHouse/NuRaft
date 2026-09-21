@@ -855,6 +855,18 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     s2.fNet->setPeerFree(s2.raftServer.get(), s1.myId);
     s2.fNet->setPeerFree(s2.raftServer.get(), s3.myId);
 
+    ptr<peer> old_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> old_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(old_s1_peer.get());
+    CHK_NONNULL(old_s3_peer.get());
+    CHK_FALSE(old_s1_peer->is_abandoned());
+    CHK_FALSE(old_s3_peer->is_abandoned());
+
+    // A leave request can outlive the leadership epoch that created it even
+    // if it has not advanced far enough to populate `srv_to_leave_`.
+    old_s3_peer->set_leave_flag();
+    CHK_TRUE(old_s3_peer->is_leave_flag_set());
+
     // Remove S2, but keep its process and peer objects alive.
     s1.raftServer->remove_srv(s2.myId);
     s1.fNet->execReqResp();
@@ -866,8 +878,16 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     // replace its old peer clients before log synchronization continues.
     s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
     s1.fNet->execReqResp();
-    CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s1.myId) );
-    CHK_FALSE( s2.fNet->isPeerBusy(s2.raftServer.get(), s3.myId) );
+
+    ptr<peer> new_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> new_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(new_s1_peer.get());
+    CHK_NONNULL(new_s3_peer.get());
+    CHK_TRUE(old_s1_peer != new_s1_peer);
+    CHK_TRUE(old_s3_peer != new_s3_peer);
+    CHK_FALSE(new_s1_peer->is_busy());
+    CHK_FALSE(new_s3_peer->is_busy());
+    CHK_FALSE(new_s3_peer->is_leave_flag_set());
 
     // The delayed response belongs to the election epoch before rejoin. It
     // must not initiate a vote while S2 is catching up with the cluster.
@@ -900,6 +920,329 @@ int rejoin_clears_busy_peers_before_leadership_takeover_test()
     s1.fNet->execReqResp();
     s2.fNet->execReqResp();
     CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int rejoin_replaces_abandoned_peers_before_leadership_takeover_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Remove S2, but keep its process and peer objects alive.
+    s1.raftServer->remove_srv(s2.myId);
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    ptr<peer> old_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> old_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(old_s1_peer.get());
+    CHK_NONNULL(old_s3_peer.get());
+
+    // Drive both self-removal timeouts. The second one runs
+    // `cancel_schedulers`, abandons every retained peer, and resets the
+    // server scheduler.
+    CHK_EQ(2, s2.fNet->getStepsToDown(s2.raftServer.get()));
+    s2.fTimer->invoke(timer_task_type::election_timer);
+    CHK_EQ(1, s2.fNet->getStepsToDown(s2.raftServer.get()));
+    s2.fTimer->invoke(timer_task_type::election_timer);
+    CHK_EQ(0, s2.fNet->getStepsToDown(s2.raftServer.get()));
+    CHK_TRUE(old_s1_peer->is_abandoned());
+    CHK_TRUE(old_s3_peer->is_abandoned());
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    s1.fNet->execReqResp();
+
+    ptr<peer> new_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> new_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(new_s1_peer.get());
+    CHK_NONNULL(new_s3_peer.get());
+    CHK_TRUE(old_s1_peer != new_s1_peer);
+    CHK_TRUE(old_s3_peer != new_s3_peer);
+    CHK_FALSE(new_s1_peer->is_abandoned());
+    CHK_FALSE(new_s3_peer->is_abandoned());
+
+    // Finish log synchronization and commit the new configuration.
+    for (size_t ii = 0; ii < 4; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_EQ(3, s2.raftServer->get_config()->get_servers().size());
+
+    // The new peer epoch must be able to request votes and win quorum.
+    s1.raftServer->yield_leadership(false, s2.myId);
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int rejoin_clears_pending_self_removal_timeout_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    s1.raftServer->remove_srv(s2.myId);
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_EQ(2, s2.fNet->getStepsToDown(s2.raftServer.get()));
+
+    // Enter the interval between the two removal timeouts. The next election
+    // timeout would call `cancel_schedulers` if the join did not cancel the
+    // pending self-removal.
+    s2.fTimer->invoke(timer_task_type::election_timer);
+    CHK_EQ(1, s2.fNet->getStepsToDown(s2.raftServer.get()));
+
+    ptr<peer> old_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> old_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(old_s1_peer.get());
+    CHK_NONNULL(old_s3_peer.get());
+    CHK_FALSE(old_s1_peer->is_abandoned());
+    CHK_FALSE(old_s3_peer->is_abandoned());
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    s1.fNet->execReqResp();
+
+    CHK_EQ(0, s2.fNet->getStepsToDown(s2.raftServer.get()));
+    ptr<peer> new_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    ptr<peer> new_s3_peer = s2.fNet->getPeer(s2.raftServer.get(), s3.myId);
+    CHK_NONNULL(new_s1_peer.get());
+    CHK_NONNULL(new_s3_peer.get());
+    CHK_TRUE(old_s1_peer != new_s1_peer);
+    CHK_TRUE(old_s3_peer != new_s3_peer);
+
+    // Fire the already scheduled timeout from the removal epoch. It must not
+    // abandon either replacement peer.
+    s2.fTimer->invoke(timer_task_type::election_timer);
+    CHK_FALSE(new_s1_peer->is_abandoned());
+    CHK_FALSE(new_s3_peer->is_abandoned());
+
+    for (size_t ii = 0; ii < 4; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_EQ(3, s2.raftServer->get_config()->get_servers().size());
+
+    s1.raftServer->yield_leadership(false, s2.myId);
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int rejoin_replaces_stale_leave_peer_before_leadership_takeover_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Remove S2, but keep its process and peer objects alive.
+    s1.raftServer->remove_srv(s2.myId);
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Model an unfinished removal that S2 started while it was leader. The
+    // target survives S2's leadership loss and aliases the current peer.
+    ptr<peer> old_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    CHK_NONNULL(old_s1_peer.get());
+    s2.fNet->setSrvToLeave(s2.raftServer.get(), s1.myId,
+                           s2.raftServer->get_last_log_idx());
+    CHK_TRUE(s2.fNet->getSrvToLeave(s2.raftServer.get()) == old_s1_peer);
+
+    // A pending removal can also own a state-machine snapshot cursor. It must
+    // be closed before the old peer is detached.
+    ptr<snapshot> snp = cs_new<snapshot>(
+        s2.raftServer->get_last_log_idx(),
+        s2.raftServer->get_term(),
+        s2.raftServer->get_config());
+    s2.fNet->setPeerSnapshotInSync(s2.raftServer.get(), s1.myId, snp);
+    ptr<snapshot_sync_ctx> sync_ctx = old_s1_peer->get_snapshot_sync_ctx();
+    CHK_NONNULL(sync_ctx.get());
+    {
+        snapshot_sync_ctx::user_snp_ctx_io_guard user_ctx_guard(
+            *sync_ctx, *s2.getTestSm());
+        CHK_TRUE(user_ctx_guard);
+        ptr<buffer> snapshot_data;
+        bool is_last_object = false;
+        CHK_Z(s2.getTestSm()->read_logical_snp_obj(
+            *snp,
+            user_ctx_guard.get(),
+            0,
+            snapshot_data,
+            is_last_object));
+        CHK_FALSE(user_ctx_guard.finish());
+    }
+    CHK_EQ(1, s2.getTestSm()->getNumOpenedUserCtxs());
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    s1.fNet->execReqResp();
+
+    ptr<peer> new_s1_peer = s2.fNet->getPeer(s2.raftServer.get(), s1.myId);
+    CHK_NONNULL(new_s1_peer.get());
+    CHK_TRUE(old_s1_peer != new_s1_peer);
+    CHK_FALSE(new_s1_peer->is_abandoned());
+    CHK_NULL(s2.fNet->getSrvToLeave(s2.raftServer.get()).get());
+    CHK_EQ(3, s2.fNet->getNumVotingMembers(s2.raftServer.get()));
+    CHK_EQ(0, s2.getTestSm()->getNumOpenedUserCtxs());
+
+    // Finish log synchronization and commit the new configuration.
+    for (size_t ii = 0; ii < 4; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_EQ(3, s2.raftServer->get_config()->get_servers().size());
+
+    // The new peer epoch must be able to request votes and win quorum.
+    s1.raftServer->yield_leadership(false, s2.myId);
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int rejoin_discards_pending_removal_config_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Start the same leader-side removal path that handles a leave response.
+    // It couples srv_to_leave_, config_changing_, and uncommitted_config_,
+    // but does not replicate the removal before the join arrives.
+    s2.fNet->removeServerFromCluster(s2.raftServer.get(), s3.myId);
+
+    CHK_TRUE(s2.fNet->getSrvToLeave(s2.raftServer.get()) != nullptr);
+    CHK_TRUE(s2.fNet->isConfigChanging(s2.raftServer.get()));
+    ptr<cluster_config> pending_removal =
+        s2.fNet->getUncommittedConfig(s2.raftServer.get());
+    CHK_NONNULL(pending_removal.get());
+    CHK_NULL(pending_removal->get_server(s3.myId).get());
+
+    // S1's committed configuration still includes S3. Deliver a join request
+    // from that membership epoch to S2 without committing S2's removal.
+    ptr<buffer> join_conf_buf = s1.raftServer->get_config()->serialize();
+    ptr<req_msg> join_req = cs_new<req_msg>(
+        s2.raftServer->get_term(),
+        msg_type::join_cluster_request,
+        s1.myId,
+        s2.myId,
+        0,
+        s1.raftServer->get_last_log_idx(),
+        s1.raftServer->get_target_committed_log_idx());
+    join_req->log_entries().push_back(
+        cs_new<log_entry>(s2.raftServer->get_term(),
+                          join_conf_buf,
+                          log_val_type::conf));
+    rpc_handler ignore_join_response =
+        [](ptr<resp_msg>&, ptr<rpc_exception>&) { return 0; };
+    s1.fNet->findClient(s2.myEndpoint)->send(join_req, ignore_join_response);
+    CHK_TRUE(s1.fNet->delieverReqTo(s2.myEndpoint));
+
+    CHK_NULL(s2.fNet->getSrvToLeave(s2.raftServer.get()).get());
+    CHK_FALSE(s2.fNet->isConfigChanging(s2.raftServer.get()));
+    CHK_NULL(s2.fNet->getUncommittedConfig(s2.raftServer.get()).get());
+
+    // The next removal must derive its configuration from the join request,
+    // not from S2's stale removal of S3. Thus it keeps S3 while removing S1.
+    s2.fNet->removeServerFromCluster(s2.raftServer.get(), s1.myId);
+    ptr<cluster_config> next_removal =
+        s2.fNet->getUncommittedConfig(s2.raftServer.get());
+    CHK_NONNULL(next_removal.get());
+    CHK_NULL(next_removal->get_server(s1.myId).get());
+    CHK_NONNULL(next_removal->get_server(s2.myId).get());
+    CHK_NONNULL(next_removal->get_server(s3.myId).get());
 
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
@@ -2652,6 +2995,18 @@ int main(int argc, char** argv) {
 
     ts.doTest( "rejoin clears busy peers before leadership takeover test",
                rejoin_clears_busy_peers_before_leadership_takeover_test );
+
+    ts.doTest( "rejoin replaces abandoned peers before leadership takeover test",
+               rejoin_replaces_abandoned_peers_before_leadership_takeover_test );
+
+    ts.doTest( "rejoin clears pending self removal timeout test",
+               rejoin_clears_pending_self_removal_timeout_test );
+
+    ts.doTest( "rejoin replaces stale leave peer before leadership takeover test",
+               rejoin_replaces_stale_leave_peer_before_leadership_takeover_test );
+
+    ts.doTest( "rejoin discards pending removal config test",
+               rejoin_discards_pending_removal_config_test );
 
     ts.doTest( "deferred free from replaced RPC cannot free new request test",
                deferred_free_from_replaced_rpc_cannot_free_new_request_test );

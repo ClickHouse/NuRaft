@@ -124,6 +124,51 @@ public:
         return entry != peers.end() && entry->second->is_busy();
     }
 
+    ptr<peer> getPeer(raft_server* srv, int peer_id)
+    {
+        auto& peers = get_peers(srv);
+        auto entry = peers.find(peer_id);
+        return entry != peers.end() ? entry->second : nullptr;
+    }
+
+    void setSrvToLeave(raft_server* srv, int peer_id, ulong target_idx)
+    {
+        ptr<peer> peer = getPeer(srv, peer_id);
+        if (peer) {
+            set_srv_to_leave(srv, peer, target_idx);
+        }
+    }
+
+    ptr<peer> getSrvToLeave(raft_server* srv)
+    {
+        return get_srv_to_leave(srv);
+    }
+
+    bool isConfigChanging(raft_server* srv)
+    {
+        return is_config_changing(srv);
+    }
+
+    ptr<cluster_config> getUncommittedConfig(raft_server* srv)
+    {
+        return get_uncommitted_config(srv);
+    }
+
+    void removeServerFromCluster(raft_server* srv, int32 srv_id)
+    {
+        remove_server_from_cluster(srv, srv_id);
+    }
+
+    int32 getNumVotingMembers(raft_server* srv)
+    {
+        return get_num_voting_members(srv);
+    }
+
+    int32 getStepsToDown(raft_server* srv)
+    {
+        return get_steps_to_down(srv);
+    }
+
     void setPeerFree(raft_server* srv, int peer_id)
     {
         auto& peers = get_peers(srv);
