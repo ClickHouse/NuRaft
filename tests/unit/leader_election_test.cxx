@@ -158,6 +158,12 @@ int leader_election_priority_test() {
     // Send vote requests, S2 will deny due to priority.
     s3.fNet->execReqResp();
 
+    // Let S2 catch up with the entry S3 appended on becoming leader. Pre-vote is granted only
+    // to a candidate whose log is at least as fresh as the voter's, so S2 has to be level
+    // before it stands - otherwise it is denied here and has to wait for its next election
+    // timeout, by which point it would have caught up anyway.
+    s3.fNet->delieverReqTo(s2_addr);
+
     // Trigger election timer of S2.
     s2.dbgLog(" --- invoke election timer of S2 ---");
     s2.fTimer->invoke( timer_task_type::election_timer );
@@ -179,6 +185,98 @@ int leader_election_priority_test() {
     CHK_FALSE( s1.raftServer->is_leader() );
     CHK_TRUE( s2.raftServer->is_leader() );
     CHK_FALSE( s3.raftServer->is_leader() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int prevote_denies_candidate_whose_log_is_behind_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Appends below are batched before the messages are pumped, so they must not each wait for
+    // their own commit.
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    // --- Let S3 fall behind: it is offline while the other two commit. ---
+    s3.fNet->goesOffline();
+
+    const size_t NUM = 10;
+    for (size_t ii=0; ii<NUM; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+    }
+    for (size_t ii=0; ii<3; ++ii) s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec( {&s1, &s2}, COMMIT_TIMEOUT_SEC ) );
+
+    CHK_GT( s2.getTestSm()->last_commit_index(),
+            s3.getTestSm()->last_commit_index() );
+
+    // --- S3 is back, still behind, and the leader is gone. ---
+    s3.fNet->goesOnline();
+    s1.fNet->goesOffline();
+
+    // The window the defect lives in is a leaderless one, and `hb_alive_` on a follower is only
+    // cleared by that follower starting a pre-vote of its own (`request_prevote`). So S2 has to
+    // time out too - which is what every member does once the leader is gone - and its requests
+    // are left unsent, so it does not win here and the decision below is S2's to make.
+    s2.dbgLog(" --- invoke election timer of S2, leaving its requests unsent ---");
+    s2.fTimer->invoke( timer_task_type::election_timer );
+
+    const ulong term_before = s2.raftServer->get_term();
+
+    // S3 stands for election. Its log is behind S2's, so it would lose the real vote, and
+    // pre-vote has to say so before the term moves.
+    s3.dbgLog(" --- invoke election timer of S3, whose log is behind ---");
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    for (size_t ii=0; ii<3; ++ii) s3.fNet->execReqResp();
+
+    CHK_EQ( term_before, s2.raftServer->get_term() );
+    CHK_EQ( term_before, s3.raftServer->get_term() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+
+    // --- Liveness is preserved: a candidate whose log is current still wins. ---
+    //
+    // Denying above must not mean nobody can be elected while the leader is away, which is
+    // the pre-vote argument: the first member with a fresh enough log to time out succeeds.
+    s2.dbgLog(" --- let S2, whose log is current, run its election ---");
+    const size_t MAX_ATTEMPTS = 1000;
+    size_t num_attempts = 0;
+    do {
+        s2.fTimer->invoke( timer_task_type::election_timer );
+        for (size_t ii=0; ii<3; ++ii) s2.fNet->execReqResp();
+        if (++num_attempts >= MAX_ATTEMPTS) break;
+    } while ( !s2.raftServer->is_leader() );
+
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_GT( s2.raftServer->get_term(), term_before );
 
     print_stats(pkgs);
 
@@ -980,6 +1078,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leader election priority test",
                leader_election_priority_test );
+
+    ts.doTest( "pre-vote denies a candidate whose log is behind test",
+               prevote_denies_candidate_whose_log_is_behind_test );
 
     ts.doTest( "leader election with aggressive node test",
                leader_election_with_aggressive_node_test );
