@@ -158,6 +158,12 @@ int leader_election_priority_test() {
     // Send vote requests, S2 will deny due to priority.
     s3.fNet->execReqResp();
 
+    // Let S2 catch up with the entry S3 appended on becoming leader. Pre-vote is granted only
+    // to a candidate whose log is at least as fresh as the voter's, so S2 has to be level
+    // before it stands - otherwise it is denied here and has to wait for its next election
+    // timeout, by which point it would have caught up anyway.
+    s3.fNet->delieverReqTo(s2_addr);
+
     // Trigger election timer of S2.
     s2.dbgLog(" --- invoke election timer of S2 ---");
     s2.fTimer->invoke( timer_task_type::election_timer );
