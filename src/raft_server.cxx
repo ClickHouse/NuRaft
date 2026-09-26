@@ -1276,10 +1276,12 @@ void raft_server::become_leader() {
             ptr<log_entry> le = log_store_->entry_at(ii);
             if (last_config->get_log_idx() > ii)
             {
-                p_in("Currently assigned config is newer than some "
-                     "uncomitted config. This can only happen during startup or "
-                     "force recovery. If that is not the case, this is a bug.");
-                break;
+                // The current config can be newer than uncommitted entries,
+                // e.g. on a server that has just joined or after force recovery.
+                p_in("skipped uncommitted config at %" PRIu64
+                     ", current config %" PRIu64 " is newer",
+                     ii, last_config->get_log_idx());
+                continue;
             }
 
             p_in("found uncommitted config at %" PRIu64 ", size %zu",
@@ -1302,6 +1304,7 @@ void raft_server::become_leader() {
         p_in("[BECOME LEADER] appended new config at %" PRIu64,
              index_at_becoming_leader_.load());
         config_changing_ = true;
+        uncommitted_config_ = last_config_cloned;
     }
 
     // The slow member backpressure lasts for one leadership, so a server that
