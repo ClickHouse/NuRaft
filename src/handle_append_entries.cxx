@@ -1074,6 +1074,57 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         bool rollback_in_progress = false;
         if ( my_last_log_idx >= log_idx &&
              cnt < req.log_entries().size() ) {
+
+            // Raft's Log Matching and Leader Completeness properties mean a
+            // legitimate leader never rolls back an already committed entry
+            // (`sm_commit_index_` or `quick_commit_index_`). If the rollback
+            // point is at or before either, the sender is not a valid
+            // leader. Check this before any state below is changed.
+            if ( log_idx <= sm_commit_index_ ||
+                 log_idx <= quick_commit_index_ ) {
+                p_er( "refuse to roll back committed logs: rollback point %"
+                      PRIu64 " <= commit idx (quick %" PRIu64 ", sm %" PRIu64
+                      "), my last log idx %" PRIu64 ", log store start idx %"
+                      PRIu64 ", req src %d, req term %" PRIu64 ". keeping "
+                      "local data and denying the request; the sender is "
+                      "likely not a valid leader for this term, e.g. it "
+                      "restarted with an empty data directory, or it has a "
+                      "duplicated or mismatched server id",
+                      log_idx,
+                      quick_commit_index_.load(),
+                      sm_commit_index_.load(),
+                      my_last_log_idx,
+                      log_store_->start_index(),
+                      req.get_src(),
+                      req.get_term() );
+
+                cb_func::RejectedCommittedLogRollbackArgs reject_args
+                    ( log_idx,
+                      my_last_log_idx,
+                      quick_commit_index_.load(),
+                      sm_commit_index_.load(),
+                      log_store_->start_index(),
+                      req.get_src(),
+                      req.get_term() );
+                cb_func::Param reject_param(id_, leader_, req.get_src(), &reject_args);
+                ctx_->cb_func_.call(cb_func::RejectedCommittedLogRollback, &reject_param);
+
+                // Deny without changing state. `resp` is already
+                // not-accepted, with next_idx_ at our own log tail.
+                resp_appendix appendix;
+                appendix.extra_order_ = resp_appendix::DO_NOT_REWIND;
+                resp->set_ctx( appendix.serialize() );
+
+                // Set the hint to a negative number to slow down the leader.
+                resp->set_next_batch_size_hint_in_bytes(-1);
+
+                // Do NOT restart the election timer: the sender is not a
+                // valid leader. This node must still time out and elect one
+                // that has all committed entries, or the cluster is stuck.
+
+                return resp;
+            }
+
             p_in( "rollback logs: %" PRIu64 " - %" PRIu64
                   ", commit idx req %" PRIu64 ", quick %" PRIu64 ", sm %" PRIu64 ", "
                   "num log entries %zu, current count %zu",
@@ -1100,23 +1151,6 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     }
                     pending_follower_resps_.clear();
                 }
-            }
-
-            // If rollback point is smaller than commit index,
-            // should rollback commit index as well
-            // (should not happen in Raft though).
-            if ( quick_commit_index_ >= log_idx ) {
-                p_wn( "rollback quick commit index from %" PRIu64 " to %" PRIu64,
-                      quick_commit_index_.load(),
-                      log_idx - 1 );
-                quick_commit_index_ = log_idx - 1;
-            }
-            if ( sm_commit_index_ >= log_idx ) {
-                p_er( "rollback sm commit index from %" PRIu64 " to %" PRIu64 ", "
-                      "it shouldn't happen and may indicate data loss",
-                      sm_commit_index_.load(),
-                      log_idx - 1 );
-                sm_commit_index_ = log_idx - 1;
             }
 
             for ( uint64_t ii = 0; ii < my_last_log_idx - log_idx + 1; ++ii ) {
