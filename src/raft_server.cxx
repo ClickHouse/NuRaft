@@ -1070,6 +1070,36 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
             pp->set_recovered();
             pp->reset_rpc_errs();
             pp->reset_resp_timer();
+
+            // Reset the long pause warning counter only when the just
+            // completed request was faster than the heartbeat interval.
+            // A slow-but-alive peer responds slower than that on every
+            // request; resetting the counter on each response would
+            // re-arm the warning burst endlessly and the suppression
+            // would never hold.
+            if ( pp->get_ls_timer_us() <=
+                    (uint64_t)ctx_->get_params()->heart_beat_interval_ *
+                        1000 ) {
+                int32 pause_warnings = pp->get_long_puase_warnings();
+                if ( pause_warnings >=
+                         raft_server::raft_limits_.warning_limit_ ) {
+                    pp->inc_recovery_cnt();
+                    p_wn( "recovered from long pause to peer %d, "
+                          "%d warnings, %d ms, %d times",
+                          resp->get_src(),
+                          pause_warnings,
+                          (int32)( pp->get_ls_timer_us() / 1000 ),
+                          pp->get_recovery_cnt() );
+
+                    if (pp->get_recovery_cnt() >= 10) {
+                        // Re-connect client, just in case.
+                        //reconnect_client(*pp);
+                        pp->reset_recovery_cnt();
+                    }
+                }
+                pp->reset_long_pause_warnings();
+                pp->set_long_pause_suppress_start_us(0);
+            }
         }
     }
 

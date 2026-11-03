@@ -66,6 +66,7 @@ public:
         , snp_sync_ctx_(nullptr)
         , lock_()
         , long_pause_warnings_(0)
+        , long_pause_suppress_start_us_(0)
         , network_recoveries_(0)
         , manual_free_(false)
         , rpc_errs_(0)
@@ -277,6 +278,17 @@ public:
     void reset_long_pause_warnings()    { long_pause_warnings_ = 0; }
     void inc_long_pause_warnings()      { long_pause_warnings_.fetch_add(1); }
     int32 get_long_puase_warnings()     { return long_pause_warnings_; }
+
+    // Wall clock timestamp (timer_helper::get_timeofday_us())
+    // when the long pause warning got suppressed
+    // (warning counter reached the limit).
+    // 0 if it is not suppressed.
+    void set_long_pause_suppress_start_us(uint64_t v) {
+        long_pause_suppress_start_us_ = v;
+    }
+    uint64_t get_long_pause_suppress_start_us() const {
+        return long_pause_suppress_start_us_;
+    }
 
     void reset_recovery_cnt()       { network_recoveries_ = 0; }
     void inc_recovery_cnt()         { network_recoveries_.fetch_add(1); }
@@ -636,6 +648,13 @@ private:
      * Counter of long pause warnings.
      */
     std::atomic<int32> long_pause_warnings_;
+
+    /**
+     * Timestamp (steady clock, timer_helper::get_timeofday_us())
+     * when the long pause warning got suppressed.
+     * 0 if it is not suppressed.
+     */
+    std::atomic<uint64_t> long_pause_suppress_start_us_;
 
     /**
      * Counter of recoveries after long pause.

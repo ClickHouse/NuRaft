@@ -115,6 +115,7 @@ public:
         limits()
             : pre_vote_rejection_limit_(20)
             , warning_limit_(20)
+            , warning_rearm_interval_ms_(60000)
             , response_limit_(20)
             , leadership_limit_(20)
             , reconnect_limit_(50)
@@ -132,6 +133,7 @@ public:
         limits& operator=(const limits& src) {
             pre_vote_rejection_limit_ = src.pre_vote_rejection_limit_.load();
             warning_limit_ = src.warning_limit_.load();
+            warning_rearm_interval_ms_ = src.warning_rearm_interval_ms_.load();
             response_limit_ = src.response_limit_.load();
             leadership_limit_  = src.leadership_limit_.load();
             reconnect_limit_ = src.reconnect_limit_.load();
@@ -153,6 +155,15 @@ public:
          * Max number of warnings before suppressing it.
          */
         std::atomic<int32> warning_limit_;
+
+        /**
+         * Re-arming interval of the suppressed long pause warning:
+         * while a peer stays slow, one more burst of warnings
+         * (`warning_limit_` messages) is allowed per this interval,
+         * so that a persistently degraded peer keeps producing a signal.
+         * 0 means never re-arm.
+         */
+        std::atomic<uint64_t> warning_rearm_interval_ms_;
 
         /**
          * If a node is not responding more than this limit,
