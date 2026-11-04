@@ -793,6 +793,16 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     return req;
 }
 
+// Make `resp` ask the leader not to rewind its `next_idx` and to slow down.
+static void deny_not_rewind(resp_msg& resp) {
+    resp_appendix appendix;
+    appendix.extra_order_ = resp_appendix::DO_NOT_REWIND;
+    resp.set_ctx( appendix.serialize() );
+
+    // Set the hint to a negative number to slow down the leader.
+    resp.set_next_batch_size_hint_in_bytes(-1);
+}
+
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     ptr<raft_params> params = ctx_->get_params();
@@ -858,6 +868,34 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
          req.get_src(), (int)req.get_type(), req.get_term(),
          req.get_last_log_idx(), req.log_entries().size(), req.get_commit_idx(),
          state_->get_term(), (int)role_);
+
+    // A term has only one leader. If the leader of this term tried to roll
+    // back committed logs, it is invalid for the whole term, so deny all its
+    // requests, including heartbeats and empty batches. Otherwise, the empty
+    // request sent after our `-1` hint would be accepted, and it would reset
+    // the election timer and set `leader_`, and the cluster could never elect
+    // a valid leader. Do this before any state change: a denied request must
+    // not mark the heartbeat alive (`update_target_priority`), as that makes
+    // this node reject pre-votes from the other nodes.
+    if ( rejected_leader_term_ &&
+         req.get_term() == rejected_leader_term_ ) {
+        static timer_helper invalid_leader_log_timer(1000 * 1000, true);
+        int invalid_leader_log_lv =
+            invalid_leader_log_timer.timeout_and_reset() ? L_WARN : L_TRACE;
+        p_lv( invalid_leader_log_lv,
+              "deny request from invalid leader %d of term %" PRIu64
+              ", it tried to roll back committed logs",
+              req.get_src(), req.get_term() );
+
+        ptr<resp_msg> invalid_leader_resp = cs_new<resp_msg>(
+            state_->get_term(),
+            msg_type::append_entries_response,
+            id_,
+            req.get_src(),
+            log_store_->next_slot() );
+        deny_not_rewind(*invalid_leader_resp);
+        return invalid_leader_resp;
+    }
 
     if (req.get_term() == state_->get_term()) {
         if (role_ == srv_role::candidate) {
@@ -1111,12 +1149,10 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
                 // Deny without changing state. `resp` is already
                 // not-accepted, with next_idx_ at our own log tail.
-                resp_appendix appendix;
-                appendix.extra_order_ = resp_appendix::DO_NOT_REWIND;
-                resp->set_ctx( appendix.serialize() );
-
-                // Set the hint to a negative number to slow down the leader.
-                resp->set_next_batch_size_hint_in_bytes(-1);
+                // All later requests of this term are denied by the early
+                // check at the top of this function.
+                rejected_leader_term_ = req.get_term();
+                deny_not_rewind(*resp);
 
                 // Do NOT restart the election timer: the sender is not a
                 // valid leader. This node must still time out and elect one

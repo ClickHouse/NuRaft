@@ -1853,6 +1853,13 @@ protected:
     std::atomic<bool> excluded_from_the_quorum_;
 
     /**
+     * Term whose leader is proven invalid, because it tried to roll back
+     * committed logs. All `AppendEntries` requests of this term are denied.
+     * 0 if there is none. Accessed only under `lock_`.
+     */
+    ulong rejected_leader_term_;
+
+    /**
      * Timer that will be reset on receiving
      * a valid `AppendEntries` request.
      */
