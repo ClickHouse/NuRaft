@@ -256,6 +256,17 @@ public:
          * ctx: pointer to `ReqResp` instance.
          */
         ReceivedMisbehavingMessage = 33,
+
+        /**
+         * A peer claiming to be leader sent an `append_entries` request
+         * whose rollback point is at or before this node's committed index,
+         * so applying it would roll back committed log entries. Refused
+         * instead: this usually means the peer is misbehaving or
+         * misconfigured, e.g. started with a stale data directory.
+         *
+         * ctx: pointer to `RejectedCommittedLogRollbackArgs`.
+         */
+        RejectedCommittedLogRollback = 34,
     };
 
     struct Param {
@@ -288,6 +299,59 @@ public:
     struct OutOfLogRangeWarningArgs {
         OutOfLogRangeWarningArgs(uint64_t x = 0) : startIdxOfLeader(x) {}
         uint64_t startIdxOfLeader;
+    };
+
+    struct RejectedCommittedLogRollbackArgs {
+        RejectedCommittedLogRollbackArgs(uint64_t log_idx = 0,
+                                          uint64_t my_last_log_idx = 0,
+                                          uint64_t quick_commit_index = 0,
+                                          uint64_t sm_commit_index = 0,
+                                          uint64_t log_store_start_index = 0,
+                                          int32_t req_src = -1,
+                                          uint64_t req_term = 0)
+            : logIdx(log_idx)
+            , myLastLogIdx(my_last_log_idx)
+            , quickCommitIndex(quick_commit_index)
+            , smCommitIndex(sm_commit_index)
+            , logStoreStartIndex(log_store_start_index)
+            , reqSrc(req_src)
+            , reqTerm(req_term)
+            {}
+
+        /**
+         * Log index where the leader wanted to start rolling back entries.
+         */
+        uint64_t logIdx;
+
+        /**
+         * This node's own last log index.
+         */
+        uint64_t myLastLogIdx;
+
+        /**
+         * This node's `quick_commit_index_`.
+         */
+        uint64_t quickCommitIndex;
+
+        /**
+         * This node's `sm_commit_index_`.
+         */
+        uint64_t smCommitIndex;
+
+        /**
+         * This node's log store start index.
+         */
+        uint64_t logStoreStartIndex;
+
+        /**
+         * Server ID the offending request claims to be from.
+         */
+        int32_t reqSrc;
+
+        /**
+         * Term of the offending request.
+         */
+        uint64_t reqTerm;
     };
 
     struct ConnectionArgs {
