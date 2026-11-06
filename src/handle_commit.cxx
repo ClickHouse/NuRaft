@@ -424,7 +424,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
                 elem->result_code_ = cmd_result_code::OK;
                 elem->ret_value_ = ret_value;
                 need_to_check_commit_ret = false;
-                p_ts("notify cb %" PRIu64 " %p", sm_idx, &elem->awaiter_);
+                p_ts("notify cb %" PRIu64, sm_idx);
 
                 if (params->track_peers_sm_commit_idx_) {
                     // Respond upon all peers' SM commit.
@@ -432,7 +432,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
 
                 } else {
                     // Respond upon the leader's SM commit.
-                    p_dv("notify cb %" PRIu64 " %p", sm_idx, &elem->awaiter_);
+                    p_dv("notify cb %" PRIu64, sm_idx);
                     switch (params->return_method_) {
                     case raft_params::blocking:
                     default:
@@ -464,7 +464,7 @@ void raft_server::commit_app_log(ulong idx_to_commit,
             elem->result_code_ = cmd_result_code::OK;
             elem->ret_value_ = ret_value;
             p_tr("commit thread is invoked earlier than user thread, "
-                 "log %" PRIu64 ", elem %p", sm_idx, elem.get());
+                 "log %" PRIu64, sm_idx);
 
             if (params->track_peers_sm_commit_idx_) {
                 // Ditto.
@@ -563,7 +563,7 @@ void raft_server::scan_sm_commit_and_notify(uint64_t idx_upto) {
         }
         ptr<commit_ret_elem> elem = entry->second;
 
-        p_tr("notify cb %" PRIu64 " %p", entry->first, &elem->awaiter_);
+        p_tr("notify cb %" PRIu64, entry->first);
         switch (params->return_method_) {
         case raft_params::blocking:
         default:
@@ -1114,8 +1114,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
                 p_in("srv_to_leave_: %d", srv_to_leave_->get_id());
                 ptr<snapshot_sync_ctx> snp_ctx = srv_to_leave_->get_snapshot_sync_ctx();
                 if (snp_ctx) {
-                    p_in("srv_to_leave_ has snapshot context %p, destroy it",
-                         snp_ctx.get());
+                    p_in("srv_to_leave_ has snapshot context, destroy it");
                     clear_snapshot_sync_ctx(*srv_to_leave_);
                 }
 
