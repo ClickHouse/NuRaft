@@ -413,13 +413,11 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  p->get_id(), p->get_last_streamed_log_idx(),
                  p->get_next_log_idx(), p->get_bytes_in_flight(), last_ts_ms);
         } else {
-            // The warning is suppressed. To avoid permanently muting a
-            // slow-but-alive peer, allow one more burst of warnings per
-            // re-arming interval.
+            // One more burst per re-arming interval,
+            // so a slow peer is not muted forever.
             uint64_t suppress_start = p->get_long_pause_suppress_start_us();
             if (suppress_start == 0) {
-                // The counter has just reached the limit
-                // (or skipped the exact moment due to concurrent increments).
+                // The counter has just reached (or skipped) the limit.
                 p->set_long_pause_suppress_start_us(
                     timer_helper::get_timeofday_us() );
                 if ( warnings == raft_server::raft_limits_.warning_limit_ ) {

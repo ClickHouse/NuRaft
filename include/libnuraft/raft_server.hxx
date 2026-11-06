@@ -157,10 +157,8 @@ public:
         std::atomic<int32> warning_limit_;
 
         /**
-         * Re-arming interval of the suppressed long pause warning:
-         * while a peer stays slow, one more burst of warnings
-         * (`warning_limit_` messages) is allowed per this interval,
-         * so that a persistently degraded peer keeps producing a signal.
+         * While a peer stays slow, one more burst of warnings
+         * (`warning_limit_`) is allowed per this interval.
          * 0 means never re-arm.
          */
         std::atomic<uint64_t> warning_rearm_interval_ms_;

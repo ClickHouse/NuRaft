@@ -1071,12 +1071,8 @@ void raft_server::handle_peer_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err)
             pp->reset_rpc_errs();
             pp->reset_resp_timer();
 
-            // Reset the long pause warning counter only when the just
-            // completed request was faster than the heartbeat interval.
-            // A slow-but-alive peer responds slower than that on every
-            // request; resetting the counter on each response would
-            // re-arm the warning burst endlessly and the suppression
-            // would never hold.
+            // Reset only on a fast response: resetting on every response
+            // would re-arm the warning burst on a slow-but-alive peer.
             if ( pp->get_ls_timer_us() <=
                     (uint64_t)ctx_->get_params()->heart_beat_interval_ *
                         1000 ) {
