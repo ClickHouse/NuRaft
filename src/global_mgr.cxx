@@ -220,8 +220,8 @@ void nuraft_global_mgr::request_append(ptr<raft_server> server) {
 
         ptr<logger>& l_ = server->l_;
         p_tr("added append request to global queue, "
-             "server %p, queue length %zu",
-             server.get(),
+             "server %d, queue length %zu",
+             server->id_,
              append_queue_.size());
     }
 
@@ -252,8 +252,8 @@ void nuraft_global_mgr::request_commit(ptr<raft_server> server) {
 
         ptr<logger>& l_ = server->l_;
         p_tr("added commit request to global queue, "
-             "server %p, queue length %zu",
-             server.get(),
+             "server %d, queue length %zu",
+             server->id_,
              commit_queue_.size());
     }
 
@@ -315,7 +315,7 @@ void nuraft_global_mgr::commit_worker_loop(ptr<worker_handle> handle) {
         // that can be queued in the meantime.
         skip_sleeping = true;
 
-        p_tr("execute commit for %p", target.get());
+        p_tr("execute commit for server %d", target->id_);
 
         if (target->sm_commit_notifier_target_idx_ >
                 target->sm_commit_notifier_notified_idx_) {

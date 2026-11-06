@@ -327,7 +327,8 @@ bool peer::recreate_rpc(ptr<srv_config>& config,
         reconn_backoff_.set_duration_ms(new_duration_ms);
 
         rpc_ = factory->create_client(config->get_endpoint());
-        p_ts("%p reconnect peer %d", rpc_.get(), get_config().get_id());
+        p_ts("client %" PRIu64 " reconnect peer %d",
+             rpc_ ? rpc_->get_id() : 0, get_config().get_id());
 
         // WARNING:
         //   A reconnection attempt should be treated as an activity,
