@@ -464,14 +464,27 @@ ptr<resp_msg> raft_server::handle_prevote_req(req_msg& req) {
     if (state_->is_catching_up()) {
         p_in("this server is catching up, always accept pre-vote");
     }
-    if (!hb_alive_ || state_->is_catching_up()) {
+
+    // The same predicate `handle_vote_req` applies, so that pre-vote predicts the vote it
+    // stands in for. Granting on liveness alone lets a candidate that would lose the real
+    // vote bump the term and depose the leader first, which is what pre-vote exists to
+    // prevent; and because that creates the next leaderless window, the same candidate
+    // qualifies again.
+    bool log_okay =
+        req.get_last_log_term() > log_store_->last_entry()->get_term() ||
+        ( req.get_last_log_term() == log_store_->last_entry()->get_term() &&
+          log_store_->next_slot() - 1 <= req.get_last_log_idx() );
+
+    if ( (!hb_alive_ && log_okay) || state_->is_catching_up() ) {
         p_in("pre-vote decision: O (grant)");
         resp->accept(log_store_->next_slot());
     } else {
-        if (next_idx_for_resp != std::numeric_limits<ulong>::max()) {
-            p_in("pre-vote decision: X (deny)");
-        } else {
+        if (next_idx_for_resp == std::numeric_limits<ulong>::max()) {
             p_in("pre-vote decision: XX (strong deny, non-existing node)");
+        } else if (hb_alive_) {
+            p_in("pre-vote decision: X (deny, heartbeat alive)");
+        } else {
+            p_in("pre-vote decision: X (deny, candidate's log is behind)");
         }
     }
 
