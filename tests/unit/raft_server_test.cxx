@@ -1484,6 +1484,150 @@ int completed_join_response_cannot_affect_later_join_test()
     return 0;
 }
 
+int new_joiner_elected_before_sm_catches_up_keeps_itself_in_config_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    removed_servers.clear();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs_12 = {&s1, &s2};
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs_12 ) );
+    CHK_Z( make_group( pkgs_12 ) );
+
+    // Start S3 without firing its election timer, so that it joins with an
+    // empty log and the leader syncs it from index 1.
+    raft_server::init_options opt(false, true, true);
+    opt.raft_callback_ = cb_default;
+    s3.initServer(nullptr, opt);
+    s3.fNet->listen(s3.raftServer);
+
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    // S3's state machine stays behind until the end of the test.
+    s3.raftServer->pause_state_machine_execution();
+
+    ulong join_conf_idx = s1.raftServer->get_config()->get_log_idx();
+
+    s1.raftServer->add_srv( *(s3.getTestMgr()->get_srv_config()) );
+    // Join, log sync, and the config that adds S3.
+    for (size_t ii = 0; ii < 3; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs_12, COMMIT_TIMEOUT_SEC) );
+    // Replicate the rest of the log to S3.
+    for (size_t ii = 0; ii < 2; ++ii) {
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs_12, COMMIT_TIMEOUT_SEC) );
+    }
+
+    // S3 holds the whole log, including the config that adds it, but has
+    // applied none of it. Its current config is still the join config, which
+    // is newer than an unapplied config entry in its log.
+    CHK_EQ( 3, s1.raftServer->get_config()->get_servers().size() );
+    CHK_EQ( 3, s2.raftServer->get_config()->get_servers().size() );
+    ulong add_conf_idx = s1.raftServer->get_config()->get_log_idx();
+    ptr<log_store> s3_log = s3.getTestMgr()->load_log_store();
+    CHK_EQ( add_conf_idx, s3.raftServer->get_last_log_idx() );
+    CHK_TRUE( s3_log->is_conf(add_conf_idx) );
+    {
+        ptr<cluster_config> add_conf =
+            cluster_config::deserialize( s3_log->entry_at(add_conf_idx)->get_buf() );
+        CHK_NONNULL( add_conf->get_server(s3.myId).get() );
+    }
+    CHK_EQ( join_conf_idx, s3.raftServer->get_config()->get_log_idx() );
+    CHK_NULL( s3.raftServer->get_config()->get_server(s3.myId).get() );
+    bool older_conf_unapplied = false;
+    for (ulong ii = s3.raftServer->get_committed_log_idx() + 1;
+         ii < join_conf_idx; ++ii) {
+        if (s3_log->is_conf(ii)) {
+            older_conf_unapplied = true;
+        }
+    }
+    CHK_TRUE( older_conf_unapplied );
+
+    // Transfer the leadership to S3 while its state machine is behind.
+    ulong last_idx_before_election = s3.raftServer->get_last_log_idx();
+    s1.raftServer->yield_leadership(false, s3.myId);
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s3.fNet->execReqResp();
+    CHK_TRUE( s3.raftServer->is_leader() );
+
+    // The config that S3 appends as the new leader must contain S3.
+    ulong leader_conf_idx = s3.raftServer->get_last_log_idx();
+    CHK_EQ( last_idx_before_election + 1, leader_conf_idx );
+    CHK_TRUE( s3_log->is_conf(leader_conf_idx) );
+    {
+        ptr<cluster_config> leader_conf =
+            cluster_config::deserialize( s3_log->entry_at(leader_conf_idx)->get_buf() );
+        CHK_EQ( 3, leader_conf->get_servers().size() );
+        CHK_NONNULL( leader_conf->get_server(s1.myId).get() );
+        CHK_NONNULL( leader_conf->get_server(s2.myId).get() );
+        CHK_NONNULL( leader_conf->get_server(s3.myId).get() );
+    }
+
+    // A priority change that S3 handles before its state machine applies that
+    // config must be based on it as well. S1 forwards it to S3.
+    s3.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s3.fNet->execReqResp();
+    CHK_TRUE( s1.raftServer->is_leader_alive() );
+    CHK_SM( s3.raftServer->get_committed_log_idx(), leader_conf_idx );
+    CHK_FALSE( s1.raftServer->set_priority_v2(s1.myId, 5) );
+    s1.fNet->execReqResp();
+    // Replicate and commit the new config.
+    s3.fNet->execReqResp();
+    s3.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs_12, COMMIT_TIMEOUT_SEC) );
+    s3.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s3.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs_12, COMMIT_TIMEOUT_SEC) );
+    for (RaftPkg* pp: pkgs_12) {
+        ptr<cluster_config> conf = pp->raftServer->get_config();
+        CHK_EQ( 5, conf->get_server(s1.myId)->get_priority() );
+        CHK_EQ( 3, conf->get_servers().size() );
+        CHK_NONNULL( conf->get_server(s3.myId).get() );
+    }
+
+    // Let S3's state machine catch up.
+    s3.raftServer->resume_state_machine_execution();
+    for (size_t ii = 0; ii < 2; ++ii) {
+        s3.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s3.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_TRUE( s3.raftServer->is_leader() );
+    for (RaftPkg* pp: pkgs) {
+        ptr<cluster_config> conf = pp->raftServer->get_config();
+        CHK_EQ( 3, conf->get_servers().size() );
+        CHK_NONNULL( conf->get_server(s3.myId).get() );
+        CHK_EQ( 5, conf->get_server(s1.myId)->get_priority() );
+    }
+    for (int removed_id: removed_servers) {
+        CHK_NEQ( s3.myId, removed_id );
+    }
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 int multiple_config_change_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3019,6 +3163,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "completed join response cannot affect later join test",
                completed_join_response_cannot_affect_later_join_test );
+
+    ts.doTest( "new joiner elected before sm catches up keeps itself in config test",
+               new_joiner_elected_before_sm_catches_up_keeps_itself_in_config_test );
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );
