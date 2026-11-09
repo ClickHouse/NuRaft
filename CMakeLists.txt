@@ -154,7 +154,17 @@ else()
 
         # This needs to be mantained for backwards compatibility.
         set(OPENSSL_ROOT_DIR ${DEPS_PREFIX})
-        set(OPENSSL_USE_STATIC_LIBS TRUE)
+        # Only the dependency bundle in `DEPS_PREFIX` is static-only. For a
+        # system OpenSSL let `FindOpenSSL` prefer the shared libraries: with
+        # `OPENSSL_USE_STATIC_LIBS` set to `TRUE`, `FindOpenSSL` also resolves
+        # the `zlib` dependency of a static OpenSSL while
+        # `CMAKE_FIND_LIBRARY_SUFFIXES` is set to `.a`, and adds `ZLIB::ZLIB`
+        # to the interface of `OpenSSL::SSL` and `OpenSSL::Crypto`. A system
+        # `libz.a` is not built with `-fPIC`, so the shared library cannot be
+        # linked against it.
+        if(DEPS_PREFIX)
+            set(OPENSSL_USE_STATIC_LIBS TRUE)
+        endif()
 
         find_package(OpenSSL QUIET)
 
