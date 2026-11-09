@@ -243,14 +243,14 @@ include_directories(BEFORE
 
 # === Compiler options ===
 if(ADDRESS_SANITIZER)
-    add_compile_options(-fsanitize=address -fuse-ld=gold)
-    add_link_options(-fsanitize=address -fuse-ld=gold)
+    add_compile_options(-fsanitize=address)
+    add_link_options(-fsanitize=address)
     message(STATUS "---- ADDRESS SANITIZER IS ON ----")
 endif()
 
 if(THREAD_SANITIZER)
-    add_compile_options(-fsanitize=thread -fuse-ld=gold)
-    add_link_options(-fsanitize=thread -fuse-ld=gold)
+    add_compile_options(-fsanitize=thread)
+    add_link_options(-fsanitize=thread)
     add_compile_definitions(SUPPRESS_TSAN_FALSE_ALARMS=1)
     message(STATUS "---- THREAD SANITIZER IS ON ----")
 endif()
