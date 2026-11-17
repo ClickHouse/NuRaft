@@ -98,8 +98,8 @@ bool raft_server::check_snapshot_timeout(ptr<peer> pp) {
 
     if ( sync_ctx->get_timer().timeout() ) {
         p_wn("snapshot install task for peer %d timed out: %" PRIu64 " ms, "
-             "reset snapshot sync context %p",
-             pp->get_id(), sync_ctx->get_timer().get_ms(), sync_ctx.get());
+             "reset snapshot sync context",
+             pp->get_id(), sync_ctx->get_timer().get_ms());
         clear_snapshot_sync_ctx(*pp);
         return true;
     }
@@ -116,7 +116,7 @@ void raft_server::clear_snapshot_sync_ctx(peer& pp) {
     if (snp_ctx) {
         snp_ctx->finish_async_snapshot_transfer();
         destroy_user_snp_ctx(snp_ctx);
-        p_tr("destroy snapshot sync ctx %p", snp_ctx.get());
+        p_tr("destroy snapshot sync ctx of peer %d", pp.get_id());
     }
     pp.reset_cnt_backward_log_probe();
     pp.set_snapshot_in_sync(nullptr);
@@ -137,14 +137,13 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
     ulong prev_sync_snp_log_idx = 0;
     if (sync_ctx) {
         snp = sync_ctx->get_snapshot();
-        p_db( "previous sync_ctx exists %p, offset %" PRIu64 ", snp idx %" PRIu64,
-              sync_ctx.get(),
+        p_db( "previous sync_ctx exists, offset %" PRIu64 ", snp idx %" PRIu64,
               sync_ctx->get_offset(),
               snp->get_last_log_idx() );
         prev_sync_snp_log_idx = snp->get_last_log_idx();
 
         if (sync_ctx->get_timer().timeout()) {
-            p_in("previous sync_ctx %p timed out, reset it", sync_ctx.get());
+            p_in("previous sync_ctx timed out, reset it");
             clear_snapshot_sync_ctx(p);
             sync_ctx.reset();
             snp.reset();

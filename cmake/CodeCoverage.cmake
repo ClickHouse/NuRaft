@@ -147,23 +147,35 @@ function(SETUP_TARGET_FOR_COVERAGE)
         message(FATAL_ERROR "genhtml not found! Aborting...")
     endif() # NOT GENHTML_PATH
 
+    # `lcov` 2.4 and later report the data consistency problems that `gcov`
+    # from GCC 15 produces as errors instead of warnings. For example, it marks
+    # a line inside a lambda as hit while the function itself is not hit, and
+    # then refuses to read the trace file it has just written:
+    #
+    #     lcov: ERROR: (corrupt) unable to read trace file '...':
+    #         lcov: ERROR: (inconsistent) "...":1229: function '...' is not hit
+    #         but line 1229 is.
+    #
+    # Skip those checks, they do not affect the coverage numbers.
+    set(LCOV_IGNORE_ERRORS --ignore-errors inconsistent,corrupt)
+
     # Setup target
     add_custom_target(${Coverage_NAME}
 
         # Cleanup lcov
-        COMMAND ${LCOV_PATH} --directory . --zerocounters
+        COMMAND ${LCOV_PATH} ${LCOV_IGNORE_ERRORS} --directory . --zerocounters
         # Create baseline to make sure untouched files show up in the report
-        COMMAND ${LCOV_PATH} -c -i -d . -o ${Coverage_NAME}.base
+        COMMAND ${LCOV_PATH} ${LCOV_IGNORE_ERRORS} -c -i -d . -o ${Coverage_NAME}.base
 
         # Run tests
         COMMAND ${Coverage_EXECUTABLE}
 
         # Capturing lcov counters and generating report
-        COMMAND ${LCOV_PATH} --directory . --capture --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info
+        COMMAND ${LCOV_PATH} ${LCOV_IGNORE_ERRORS} --directory . --capture --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info
         # add baseline counters
-        COMMAND ${LCOV_PATH} -a ${PROJECT_BINARY_DIR}/${Coverage_NAME}.base -a ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.total
-        COMMAND ${LCOV_PATH} --remove ${Coverage_NAME}.total ${COVERAGE_EXCLUDES} --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info.cleaned
-        COMMAND ${GENHTML_PATH} -o ${PROJECT_BINARY_DIR}/${Coverage_NAME} ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info.cleaned
+        COMMAND ${LCOV_PATH} ${LCOV_IGNORE_ERRORS} -a ${PROJECT_BINARY_DIR}/${Coverage_NAME}.base -a ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.total
+        COMMAND ${LCOV_PATH} ${LCOV_IGNORE_ERRORS} --remove ${Coverage_NAME}.total ${COVERAGE_EXCLUDES} --output-file ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info.cleaned
+        COMMAND ${GENHTML_PATH} ${LCOV_IGNORE_ERRORS} -o ${PROJECT_BINARY_DIR}/${Coverage_NAME} ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info.cleaned
         #COMMAND ${CMAKE_COMMAND} -E remove ${Coverage_NAME}.base ${Coverage_NAME}.info ${Coverage_NAME}.total ${PROJECT_BINARY_DIR}/${Coverage_NAME}.info.cleaned
 
         WORKING_DIRECTORY ${PROJECT_BINARY_DIR}

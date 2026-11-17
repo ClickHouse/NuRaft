@@ -113,6 +113,7 @@ raft_server::raft_server(context* ctx, const init_options& opt)
     , test_mode_flag_(opt.test_mode_flag_)
     , self_mark_down_(false)
     , excluded_from_the_quorum_(false)
+    , rejected_leader_term_(0)
     , sm_commit_notifier_target_idx_(0)
     , sm_commit_notifier_notified_idx_(0)
 {
@@ -1936,7 +1937,7 @@ void raft_server::handle_ext_resp(ptr<resp_msg>& resp, ptr<rpc_exception>& err) 
         handle_ext_resp_err(*err);
         return;
     }
-    p_db("type: %d, err %p\n", (int)resp->get_type(), err.get());
+    p_db("type: %d, err %s\n", (int)resp->get_type(), err ? "set" : "null");
 
     p_db( "Receive an extended %s message from peer %d with Result=%d, "
           "Term=%" PRIu64 ", NextIndex=%" PRIu64 "",
@@ -2065,9 +2066,9 @@ ulong raft_server::term_for_log(ulong log_idx) {
         p_lv(log_lv, "bad log_idx %" PRIu64 " for retrieving the term value, "
              "will ignore this log req", log_idx);
         if (last_snapshot) {
-            p_lv(log_lv, "last snapshot %p, log_idx %" PRIu64
+            p_lv(log_lv, "last snapshot log_idx %" PRIu64
                  ", snapshot last_log_idx %" PRIu64 "\n",
-                 last_snapshot.get(), log_idx, last_snapshot->get_last_log_idx());
+                 log_idx, last_snapshot->get_last_log_idx());
         }
         p_lv(log_lv, "log_store_->start_index() %" PRIu64, log_store_->start_index());
         //ctx_->state_mgr_->system_exit(raft_err::N19_bad_log_idx_for_term);

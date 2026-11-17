@@ -323,8 +323,8 @@ public:
         , crc_header_(0)
         , crc_from_msg_(0)
     {
-        p_tr( "asio rpc session created: %p. %s",
-              this,
+        p_tr( "asio rpc session created: %" PRIu64 ". %s",
+              session_id_,
               ssl_enabled_ ? "SSL ENABLED" : "UNSECURED" );
     }
 
@@ -333,7 +333,7 @@ public:
 public:
     ~rpc_session() {
         close_socket();
-        p_tr("asio rpc session destroyed: %p", this);
+        p_tr("asio rpc session destroyed: %" PRIu64, session_id_);
     }
 
 public:
@@ -1468,12 +1468,12 @@ public:
                                      std::placeholders::_2 ) );
 #endif
         }
-        p_ts("asio client created: %p id %" PRIu64 ". %s",
-             this, client_id_, ssl_enabled_ ? "SSL enabled" : "unsecured");
+        p_ts("asio client created: id %" PRIu64 ". %s",
+             client_id_, ssl_enabled_ ? "SSL enabled" : "unsecured");
     }
 
     virtual ~asio_rpc_client() {
-        p_ts("asio client destroyed: %p id %" PRIu64, this, client_id_);
+        p_ts("asio client destroyed: id %" PRIu64, client_id_);
         close_socket();
     }
 
@@ -1693,8 +1693,8 @@ public:
                            rpc_handler& when_done,
                            uint64_t send_timeout_ms) {
         if (abandoned_) {
-            p_er( "client %p to %s:%s is already stale (SSL %s)",
-                  this, host_.c_str(), port_.c_str(),
+            p_er( "client %" PRIu64 " to %s:%s is already stale (SSL %s)",
+                  client_id_, host_.c_str(), port_.c_str(),
                   ( ssl_enabled_ ? "enabled" : "disabled" ) );
             std::string err_msg = lstrfmt("abandoned client to %s").fmt(host_.c_str());
             handle_error(req, err_msg, when_done);
@@ -1706,8 +1706,8 @@ public:
 
         ptr<asio_rpc_client> self = this->shared_from_this();
         if (!socket().is_open()) {
-            p_ts( "socket %p to %s:%s is not opened yet",
-                  this, host_.c_str(), port_.c_str() );
+            p_ts( "socket %" PRIu64 " to %s:%s is not opened yet",
+                  client_id_, host_.c_str(), port_.c_str() );
 
             if (impl_->get_options().custom_resolver_) {
                 impl_->get_options().custom_resolver_(
@@ -1826,9 +1826,9 @@ private:
     void set_busy_flag(bool receive, bool busy) {
         bool& flag = receive ? receive_busy_ : send_busy_;
         if (flag == busy) {
-            p_ft("socket %p %s side is already %s, race "
+            p_ft("socket %" PRIu64 " %s side is already %s, race "
                  "happened on connection to %s:%s",
-                 this, receive ? "receive" : "send",
+                 client_id_, receive ? "receive" : "send",
                  busy ? "in use" : "idle", host_.c_str(), port_.c_str());
             assert(0);
         }
@@ -1947,8 +1947,8 @@ private:
         if (!err) {
             asio::ip::tcp::no_delay option(true);
             socket().set_option(option);
-            p_in( "%p connected to %s:%s (as a client)",
-                  this, host_.c_str(), port_.c_str() );
+            p_in( "client %" PRIu64 " connected to %s:%s (as a client)",
+                  client_id_, host_.c_str(), port_.c_str() );
             if (ssl_enabled_) {
 #ifdef SSL_LIBRARY_NOT_FOUND
                 assert(0); // Should not reach here.

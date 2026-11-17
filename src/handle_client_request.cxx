@@ -251,7 +251,7 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
             if (entry != commit_ret_elems_.end()) {
                 // Commit thread was faster than this.
                 elem = entry->second;
-                p_tr("commit thread was faster than this thread: %p", elem.get());
+                p_tr("commit thread was faster than this thread: %" PRIu64, last_idx);
             } else {
                 commit_ret_elems_.insert( std::make_pair(last_idx, elem) );
             }
@@ -282,8 +282,8 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
     } else {
         // Async replication:
         //   Immediately return with the result of pre-commit.
-        p_dv( "asynchronously replicated %" PRIu64 ", return value %p",
-              last_idx, ret_value.get() );
+        p_dv( "asynchronously replicated %" PRIu64 ", return value %s",
+              last_idx, ret_value ? "set" : "null" );
         resp->set_ctx(ret_value);
     }
 
@@ -338,7 +338,7 @@ void raft_server::log_uncommitted_log_entry_limit_rejection(uint64_t current_ent
 
 ptr<resp_msg> raft_server::handle_cli_req_callback(ptr<commit_ret_elem> elem,
                                                    ptr<resp_msg> resp) {
-    p_dv("commit_ret_cv %" PRIu64 " %p sleep", elem->idx_, &elem->awaiter_);
+    p_dv("commit_ret_cv %" PRIu64 " sleep", elem->idx_);
 
     // Will wake up after timeout.
     elem->awaiter_.wait_ms(ctx_->get_params()->client_req_timeout_);
@@ -361,13 +361,13 @@ ptr<resp_msg> raft_server::handle_cli_req_callback(ptr<commit_ret_elem> elem,
     }
 
     if (elem->result_code_ == cmd_result_code::OK) {
-        p_dv( "[OK] commit_ret_cv %" PRIu64 " wake up (%" PRIu64 " us), return value %p",
-              idx, elapsed_us, ret_value.get() );
+        p_dv( "[OK] commit_ret_cv %" PRIu64 " wake up (%" PRIu64 " us), return value %s",
+              idx, elapsed_us, ret_value ? "set" : "null" );
     } else {
         // Null `ret_value`, most likely timeout.
         p_wn( "[NOT OK] commit_ret_cv %" PRIu64 " wake up (%" PRIu64 " us), "
-              "return value %p, result code %d",
-              idx, elapsed_us, ret_value.get(), elem->result_code_ );
+              "return value %s, result code %d",
+              idx, elapsed_us, ret_value ? "set" : "null", elem->result_code_ );
         bool valid_leader = check_leadership_validity();
         if (valid_leader) {
             p_in("leadership is still valid");

@@ -791,6 +791,16 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
     return req;
 }
 
+// Make `resp` ask the leader not to rewind its `next_idx` and to slow down.
+static void deny_not_rewind(resp_msg& resp) {
+    resp_appendix appendix;
+    appendix.extra_order_ = resp_appendix::DO_NOT_REWIND;
+    resp.set_ctx( appendix.serialize() );
+
+    // Set the hint to a negative number to slow down the leader.
+    resp.set_next_batch_size_hint_in_bytes(-1);
+}
+
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     ptr<raft_params> params = ctx_->get_params();
@@ -856,6 +866,34 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
          req.get_src(), (int)req.get_type(), req.get_term(),
          req.get_last_log_idx(), req.log_entries().size(), req.get_commit_idx(),
          state_->get_term(), (int)role_);
+
+    // A term has only one leader. If the leader of this term tried to roll
+    // back committed logs, it is invalid for the whole term, so deny all its
+    // requests, including heartbeats and empty batches. Otherwise, the empty
+    // request sent after our `-1` hint would be accepted, and it would reset
+    // the election timer and set `leader_`, and the cluster could never elect
+    // a valid leader. Do this before any state change: a denied request must
+    // not mark the heartbeat alive (`update_target_priority`), as that makes
+    // this node reject pre-votes from the other nodes.
+    if ( rejected_leader_term_ &&
+         req.get_term() == rejected_leader_term_ ) {
+        static timer_helper invalid_leader_log_timer(1000 * 1000, true);
+        int invalid_leader_log_lv =
+            invalid_leader_log_timer.timeout_and_reset() ? L_WARN : L_TRACE;
+        p_lv( invalid_leader_log_lv,
+              "deny request from invalid leader %d of term %" PRIu64
+              ", it tried to roll back committed logs",
+              req.get_src(), req.get_term() );
+
+        ptr<resp_msg> invalid_leader_resp = cs_new<resp_msg>(
+            state_->get_term(),
+            msg_type::append_entries_response,
+            id_,
+            req.get_src(),
+            log_store_->next_slot() );
+        deny_not_rewind(*invalid_leader_resp);
+        return invalid_leader_resp;
+    }
 
     if (req.get_term() == state_->get_term()) {
         if (role_ == srv_role::candidate) {
@@ -1072,6 +1110,55 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         bool rollback_in_progress = false;
         if ( my_last_log_idx >= log_idx &&
              cnt < req.log_entries().size() ) {
+
+            // Raft's Log Matching and Leader Completeness properties mean a
+            // legitimate leader never rolls back an already committed entry
+            // (`sm_commit_index_` or `quick_commit_index_`). If the rollback
+            // point is at or before either, the sender is not a valid
+            // leader. Check this before any state below is changed.
+            if ( log_idx <= sm_commit_index_ ||
+                 log_idx <= quick_commit_index_ ) {
+                p_er( "refuse to roll back committed logs: rollback point %"
+                      PRIu64 " <= commit idx (quick %" PRIu64 ", sm %" PRIu64
+                      "), my last log idx %" PRIu64 ", log store start idx %"
+                      PRIu64 ", req src %d, req term %" PRIu64 ". keeping "
+                      "local data and denying the request; the sender is "
+                      "likely not a valid leader for this term, e.g. it "
+                      "restarted with an empty data directory, or it has a "
+                      "duplicated or mismatched server id",
+                      log_idx,
+                      quick_commit_index_.load(),
+                      sm_commit_index_.load(),
+                      my_last_log_idx,
+                      log_store_->start_index(),
+                      req.get_src(),
+                      req.get_term() );
+
+                cb_func::RejectedCommittedLogRollbackArgs reject_args
+                    ( log_idx,
+                      my_last_log_idx,
+                      quick_commit_index_.load(),
+                      sm_commit_index_.load(),
+                      log_store_->start_index(),
+                      req.get_src(),
+                      req.get_term() );
+                cb_func::Param reject_param(id_, leader_, req.get_src(), &reject_args);
+                ctx_->cb_func_.call(cb_func::RejectedCommittedLogRollback, &reject_param);
+
+                // Deny without changing state. `resp` is already
+                // not-accepted, with next_idx_ at our own log tail.
+                // All later requests of this term are denied by the early
+                // check at the top of this function.
+                rejected_leader_term_ = req.get_term();
+                deny_not_rewind(*resp);
+
+                // Do NOT restart the election timer: the sender is not a
+                // valid leader. This node must still time out and elect one
+                // that has all committed entries, or the cluster is stuck.
+
+                return resp;
+            }
+
             p_in( "rollback logs: %" PRIu64 " - %" PRIu64
                   ", commit idx req %" PRIu64 ", quick %" PRIu64 ", sm %" PRIu64 ", "
                   "num log entries %zu, current count %zu",
@@ -1098,23 +1185,6 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     }
                     pending_follower_resps_.clear();
                 }
-            }
-
-            // If rollback point is smaller than commit index,
-            // should rollback commit index as well
-            // (should not happen in Raft though).
-            if ( quick_commit_index_ >= log_idx ) {
-                p_wn( "rollback quick commit index from %" PRIu64 " to %" PRIu64,
-                      quick_commit_index_.load(),
-                      log_idx - 1 );
-                quick_commit_index_ = log_idx - 1;
-            }
-            if ( sm_commit_index_ >= log_idx ) {
-                p_er( "rollback sm commit index from %" PRIu64 " to %" PRIu64 ", "
-                      "it shouldn't happen and may indicate data loss",
-                      sm_commit_index_.load(),
-                      log_idx - 1 );
-                sm_commit_index_ = log_idx - 1;
             }
 
             for ( uint64_t ii = 0; ii < my_last_log_idx - log_idx + 1; ++ii ) {

@@ -324,8 +324,8 @@ void snapshot_io_mgr::drop_reqs(raft_server* r) {
         auto entry = queue_.begin();
         while (entry != queue_.end()) {
             if ((*entry)->raft_.get() == r) {
-                p_tr("drop snapshot request for peer %d, raft server %p",
-                     (*entry)->dst_->get_id(), r);
+                p_tr("drop snapshot request for peer %d",
+                     (*entry)->dst_->get_id());
                 reqs_to_drop.push_back(*entry);
                 entry = queue_.erase(entry);
             } else {
