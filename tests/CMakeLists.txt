@@ -1,17 +1,23 @@
 
 function(unit_test)
     set(options SKIP)
-    set(oneValueArgs NAME TIMEOUT)
+    set(oneValueArgs NAME TIMEOUT WORKING_DIRECTORY)
     set(multiValueArgs SOURCES)
     cmake_parse_arguments(PARSE_ARGV 0 arg
         "${options}" "${oneValueArgs}" "${multiValueArgs}"
     )
 
+    if(NOT arg_WORKING_DIRECTORY)
+        set(arg_WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    endif()
+
     add_executable(${arg_NAME} ${arg_SOURCES})
     target_link_libraries(${arg_NAME} ${LIBRARY_NAME})
     add_dependencies(${arg_NAME} build_ssl_key)
     if(NOT arg_SKIP)
-        add_test(NAME ${arg_NAME} WORKING_DIRECTORY ${CMAKE_BINARY_DIR} COMMAND ${arg_NAME} --abort-on-failure)
+        add_test(NAME ${arg_NAME}
+                 WORKING_DIRECTORY ${arg_WORKING_DIRECTORY}
+                 COMMAND ${arg_NAME} --abort-on-failure)
         if(arg_TIMEOUT)
             set_tests_properties(${arg_NAME} PROPERTIES TIMEOUT ${arg_TIMEOUT})
         endif()
@@ -32,6 +38,20 @@ unit_test(NAME raft_server_test
 unit_test(NAME slow_member_backpressure_test
     SOURCES
     unit/slow_member_backpressure_test.cxx
+    unit/fake_network.cxx
+    ${EXAMPLES_SRC}/logger.cc
+    ${EXAMPLES_SRC}/in_memory_log_store.cxx
+)
+
+# The test asserts on the contents of `./srv*.log`, which every test binary
+# in this directory writes to. Give it its own working directory, so that
+# a parallel `ctest -j` run of the other binaries cannot clobber the files.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/long_pause_warning_test)
+
+unit_test(NAME long_pause_warning_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/long_pause_warning_test
+    SOURCES
+    unit/long_pause_warning_test.cxx
     unit/fake_network.cxx
     ${EXAMPLES_SRC}/logger.cc
     ${EXAMPLES_SRC}/in_memory_log_store.cxx

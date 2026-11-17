@@ -403,7 +403,8 @@ bool raft_server::request_append_entries(ptr<peer> p) {
     if ( last_ts_ms > params->heart_beat_interval_ ) {
         // Waiting time becomes longer than HB interval, warning.
         p->inc_long_pause_warnings();
-        if (p->get_long_puase_warnings() < raft_server::raft_limits_.warning_limit_) {
+        int32 warnings = p->get_long_puase_warnings();
+        if ( warnings < raft_server::raft_limits_.warning_limit_ ) {
             p_wn("skipped sending msg to %d too long time, "
                  "last streamed idx: %" PRIu64 ", "
                  "next log idx: %" PRIu64 ", "
@@ -411,10 +412,28 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  "last msg sent %d ms ago",
                  p->get_id(), p->get_last_streamed_log_idx(),
                  p->get_next_log_idx(), p->get_bytes_in_flight(), last_ts_ms);
-        } else if ( p->get_long_puase_warnings() ==
-                        raft_server::raft_limits_.warning_limit_ ) {
-            p_wn("long pause warning to %d is too verbose, "
-                 "will suppress it from now", p->get_id());
+        } else {
+            // One more burst per re-arming interval,
+            // so a slow peer is not muted forever.
+            uint64_t suppress_start = p->get_long_pause_suppress_start_us();
+            if (suppress_start == 0) {
+                // The counter has just reached (or skipped) the limit.
+                p->set_long_pause_suppress_start_us(
+                    timer_helper::get_timeofday_us() );
+                if ( warnings == raft_server::raft_limits_.warning_limit_ ) {
+                    p_wn("long pause warning to %d is too verbose, "
+                         "will suppress it from now", p->get_id());
+                }
+            } else if ( warnings > raft_server::raft_limits_.warning_limit_ &&
+                        raft_server::raft_limits_.
+                            warning_rearm_interval_ms_ > 0 &&
+                        ( timer_helper::get_timeofday_us() - suppress_start ) /
+                            1000 >=
+                            raft_server::raft_limits_.
+                                warning_rearm_interval_ms_ ) {
+                p->reset_long_pause_warnings();
+                p->set_long_pause_suppress_start_us(0);
+            }
         }
     }
     return false;
@@ -424,28 +443,7 @@ bool raft_server::send_request(ptr<peer>& p,
                                ptr<req_msg>& msg,
                                rpc_handler& m_handler,
                                bool streaming) {
-    if (!p->is_manual_free()) {
-        // Actual recovery.
-        if ( p->get_long_puase_warnings() >=
-                    raft_server::raft_limits_.warning_limit_ ) {
-            int32 last_ts_ms = p->get_ls_timer_us() / 1000;
-            p->inc_recovery_cnt();
-            p_wn( "recovered from long pause to peer %d, %d warnings, "
-                    "%d ms, %d times",
-                    p->get_id(),
-                    p->get_long_puase_warnings(),
-                    last_ts_ms,
-                    p->get_recovery_cnt() );
-
-            if (p->get_recovery_cnt() >= 10) {
-                // Re-connect client, just in case.
-                //reconnect_client(*p);
-                p->reset_recovery_cnt();
-            }
-        }
-        p->reset_long_pause_warnings();
-
-    } else {
+    if (p->is_manual_free()) {
         // FIXME: `manual_free` is deprecated, need to get rid of it.
 
         // It means that this is not an actual recovery,

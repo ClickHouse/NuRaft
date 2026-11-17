@@ -10,6 +10,7 @@ set -e
 ./tests/leader_election_test --abort-on-failure
 ./tests/learner_new_joiner_test --abort-on-failure
 ./tests/failure_test --abort-on-failure
+./tests/long_pause_warning_test --abort-on-failure
 
 ASIO_TESTS=(
     "./tests/timer_test"
