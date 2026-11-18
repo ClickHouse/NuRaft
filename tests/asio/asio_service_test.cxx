@@ -1750,6 +1750,101 @@ int parallel_log_append_test() {
     return 0;
 }
 
+int parallel_log_append_early_commit_test() {
+    // Blocking mode (parallel log appending without streaming): a slow
+    // follower applies the leader's commit index for entries it already
+    // holds durably before it waits for the new entries of the same request,
+    // not one disk round later.
+    reset_log_files();
+
+    std::string s1_addr = "tcp://127.0.0.1:20010";
+    std::string s2_addr = "tcp://127.0.0.1:20020";
+    std::string s3_addr = "tcp://127.0.0.1:20030";
+
+    RaftAsioPkg s1(1, s1_addr);
+    RaftAsioPkg s2(2, s2_addr);
+    RaftAsioPkg s3(3, s3_addr);
+    std::vector<RaftAsioPkg*> pkgs = {&s1, &s2, &s3};
+
+    _msg("launching asio-raft servers\n");
+    CHK_Z( launch_servers(pkgs, false) );
+
+    _msg("organizing raft group\n");
+    CHK_Z( make_group(pkgs) );
+
+    // S2 is the slow follower. S1 and S3 form the quorum without it.
+    const size_t SLOW_DISK_MS = 1000;
+    s1.getTestMgr()->set_disk_delay(s1.raftServer.get(), 10);
+    s2.getTestMgr()->set_disk_delay(s2.raftServer.get(), SLOW_DISK_MS);
+    s3.getTestMgr()->set_disk_delay(s3.raftServer.get(), 10);
+
+    // `max_log_gap_in_stream_` is 0, so a follower blocks in
+    // `handle_append_entries` until the request's entries are durable.
+    for (auto& entry: pkgs) {
+        RaftAsioPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.parallel_log_appending_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    auto append_msg = [&](const std::string& str) -> int {
+        ptr<buffer> msg = buffer::alloc(str.size() + 1);
+        msg->put(str);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+        CHK_EQ( cmd_result_code::OK, ret->get_result_code() );
+        return 0;
+    };
+    auto wait_until = [](std::function<bool()> cond, size_t timeout_ms) {
+        TestSuite::Timer timer(timeout_ms);
+        while (!cond()) {
+            if (timer.timeout()) return false;
+            TestSuite::sleep_ms(10);
+        }
+        return true;
+    };
+
+    // Entry A is committed by S1 and S3. S2 appends it and blocks until it
+    // is durable, so the leader sends S2 nothing else until then.
+    CHK_Z( append_msg("entry_a") );
+    uint64_t a_idx = s1.raftServer->get_last_log_idx();
+    CHK_TRUE( wait_until( [&]() {
+                  return s2.raftServer->get_last_log_idx() >= a_idx;
+              }, SLOW_DISK_MS / 2 ) );
+
+    // Entry B is committed by S1 and S3. When S2 responds for A, the leader
+    // sends it B with a commit index that covers A.
+    CHK_Z( append_msg("entry_b") );
+    uint64_t b_idx = s1.raftServer->get_last_log_idx();
+    CHK_GT( b_idx, a_idx );
+    CHK_SM( s2.raftServer->get_committed_log_idx(), a_idx );
+
+    // S2 has appended B and now waits for it to become durable.
+    CHK_TRUE( wait_until( [&]() {
+                  return s2.raftServer->get_last_log_idx() >= b_idx;
+              }, SLOW_DISK_MS * 3 ) );
+
+    // S2 commits A without waiting for B to become durable.
+    CHK_TRUE( wait_until( [&]() {
+                  return s2.raftServer->get_committed_log_idx() >= a_idx;
+              }, SLOW_DISK_MS / 2 ) );
+    CHK_SM( s2.getTestMgr()->load_log_store()->last_durable_index(), b_idx );
+
+    // Once B is durable, S2 commits it as well.
+    CHK_TRUE( wait_until( [&]() {
+                  return s2.raftServer->get_committed_log_idx() >= b_idx;
+              }, SLOW_DISK_MS * 3 ) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    TestSuite::sleep_sec(1, "shutting down");
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
 int custom_resolver_test() {
     reset_log_files();
 
@@ -2249,6 +2344,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "parallel log append test",
                parallel_log_append_test );
+
+    ts.doTest( "parallel log append early commit test",
+               parallel_log_append_early_commit_test );
 
     ts.doTest( "custom resolver test",
                custom_resolver_test );
