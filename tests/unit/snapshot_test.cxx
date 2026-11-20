@@ -745,6 +745,80 @@ int snapshot_close_for_removed_peer_test() {
     return 0;
 }
 
+int snapshot_user_ctx_not_created_after_shutdown_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        // Set quorum to 1 so as to make S1 commits data locally.
+        param.custom_commit_quorum_size_ = 1;
+        param.custom_election_quorum_size_ = 1;
+        pp->raftServer->update_params(param);
+    }
+
+    const size_t NUM = 10;
+
+    // Append messages asynchronously.
+    std::list< ptr< cmd_result< ptr<buffer> > > > handlers;
+    for (size_t ii=0; ii<NUM; ++ii) {
+        std::string test_msg = "test" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr< cmd_result< ptr<buffer> > > ret =
+            s1.raftServer->append_entries( {msg} );
+
+        CHK_TRUE( ret->get_accepted() );
+
+        handlers.push_back(ret);
+    }
+    // Wait for bg commit.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Make req to S2 failed, S2 will need a snapshot.
+    s1.fNet->makeReqFailAll("S2");
+
+    // Before shutdown, a request to S2 starts a snapshot transfer
+    // and opens a user context.
+    ptr<req_msg> pre = s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 2);
+    CHK_NONNULL( pre.get() );
+    CHK_EQ( msg_type::install_snapshot_request, pre->get_type() );
+    CHK_EQ( (size_t)1, s1.getTestSm()->getNumOpenedUserCtxs() );
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 2) );
+
+    // Shutdown frees it.
+    s1.raftServer->shutdown();
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 2) );
+
+    // Work that runs after shutdown (e.g. a late peer response that
+    // advances the commit index) must not open a new one: nothing would free it.
+    ptr<req_msg> late = s1.fNet->createAppendEntriesReq(s1.raftServer.get(), 2);
+    CHK_NULL( late.get() );
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+    CHK_FALSE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 2) );
+
+    print_stats(pkgs);
+
+    s2.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int snapshot_leader_switch_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2983,6 +3057,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot close for removed peer test",
                snapshot_close_for_removed_peer_test );
+
+    ts.doTest( "snapshot user ctx not created after shutdown test",
+               snapshot_user_ctx_not_created_after_shutdown_test );
 
     ts.doTest( "snapshot leader switch test",
                snapshot_leader_switch_test );
