@@ -128,6 +128,8 @@ ptr<req_msg> raft_server::create_sync_snapshot_req(ptr<peer>& pp,
                                                    ulong commit_idx,
                                                    bool& succeeded_out) {
     succeeded_out = false;
+    // `shutdown()` frees the peers' user snapshot contexts once; a new one would leak.
+    if (stopping_) return ptr<req_msg>();
     peer& p = *pp;
     ptr<raft_params> params = ctx_->get_params();
     std::unique_lock<std::mutex> guard(p.get_lock());
