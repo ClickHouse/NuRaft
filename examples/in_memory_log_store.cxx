@@ -286,6 +286,29 @@ bool inmem_log_store::compact(ulong last_log_index) {
     return true;
 }
 
+bool inmem_log_store::discard_all(ulong last_log_index) {
+    std::lock_guard<std::mutex> l(logs_lock_);
+    // Keep the dummy entry for index 0.
+    auto itr = logs_.upper_bound(0);
+    while (itr != logs_.end()) {
+        itr = logs_.erase(itr);
+    }
+    start_idx_ = last_log_index + 1;
+
+    auto entry = disk_emul_logs_being_written_.begin();
+    while (entry != disk_emul_logs_being_written_.end()) {
+        if (entry->second > last_log_index) {
+            entry = disk_emul_logs_being_written_.erase(entry);
+        } else {
+            entry++;
+        }
+    }
+    if (disk_emul_last_durable_index_ > last_log_index) {
+        disk_emul_last_durable_index_ = last_log_index;
+    }
+    return true;
+}
+
 bool inmem_log_store::flush() {
     disk_emul_last_durable_index_ = next_slot() - 1;
     return true;

@@ -828,7 +828,42 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
               ") from leader",
               req.get_snapshot().get_last_log_idx(),
               req.get_snapshot().get_last_log_term() );
-        if (log_store_->compact(req.get_snapshot().get_last_log_idx())) {
+
+        // Raft keeps the log entries following the snapshot only if the log
+        // has an entry with the snapshot's last index and term.
+        ulong snp_idx = req.get_snapshot().get_last_log_idx();
+        ulong snp_term = req.get_snapshot().get_last_log_term();
+        bool log_ready = false;
+        if ( snp_idx >= log_store_->next_slot() ||
+             term_for_log(snp_idx) == snp_term ) {
+            log_ready = log_store_->compact(snp_idx);
+        } else {
+            ulong last_idx = log_store_->next_slot() - 1;
+            p_wn( "log entry %" PRIu64 " has term %" PRIu64 ", snapshot term %"
+                  PRIu64 ", discard all logs %" PRIu64 " - %" PRIu64,
+                  snp_idx, term_for_log(snp_idx), snp_term,
+                  log_store_->start_index(), last_idx );
+
+            ptr<std::vector<ptr<log_entry>>> suffix;
+            if (last_idx > snp_idx) {
+                suffix = log_store_->log_entries(snp_idx + 1, last_idx + 1);
+            }
+            if ( last_idx > snp_idx &&
+                 (!suffix || suffix->size() != last_idx - snp_idx) ) {
+                p_er( "failed to read logs %" PRIu64 " - %" PRIu64
+                      " to roll back", snp_idx + 1, last_idx );
+            } else if (log_store_->discard_all(snp_idx)) {
+                log_ready = true;
+                fail_pending_follower_resps();
+                for (ulong idx = last_idx; idx > snp_idx; --idx) {
+                    rollback_log_entry(idx, (*suffix)[idx - snp_idx - 1]);
+                }
+                // The log is empty, so there is no uncommitted config.
+                config_changing_ = false;
+            }
+        }
+
+        if (log_ready) {
             // The state machine will not be able to commit anything before the
             // snapshot is applied, so make this synchronously with election
             // timer stopped as usually applying a snapshot may take a very

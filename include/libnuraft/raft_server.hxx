@@ -1151,6 +1151,9 @@ protected:
     bool handle_snapshot_sync_req(snapshot_sync_req& req,
                                   std::unique_lock<std::recursive_mutex>& guard);
 
+    void fail_pending_follower_resps();
+    void rollback_log_entry(ulong idx, ptr<log_entry>& entry);
+
     bool check_cond_for_zp_election();
     void request_prevote();
     void initiate_vote(bool force_vote = false);

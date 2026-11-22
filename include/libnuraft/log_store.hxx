@@ -214,6 +214,26 @@ public:
     }
 
     /**
+     * (Optional)
+     * Purge all log entries, so that both `start_index` and `next_slot`
+     * return `last_log_index + 1`.
+     *
+     * Called instead of `compact` when a snapshot received from the leader
+     * is installed while the local log entry at `last_log_index` has a
+     * different term than the snapshot.
+     *
+     * The default implementation returns `false`, which declines the
+     * snapshot installation.
+     *
+     * @param last_log_index Last log index of the installed snapshot.
+     * @return `true` on success.
+     */
+    virtual bool discard_all(ulong last_log_index) {
+        (void)last_log_index;
+        return false;
+    }
+
+    /**
      * Synchronously flush all log entries in this log store to the backing storage
      * so that all log entries are guaranteed to be durable upon process crash.
      *
