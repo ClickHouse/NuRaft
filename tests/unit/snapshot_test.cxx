@@ -1532,6 +1532,131 @@ int snapshot_append_rejection_compacted_boundary_test() {
     return 0;
 }
 
+// Delivers the requests to `ep` and handles the responses until both queues
+// are empty. Returns the number of steps, or -1 if `max_steps` is reached.
+static int drain_peer(RaftPkg& leader, const std::string& ep, size_t max_steps) {
+    for (size_t steps = 0; steps < max_steps; ++steps) {
+        bool delivered = leader.fNet->delieverReqTo(ep);
+        bool handled = leader.fNet->handleRespFrom(ep);
+        if (!delivered && !handled) return (int)steps;
+    }
+    return -1;
+}
+
+int snapshot_stops_stream_mode_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        if (pp->raftServer->get_id() == 1) {
+            param.max_log_gap_in_stream_ = 3;
+        }
+        pp->raftServer->update_params(param);
+    }
+
+    // S3 is replicated in stream mode.
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 1) );
+    CHK_GT( drain_peer(s1, "S2", 100), -1 );
+    CHK_GT( drain_peer(s1, "S3", 100), -1 );
+    CHK_GT( s1.fNet->getPeer(s1.raftServer.get(), 3)->get_last_streamed_log_idx(),
+            0 );
+    CHK_Z( s1.fNet->getNumPendingReqs("S3") );
+
+    // S3 stops responding: its stream stops at the gap, while S1 commits
+    // with S2 and compacts its log past the last streamed entry.
+    size_t next_msg = 1;
+    auto append_without_s3 = [&]() -> int {
+        ptr<raft_result> ret = s1.raftServer->append_entries(
+            { make_test_msg("test" + std::to_string(next_msg++)) } );
+        CHK_TRUE( ret->get_accepted() );
+        CHK_GT( drain_peer(s1, "S2", 100), -1 );
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        return 0;
+    };
+    for (size_t ii = 0; ii < 30; ++ii) {
+        CHK_Z( append_without_s3() );
+        if (s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3)) break;
+    }
+    CHK_TRUE( s1.fNet->hasPeerSnapshotSyncCtx(s1.raftServer.get(), 3) );
+    size_t pending_at_snapshot = s1.fNet->getNumPendingReqs("S3");
+
+    // While the snapshot request is in flight, appends and heartbeats must
+    // not send S3 more snapshot requests.
+    raft_params s1_params = s1.raftServer->get_current_params();
+    s1_params.snapshot_distance_ = 100;
+    s1.raftServer->update_params(s1_params);
+    for (size_t ii = 0; ii < 5; ++ii) {
+        CHK_Z( append_without_s3() );
+    }
+    for (size_t ii = 0; ii < 3; ++ii) {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        CHK_GT( drain_peer(s1, "S2", 100), -1 );
+    }
+    int64_t piled = (int64_t)s1.fNet->getNumPendingReqs("S3") -
+                    (int64_t)pending_at_snapshot;
+
+    // S3 comes back: it gets one snapshot, then catches up through the log.
+    int steps = -1;
+    size_t useless_snapshot_reqs = 0;
+    for (int ii = 0; ii < 500; ++ii) {
+        ptr<req_msg> req = s1.fNet->getFirstPendingReq("S3");
+        if ( req &&
+             req->get_type() == msg_type::install_snapshot_request &&
+             req->get_last_log_idx() <= s3.raftServer->get_committed_log_idx() ) {
+            // S3 already has this snapshot, so it declines it.
+            useless_snapshot_reqs++;
+        }
+        bool delivered = s1.fNet->delieverReqTo("S3");
+        bool handled = s1.fNet->handleRespFrom("S3");
+        if (!delivered && !handled) {
+            steps = ii;
+            break;
+        }
+    }
+    int sm_exec_rc = wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC);
+
+    _msg("steps %d, useless snapshot requests %zu, piled snapshot requests %lld\n",
+         steps, useless_snapshot_reqs, (long long)piled);
+    CHK_GT( steps, -1 );
+    CHK_Z( sm_exec_rc );
+    CHK_EQ( s1.getTestMgr()->get_inmem_log_store()->next_slot(),
+            s3.getTestMgr()->get_inmem_log_store()->next_slot() );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_Z( useless_snapshot_reqs );
+    CHK_Z( piled );
+    CHK_GT( s1.fNet->getPeer(s1.raftServer.get(), 3)->get_last_streamed_log_idx(),
+            0 );
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int append_rejection_unmarked_ahead_next_index_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3004,6 +3129,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot append rejection compacted boundary test",
                snapshot_append_rejection_compacted_boundary_test );
+
+    ts.doTest( "snapshot stops stream mode test",
+               snapshot_stops_stream_mode_test );
 
     ts.doTest( "append rejection unmarked ahead next index test",
                append_rejection_unmarked_ahead_next_index_test );
