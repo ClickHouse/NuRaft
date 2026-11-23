@@ -51,6 +51,7 @@ public:
 
     ulong get_offset() const { return offset_; }
     void set_offset(const ulong src) { offset_ = src; }
+    void set_done(bool src) { done_ = src; }
 
     buffer& get_data() const { return *data_; }
 

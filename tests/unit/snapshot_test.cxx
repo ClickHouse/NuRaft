@@ -296,6 +296,166 @@ int snapshot_new_member_restart_test() {
     return 0;
 }
 
+int snapshot_restart_on_last_object_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    // S3 lags behind while S1 creates a snapshot and compacts its log.
+    for (size_t ii = 0; ii < 10; ++ii) {
+        ptr<raft_result> ret = s1.raftServer->append_entries(
+            { make_test_msg("test" + std::to_string(ii)) } );
+        CHK_TRUE( ret->get_accepted() );
+        s1.fNet->execReqResp("S2"); // replication.
+        s1.fNet->execReqResp("S2"); // commit.
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    s1.fNet->makeReqFailAll("S3");
+    CHK_NONNULL( s1.getTestSm()->last_snapshot().get() );
+    CHK_GT( s1.getTestMgr()->get_inmem_log_store()->start_index(),
+            s3.getTestMgr()->get_inmem_log_store()->next_slot() );
+
+    // Transfer the snapshot to S3, stop before its last object is delivered.
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    ulong snp_idx = 0;
+    size_t num_objs = 0;
+    for (size_t steps = 0; ; ++steps) {
+        CHK_SM( steps, 100 );
+        ptr<snapshot_sync_ctx> ctx =
+            s1.fNet->getPeer(s1.raftServer.get(), 3)->get_snapshot_sync_ctx();
+        ptr<req_msg> req = s1.fNet->getFirstPendingReq("S3");
+        bool is_snp_req =
+            req && req->get_type() == msg_type::install_snapshot_request;
+        if ( ctx && is_snp_req && ctx->get_offset() > 0 &&
+             ctx->get_offset() == ctx->get_snapshot()->get_last_log_idx() ) {
+            snp_idx = ctx->get_snapshot()->get_last_log_idx();
+            break;
+        }
+        if (!req) {
+            s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+            continue;
+        }
+        if (is_snp_req) num_objs++;
+        CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+        CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+    }
+    CHK_GTEQ( num_objs, 2 );
+    CHK_TRUE( s3.raftServer->is_receiving_snapshot() );
+
+    // S3 restarts and loses its receive in progress,
+    // while S1 keeps the transfer at the last object.
+    s1.dbgLog(" --- shutting down S3 ---");
+    s3.raftServer->shutdown();
+    s3.fNet->shutdown();
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s3.getTestSm()->setSnpObjRestart(1);
+    CHK_Z( launch_servers( {&s3},
+                           /* custom_params = */ nullptr,
+                           /* restart = */ true ) );
+    s1.dbgLog(" --- restarted S3 ---");
+
+    ptr<snapshot_sync_ctx> kept_ctx =
+        s1.fNet->getPeer(s1.raftServer.get(), 3)->get_snapshot_sync_ctx();
+    CHK_NONNULL( kept_ctx.get() );
+    CHK_EQ( snp_idx, kept_ctx->get_offset() );
+    ulong start_before = s3.getTestMgr()->get_inmem_log_store()->start_index();
+    uint64_t applies_before = s3.getTestSm()->getNumSnapshotApplies();
+
+    // S1 resumes the transfer with the last object.
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    for (size_t steps = 0; ; ++steps) {
+        CHK_SM( steps, 20 );
+        ptr<req_msg> req = s1.fNet->getFirstPendingReq("S3");
+        if (req && req->get_type() == msg_type::install_snapshot_request) break;
+        if (!req) {
+            s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+            continue;
+        }
+        CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+        CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+    }
+    ptr<req_msg> last_req = s1.fNet->getFirstPendingReq("S3");
+    CHK_EQ( 1, last_req->log_entries().size() );
+    ptr<snapshot_sync_req> last_obj =
+        snapshot_sync_req::deserialize( last_req->log_entries()[0]->get_buf() );
+    CHK_TRUE( last_obj->is_done() );
+    CHK_EQ( snp_idx, last_obj->get_offset() );
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+
+    _msg( "snapshot idx %zu, S3 applies %zu -> %zu, S3 log start %zu -> %zu\n",
+          (size_t)snp_idx,
+          (size_t)applies_before,
+          (size_t)s3.getTestSm()->getNumSnapshotApplies(),
+          (size_t)start_before,
+          (size_t)s3.getTestMgr()->get_inmem_log_store()->start_index() );
+
+    // S3 did not install the snapshot whose last object it asked to resend.
+    CHK_EQ( applies_before, s3.getTestSm()->getNumSnapshotApplies() );
+    CHK_EQ( start_before, s3.getTestMgr()->get_inmem_log_store()->start_index() );
+
+    // S1 does not credit S3 with the snapshot.
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+    ulong matched_idx =
+        s1.fNet->getPeer(s1.raftServer.get(), 3)->get_matched_idx();
+    _msg( "S1 matched idx of S3 %zu\n", (size_t)matched_idx );
+    CHK_SM( matched_idx, snp_idx );
+    // S1 restarts the transfer from the first object instead of handling a decline.
+    CHK_Z( kept_ctx->get_offset() );
+
+    // S1 transfers a snapshot again and S3 catches up.
+    for (size_t steps = 0; ; ++steps) {
+        CHK_SM( steps, 500 );
+        if ( !s3.raftServer->is_receiving_snapshot() &&
+             !s1.fNet->getNumPendingReqs("S3") &&
+             !s1.fNet->getNumPendingResps("S3") ) {
+            break;
+        }
+        if (!s1.fNet->getNumPendingReqs("S3")) {
+            s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        }
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_EQ( s1.getTestMgr()->get_inmem_log_store()->next_slot(),
+            s3.getTestMgr()->get_inmem_log_store()->next_slot() );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_EQ( applies_before + 1, s3.getTestSm()->getNumSnapshotApplies() );
+    CHK_Z( s1.getTestSm()->getNumOpenedUserCtxs() );
+
+    print_stats(pkgs);
+
+    s1.fNet->makeReqFailAll("S2");
+    s1.fNet->makeReqFailAll("S3");
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int snapshot_manual_creation_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2968,6 +3128,9 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot new member restart test",
                snapshot_new_member_restart_test );
+
+    ts.doTest( "snapshot restart on last object test",
+               snapshot_restart_on_last_object_test );
 
     ts.doTest( "snapshot manual creation test",
                snapshot_manual_creation_test );

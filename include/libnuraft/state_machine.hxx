@@ -206,6 +206,9 @@ public:
      *     As a result of this API call, the next object ID
      *     that reciever wants to get should be set to
      *     this parameter.
+     *     Setting it to 0 for any object but the first
+     *     restarts the transfer from the first object,
+     *     without applying the snapshot.
      * @param data Payload of given object.
      * @param is_first_obj `true` if this is the first object.
      * @param is_last_obj `true` if this is the last object.

@@ -56,7 +56,9 @@ public:
         , lastCommittedConfigIdx(0)
         , targetSnpReadFailures(0)
         , snpDelayMs(0)
+        , targetSnpObjRestarts(0)
         , numSnapshotCreations(0)
+        , numSnapshotApplies(0)
         , myLog(logger)
     {
         (void)myLog;
@@ -103,6 +105,14 @@ public:
             TestSuite::sleep_ms(snpDelayMs);
         }
 
+        if (!is_first_obj && targetSnpObjRestarts > 0) {
+            // Like a state machine that lost its receive in progress:
+            // ask to restart the transfer.
+            targetSnpObjRestarts--;
+            obj_id = 0;
+            return;
+        }
+
         if (obj_id == 0) {
             // Special object containing metadata.
             // Request next object.
@@ -143,6 +153,7 @@ public:
         // NOTE: We only handle logical snapshot.
         ptr<buffer> snp_buf = s.serialize();
         lastSnapshot = snapshot::deserialize(*snp_buf);
+        numSnapshotApplies++;
         return true;
     }
 
@@ -379,6 +390,10 @@ public:
         snpDelayMs = delay_ms;
     }
 
+    void setSnpObjRestart(int num) {
+        targetSnpObjRestarts = num;
+    }
+
     void setServersForCommit(const std::list<int>& src) {
         std::lock_guard<std::mutex> l(serversForCommitLock);
         serversForCommit = src;
@@ -386,6 +401,10 @@ public:
 
     uint64_t getNumSnapshotCreations() const {
         return numSnapshotCreations;
+    }
+
+    uint64_t getNumSnapshotApplies() const {
+        return numSnapshotApplies;
     }
 
 private:
@@ -405,6 +424,8 @@ private:
 
     std::atomic<size_t> snpDelayMs;
 
+    std::atomic<int> targetSnpObjRestarts;
+
     std::set<void*> openedUserCtxs;
     mutable std::mutex openedUserCtxsLock;
 
@@ -415,6 +436,8 @@ private:
     mutable std::mutex serversForCommitLock;
 
     std::atomic<uint64_t> numSnapshotCreations;
+
+    std::atomic<uint64_t> numSnapshotApplies;
 
     SimpleLogger* myLog;
 };
