@@ -862,6 +862,19 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     } _s_req(&serving_req_);
     timer_helper tt;
 
+    // Cumulative time spent on log store operations (storing entries
+    // and waiting for them to become durable), for the warning below.
+    uint64_t log_store_time_us = 0;
+    struct LogStoreTimer {
+        LogStoreTimer(uint64_t* total_us)
+            : total_us_(total_us), start_us_(timer_helper::get_timeofday_us()) {}
+        ~LogStoreTimer() {
+            *total_us_ += timer_helper::get_timeofday_us() - start_us_;
+        }
+        uint64_t* total_us_;
+        uint64_t start_us_;
+    };
+
     p_ts("from peer %d, req type: %d, req term: %" PRIu64 ", "
          "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
          "my term: %" PRIu64 ", my role: %d\n",
@@ -1224,7 +1237,10 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
             p_in("overwrite at %" PRIu64 ", term %" PRIu64 ", timestamp %" PRIu64 "\n",
 
                  log_idx, entry->get_term(), entry->get_timestamp());
-            store_log_entry(entry, log_idx);
+            {
+                LogStoreTimer ls_tm(&log_store_time_us);
+                store_log_entry(entry, log_idx);
+            }
 
             if (entry->get_val_type() == log_val_type::app_log) {
                 ptr<buffer> buf = entry->get_buf_ptr();
@@ -1259,7 +1275,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
             p_tr("append at %" PRIu64 ", term %" PRIu64 "\n",
                  log_store_->next_slot(), entry->get_term());
-            ulong idx_for_entry = store_log_entry(entry);
+            ulong idx_for_entry;
+            {
+                LogStoreTimer ls_tm(&log_store_time_us);
+                idx_for_entry = store_log_entry(entry);
+            }
             if (entry->get_val_type() == log_val_type::conf) {
                 p_in( "receive a config change from leader at %" PRIu64,
                       idx_for_entry );
@@ -1276,8 +1296,11 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
         }
 
         // End of batch.
-        log_store_->end_of_append_batch( req.get_last_log_idx() + 1,
-                                         req.log_entries().size() );
+        {
+            LogStoreTimer ls_tm(&log_store_time_us);
+            log_store_->end_of_append_batch( req.get_last_log_idx() + 1,
+                                             req.log_entries().size() );
+        }
 
         if (params->parallel_log_appending_) {
             ulong required_durable =
@@ -1307,6 +1330,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     resp->set_async_cb([promise]() { return promise; });
                 }
             } else {
+                LogStoreTimer ls_tm(&log_store_time_us);
                 uint64_t last_durable_index = log_store_->last_durable_index();
                 while ( last_durable_index < required_durable ) {
                     if (stopping_) return resp;
@@ -1401,11 +1425,13 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     int32 time_ms = tt.get_us() / 1000;
     if (time_ms >= ctx_->get_params()->heart_beat_interval_) {
         // Append entries took longer than HB interval. Warning.
-        p_wn("appending entries from peer %d took long time (%d ms)\n"
+        p_wn("appending entries from peer %d took long time (%d ms), "
+             "log_store %d ms\n"
              "req type: %d, req term: %" PRIu64 ", "
              "req l idx: %" PRIu64 " (%zu), req c idx: %" PRIu64 ", "
              "my term: %" PRIu64 ", my role: %d",
-             req.get_src(), time_ms, (int)req.get_type(), req.get_term(),
+             req.get_src(), time_ms, (int32)(log_store_time_us / 1000),
+             (int)req.get_type(), req.get_term(),
              req.get_last_log_idx(), req.log_entries().size(), req.get_commit_idx(),
              state_->get_term(), (int)role_);
     }
