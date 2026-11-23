@@ -862,15 +862,12 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     } _s_req(&serving_req_);
     timer_helper tt;
 
-    // Cumulative time spent on log store operations (storing entries
-    // and waiting for them to become durable), for the warning below.
     uint64_t log_store_time_us = 0;
     struct LogStoreTimer {
         LogStoreTimer(uint64_t* total_us)
-            : total_us_(total_us), start_us_(timer_helper::get_timeofday_us()) {}
-        ~LogStoreTimer() {
-            *total_us_ += timer_helper::get_timeofday_us() - start_us_;
-        }
+            : total_us_(total_us)
+            , start_us_(timer_helper::get_timeofday_us()) {}
+        ~LogStoreTimer() { *total_us_ += timer_helper::get_timeofday_us() - start_us_; }
         uint64_t* total_us_;
         uint64_t start_us_;
     };
