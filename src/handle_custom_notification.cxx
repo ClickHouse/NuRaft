@@ -215,6 +215,13 @@ ptr<resp_msg> raft_server::handle_out_of_log_msg(req_msg& req,
     static timer_helper msg_timer(5000000);
     int log_lv = msg_timer.timeout_and_reset() ? L_WARN : L_TRACE;
 
+    if (req.get_term() < state_->get_term()) {
+        p_wn("ignore out of log range warning from %d with stale term %" PRIu64
+             ", my term %" PRIu64,
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     // As it is a special form of heartbeat, need to update term.
     update_term(req.get_term());
 
@@ -245,6 +252,13 @@ ptr<resp_msg> raft_server::handle_leadership_takeover
                              ptr<custom_notification_msg> msg,
                              ptr<resp_msg> resp )
 {
+    if (req.get_term() < state_->get_term()) {
+        p_wn("ignore leadership takeover request from %d with stale term %" PRIu64
+             ", my term %" PRIu64,
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     if (is_leader()) {
         p_er("got leadership takeover request from peer %d, "
              "I'm already a leader", req.get_src());
