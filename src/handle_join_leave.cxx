@@ -166,7 +166,8 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
-    // A server alone in its configuration forms its own cluster: its term is unrelated to the sender's.
+    // A server alone in its configuration forms its own cluster:
+    // its term is unrelated to the sender's.
     ptr<cluster_config> my_conf = get_config();
     bool own_cluster = my_conf->get_servers().size() == 1 && my_conf->get_server(id_);
     if (!own_cluster && req.get_term() < state_->get_term()) {
