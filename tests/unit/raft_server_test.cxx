@@ -1748,6 +1748,164 @@ int priority_v2_test() {
     return 0;
 }
 
+int auto_forwarding_to_leader_missing_from_config_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+    std::vector<RaftPkg*> all_pkgs = {&s1, &s2, &s3, &s4};
+
+    // No snapshots: S3 can learn about S4 only from the log.
+    raft_params custom_params;
+    custom_params.election_timeout_lower_bound_ = 0;
+    custom_params.election_timeout_upper_bound_ = 1000;
+    custom_params.heart_beat_interval_ = 500;
+    custom_params.snapshot_distance_ = 100;
+    CHK_Z( launch_servers( pkgs, &custom_params ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    // S3 misses some logs.
+    s3.fNet->goesOffline();
+    for (size_t ii = 0; ii < 5; ++ii) {
+        ptr<raft_result> ret = append_one(s1, 8);
+        CHK_TRUE( ret->get_accepted() );
+    }
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Add S4 while S3 is offline.
+    CHK_Z( launch_servers( {&s4}, &custom_params ) );
+    s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(all_pkgs, COMMIT_TIMEOUT_SEC) );
+
+    {
+        raft_params param = s4.raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        // One entry per request, so S3 follows S4 before it gets the config adding S4.
+        param.max_append_size_ = 1;
+        s4.raftServer->update_params(param);
+    }
+    CHK_EQ( 4, s1.raftServer->get_config()->get_servers().size() );
+    CHK_EQ( 4, s4.raftServer->get_config()->get_servers().size() );
+    CHK_EQ( 3, s3.raftServer->get_config()->get_servers().size() );
+
+    // S4 becomes the leader.
+    s1.raftServer->yield_leadership(false, s4.myId);
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s4.fNet->execReqResp();
+    CHK_TRUE( s4.raftServer->is_leader() );
+    s4.fNet->execReqResp();
+    s4.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(all_pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Nothing from the old leader can reach S3 later.
+    CHK_Z( s1.fNet->getNumPendingReqs("S3") );
+    CHK_Z( s2.fNet->getNumPendingReqs("S3") );
+    CHK_Z( s4.fNet->getNumPendingReqs("S3") );
+
+    // S3 follows S4 before it commits the config that adds S4.
+    s3.fNet->goesOnline();
+    for (size_t ii = 0; ii < 20 && s3.raftServer->get_leader() != 4; ++ii) {
+        s4.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s4.fNet->execReqResp();
+    }
+    CHK_EQ( 4, s3.raftServer->get_leader() );
+    CHK_NULL( s3.raftServer->get_srv_config(4).get() );
+
+    ptr<raft_result> ret = append_one(s3, 8);
+    CHK_FALSE( ret->get_accepted() );
+    CHK_EQ( cmd_result_code::NOT_LEADER, ret->get_result_code() );
+
+    // Forwarding works once S3 commits the config.
+    for (size_t ii = 0; ii < 30 && !s3.raftServer->get_srv_config(4); ++ii) {
+        s4.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s4.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(all_pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_NONNULL( s3.raftServer->get_srv_config(4).get() );
+
+    ret = append_one(s3, 8);
+    s3.fNet->execReqResp();
+    CHK_TRUE( ret->get_accepted() );
+    CHK_EQ( cmd_result_code::OK, ret->get_result_code() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int auto_forwarding_client_creation_failure_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        // A leaked connection slot would queue the next request.
+        param.auto_forwarding_max_connections_ = 1;
+        pp->raftServer->update_params(param);
+    }
+
+    // S2 cannot create a client to the leader.
+    f_base->removeNetwork("S1");
+    for (size_t ii = 0; ii < 2; ++ii) {
+        ptr<raft_result> ret = append_one(s2, 8);
+        CHK_TRUE( ret->has_result() );
+        CHK_FALSE( ret->get_accepted() );
+        CHK_EQ( cmd_result_code::NOT_LEADER, ret->get_result_code() );
+    }
+
+    f_base->addNetwork(s1.fNet);
+    ptr<raft_result> ret = append_one(s2, 8);
+    s2.fNet->execReqResp();
+    CHK_TRUE( ret->get_accepted() );
+    CHK_EQ( cmd_result_code::OK, ret->get_result_code() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int priority_broadcast_with_live_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3073,6 +3231,12 @@ int main(int argc, char** argv) {
 
     ts.doTest( "priority v2 test",
                priority_v2_test );
+
+    ts.doTest( "auto forwarding to leader missing from config test",
+               auto_forwarding_to_leader_missing_from_config_test );
+
+    ts.doTest( "auto forwarding client creation failure test",
+               auto_forwarding_client_creation_failure_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
