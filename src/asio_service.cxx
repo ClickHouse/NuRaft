@@ -2155,6 +2155,17 @@ private:
         ulong nxt_idx = bs.get_u64();
         byte accepted_val = bs.get_u8();
         int32 carried_data_size = bs.get_i32();
+        if ( carried_data_size < 0 ||
+             ( carried_data_size == 0 &&
+               ( flags & (INCLUDE_META | INCLUDE_HINT | INCLUDE_RESULT_CODE) ) ) ) {
+            receive_timer_.cancel();
+            std::string err_msg = sstrfmt( "bad data size %d in response from "
+                                           "peer %d, %s:%s" )
+                                           .fmt( carried_data_size, req->get_dst(),
+                                                 host_.c_str(), port_.c_str() );
+            handle_error(req, err_msg, when_done);
+            return;
+        }
         ptr<resp_msg> rsp
             ( cs_new<resp_msg>
               ( term, (msg_type)msg_type_val, src, dst,
@@ -2230,12 +2241,28 @@ private:
 
         // Otherwise: buffer contains composite data.
         buffer_serializer bs(ctx_buf);
-        int remaining_len = ctx_buf->size();
+        auto fits = [&bs](size_t len) { return len <= bs.size() - bs.pos(); };
+        auto reject = [&](const char* what) {
+            receive_timer_.cancel();
+            std::string err_msg = sstrfmt( "malformed %s in response from "
+                                           "peer %d, %s:%s" )
+                                           .fmt( what, req->get_dst(),
+                                                 host_.c_str(), port_.c_str() );
+            handle_error(req, err_msg, when_done);
+        };
 
         // 1) Custom meta.
         if (flags & INCLUDE_META) {
-            size_t resp_meta_len = 0;
-            void* resp_meta_raw = bs.get_bytes(resp_meta_len);
+            if (!fits(sizeof(int32))) {
+                reject("meta");
+                return;
+            }
+            size_t resp_meta_len = bs.get_u32();
+            if (!fits(resp_meta_len)) {
+                reject("meta");
+                return;
+            }
+            void* resp_meta_raw = bs.get_raw(resp_meta_len);
 
             // If callback is given, verify meta
             // (if meta is empty, invoke callback according to the flag).
@@ -2252,36 +2279,44 @@ private:
                     return;
                 }
             }
-            remaining_len -= sizeof(int32) + resp_meta_len;
         }
 
         // 2) Hint.
         if (flags & INCLUDE_HINT) {
+            if (!fits(sizeof(uint16_t) * 2)) {
+                reject("hint");
+                return;
+            }
             size_t hint_len = 0;
             uint16_t hint_version = bs.get_u16();
             (void)hint_version;
             hint_len = bs.get_u16();
+            if (hint_len < sizeof(int64) || !fits(hint_len)) {
+                reject("hint");
+                return;
+            }
             rsp->set_next_batch_size_hint_in_bytes(bs.get_i64());
-            remaining_len -= sizeof(uint16_t) * 2 + hint_len;
+            // Skip the bytes a newer writer may append to the hint.
+            bs.pos(bs.pos() + hint_len - sizeof(int64));
         }
 
         // 3) Context.
-        assert(remaining_len >= 0);
-        size_t ctx_len = remaining_len;
-        if (flags & INCLUDE_RESULT_CODE) {
-            ctx_len -= sizeof(int32_t);
+        size_t result_code_len =
+            (flags & INCLUDE_RESULT_CODE) ? sizeof(int32_t) : 0;
+        if (!fits(result_code_len)) {
+            reject("result code");
+            return;
         }
+        size_t ctx_len = bs.size() - bs.pos() - result_code_len;
         if (ctx_len) {
             // It has context, read it.
             ptr<buffer> actual_ctx = buffer::alloc(ctx_len);
             bs.get_buffer(actual_ctx);
             rsp->set_ctx(actual_ctx);
-            remaining_len -= ctx_len;
         }
 
         // 4) Result code
         if (flags & INCLUDE_RESULT_CODE) {
-            assert((size_t)remaining_len >= sizeof(int32_t));
             cmd_result_code res = static_cast<cmd_result_code>(bs.get_i32());
             rsp->set_result_code(res);
         }

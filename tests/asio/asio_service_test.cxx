@@ -16,6 +16,7 @@ limitations under the License.
 **************************************************************************/
 
 #include "buffer_serializer.hxx"
+#include "crc32.hxx"
 #include "debugging_options.hxx"
 #include "in_memory_log_store.hxx"
 #include "peer.hxx"
@@ -2167,6 +2168,343 @@ int connection_timeout_test() {
 }
 #endif
 
+// RPC flags and header sizes, as defined in asio_service.cxx.
+static const uint32_t RESP_INCLUDE_META = 0x1;
+static const uint32_t RESP_INCLUDE_HINT = 0x2;
+static const uint32_t RESP_INCLUDE_RESULT_CODE = 0x20;
+static const size_t REQ_HEADER_SIZE = 54;
+static const size_t RESP_HEADER_SIZE = 39;
+
+static const uint16_t CANNED_PEER_PORT = 20091;
+
+static std::vector<uint8_t> make_bytes
+                            ( const std::function<void(buffer_serializer&)>& writer )
+{
+    ptr<buffer> buf = buffer::alloc(1024);
+    buffer_serializer bs(buf);
+    writer(bs);
+    return std::vector<uint8_t>(buf->data_begin(), buf->data_begin() + bs.pos());
+}
+
+// A response as `serialize_resp` writes it, with the given flags, data size
+// and payload.
+static std::vector<uint8_t> make_response(uint32_t flags,
+                                          int32 carried_data_size,
+                                          const std::vector<uint8_t>& payload)
+{
+    ptr<buffer> buf = buffer::alloc(RESP_HEADER_SIZE + payload.size());
+    buffer_serializer bs(buf);
+    bs.put_u8(0x1);
+    bs.put_u8((uint8_t)msg_type::ping_response);
+    bs.put_i32(2);
+    bs.put_i32(1);
+    bs.put_u64(0);
+    bs.put_u64(0);
+    bs.put_u8(1);
+    bs.put_i32(carried_data_size);
+    uint32_t crc = crc32_8(buf->data_begin(), RESP_HEADER_SIZE - 8, 0);
+    bs.put_u64(((uint64_t)flags << 32) | crc);
+    if (!payload.empty()) bs.put_raw(payload.data(), payload.size());
+    return std::vector<uint8_t>(buf->data_begin(), buf->data_begin() + buf->size());
+}
+
+// Answers the request on every accepted connection with `response`, and keeps
+// the connection open until destroyed.
+class canned_response_peer {
+public:
+    canned_response_peer(uint16_t port, const std::vector<uint8_t>& response)
+        : acceptor_( io_context_,
+                     asio::ip::tcp::endpoint( asio::ip::make_address("127.0.0.1"),
+                                              port ) )
+        , response_(response)
+    {
+        accept_next();
+        worker_ = std::thread([this]() { io_context_.run(); });
+    }
+
+    ~canned_response_peer() {
+        io_context_.stop();
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    struct connection {
+        explicit connection(asio::io_context& io_context)
+            : socket_(io_context)
+            , header_(buffer::alloc(REQ_HEADER_SIZE))
+            {}
+        asio::ip::tcp::socket socket_;
+        ptr<buffer> header_;
+        std::vector<uint8_t> payload_;
+    };
+
+    void accept_next() {
+        connections_.emplace_back(io_context_);
+        connection& conn = connections_.back();
+        acceptor_.async_accept
+            ( conn.socket_,
+              [this, &conn](const asio_error_code& err) {
+                  if (err) return;
+                  read_request(conn);
+                  accept_next();
+              } );
+    }
+
+    void read_request(connection& conn) {
+        asio::async_read
+            ( conn.socket_,
+              asio::buffer(conn.header_->data_begin(), REQ_HEADER_SIZE),
+              [this, &conn](const asio_error_code& err, size_t) {
+                  if (err) return;
+                  // The data size precedes the 8 bytes of flags and CRC.
+                  buffer_serializer bs(conn.header_);
+                  bs.pos(REQ_HEADER_SIZE - 8 - 4);
+                  conn.payload_.resize((size_t)bs.get_i32());
+                  asio::async_read
+                      ( conn.socket_,
+                        asio::buffer(conn.payload_),
+                        [this, &conn](const asio_error_code& err, size_t) {
+                            if (err) return;
+                            asio::async_write
+                                ( conn.socket_,
+                                  asio::buffer(response_),
+                                  [](const asio_error_code&, size_t) {} );
+                        } );
+              } );
+    }
+
+    asio::io_context io_context_;
+    asio::ip::tcp::acceptor acceptor_;
+    std::vector<uint8_t> response_;
+    std::list<connection> connections_;
+    std::thread worker_;
+};
+
+struct canned_response_result {
+    bool called_;
+    ptr<resp_msg> resp_;
+    ptr<rpc_exception> err_;
+};
+
+// Sends one request to a peer that answers with `response`, and waits up to
+// 5 seconds for the handler. `resp_meta`, if given, receives the response meta.
+static canned_response_result send_to_canned_peer
+                              ( const std::vector<uint8_t>& response,
+                                bool streaming,
+                                std::string* resp_meta = nullptr )
+{
+    canned_response_peer peer(CANNED_PEER_PORT, response);
+
+    ptr<logger_wrapper> log_wrap = cs_new<logger_wrapper>("./client.log");
+    ptr<logger> log_inst = log_wrap;
+
+    asio_service::options asio_opt;
+    asio_opt.thread_pool_size_ = 2;
+    asio_opt.streaming_mode_ = streaming;
+    if (resp_meta) {
+        asio_opt.read_resp_meta_ = [resp_meta]( const asio_service_meta_cb_params&,
+                                                const std::string& meta ) {
+            *resp_meta = meta;
+            return true;
+        };
+    }
+
+    ptr<asio_service> svc = cs_new<asio_service>(asio_opt, log_inst);
+    ptr<rpc_client> client =
+        svc->create_client( "tcp://127.0.0.1:" + std::to_string(CANNED_PEER_PORT) );
+
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( (ulong)0, msg_type::ping_request, 1, 2,
+                         (ulong)0, (ulong)0, (ulong)0 );
+
+    std::promise<canned_response_result> promise;
+    std::future<canned_response_result> future = promise.get_future();
+    rpc_handler handler = [&promise]( ptr<resp_msg>& resp,
+                                      ptr<rpc_exception>& err ) {
+        promise.set_value(canned_response_result{true, resp, err});
+    };
+    client->send(req, handler);
+
+    canned_response_result result{false, nullptr, nullptr};
+    if ( future.wait_for(std::chrono::seconds(5)) ==
+         std::future_status::ready ) {
+        result = future.get();
+    }
+
+    client.reset();
+    svc->stop();
+    svc.reset();
+    return result;
+}
+
+static std::string ctx_str(ptr<buffer> ctx) {
+    return std::string((const char*)ctx->data_begin(), ctx->size());
+}
+
+struct malformed_response_case {
+    const char* name_;
+    uint32_t flags_;
+    int32 carried_data_size_;
+    std::vector<uint8_t> payload_;
+    const char* marker_;
+};
+
+static const std::vector<malformed_response_case>& malformed_response_cases() {
+    const uint32_t META = RESP_INCLUDE_META;
+    const uint32_t HINT = RESP_INCLUDE_HINT;
+    const uint32_t RC = RESP_INCLUDE_RESULT_CODE;
+    static const std::vector<malformed_response_case> cases = {
+        { "size minus one", 0, -1,
+          std::vector<uint8_t>(64, 0x41), "bad data size" },
+        { "size int32 min", 0, INT32_MIN,
+          std::vector<uint8_t>(64, 0x41), "bad data size" },
+        { "result code underflow", RC, 2,
+          std::vector<uint8_t>(2, 0), "malformed result code" },
+        { "hint length past the end", HINT | RC, 16,
+          make_bytes([](buffer_serializer& bs) {
+              bs.put_u16(0);
+              bs.put_u16(0xFFFF);
+              bs.put_i64(1);
+              bs.put_i32(0);
+          }),
+          "malformed hint" },
+        { "hint length below eight", HINT | RC, 16,
+          make_bytes([](buffer_serializer& bs) {
+              bs.put_u16(0);
+              bs.put_u16(0);
+              bs.put_i64(1);
+              bs.put_i32(0);
+          }),
+          "malformed hint" },
+        { "truncated hint", HINT, 1,
+          std::vector<uint8_t>(1, 0), "malformed hint" },
+        { "truncated meta length", META, 3,
+          std::vector<uint8_t>(3, 0), "malformed meta" },
+        { "meta length past the end", META, 8,
+          make_bytes([](buffer_serializer& bs) {
+              bs.put_u32(100);
+              bs.put_u32(0);
+          }),
+          "malformed meta" },
+        { "zero size with result code", RC, 0,
+          std::vector<uint8_t>(), "bad data size" },
+    };
+    return cases;
+}
+
+static const malformed_response_case* current_malformed_response_case = nullptr;
+
+int malformed_response_test(bool streaming) {
+    reset_log_files();
+
+    const malformed_response_case& c = *current_malformed_response_case;
+    canned_response_result result = send_to_canned_peer
+        ( make_response(c.flags_, c.carried_data_size_, c.payload_), streaming );
+
+    CHK_TRUE( result.called_ );
+    CHK_NULL( result.resp_.get() );
+    CHK_NONNULL( result.err_.get() );
+    std::string what = result.err_->what();
+    _msg("%s\n", what.c_str());
+    CHK_TRUE( what.find(c.marker_) != std::string::npos );
+    CHK_TRUE( what.find("CRC mismatch") == std::string::npos );
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
+int well_formed_response_test(bool streaming) {
+    reset_log_files();
+
+    const uint32_t META = RESP_INCLUDE_META;
+    const uint32_t HINT = RESP_INCLUDE_HINT;
+    const uint32_t RC = RESP_INCLUDE_RESULT_CODE;
+    const int32 FAILED = cmd_result_code::FAILED;
+
+    // Only a result code.
+    {
+        std::vector<uint8_t> payload = make_bytes([&](buffer_serializer& bs) {
+            bs.put_i32(FAILED);
+        });
+        canned_response_result result = send_to_canned_peer
+            ( make_response(RC, (int32)payload.size(), payload), streaming );
+        CHK_TRUE( result.called_ );
+        CHK_NULL( result.err_.get() );
+        CHK_NONNULL( result.resp_.get() );
+        CHK_EQ( cmd_result_code::FAILED, result.resp_->get_result_code() );
+        CHK_NULL( result.resp_->get_ctx().get() );
+    }
+
+    // Meta, hint, context and result code.
+    {
+        std::vector<uint8_t> payload = make_bytes([&](buffer_serializer& bs) {
+            bs.put_str("abc");
+            bs.put_u16(0);
+            bs.put_u16(8);
+            bs.put_i64(12345);
+            bs.put_raw("hello", 5);
+            bs.put_i32(FAILED);
+        });
+        std::string resp_meta;
+        canned_response_result result = send_to_canned_peer
+            ( make_response(META | HINT | RC, (int32)payload.size(), payload),
+              streaming, &resp_meta );
+        CHK_TRUE( result.called_ );
+        CHK_NULL( result.err_.get() );
+        CHK_NONNULL( result.resp_.get() );
+        CHK_EQ( std::string("abc"), resp_meta );
+        CHK_EQ( (int64)12345, result.resp_->get_next_batch_size_hint_in_bytes() );
+        CHK_NONNULL( result.resp_->get_ctx().get() );
+        CHK_EQ( std::string("hello"), ctx_str(result.resp_->get_ctx()) );
+        CHK_EQ( cmd_result_code::FAILED, result.resp_->get_result_code() );
+    }
+
+    // Only a context.
+    {
+        std::vector<uint8_t> payload = make_bytes([](buffer_serializer& bs) {
+            bs.put_raw("hello", 5);
+        });
+        canned_response_result result = send_to_canned_peer
+            ( make_response(0, (int32)payload.size(), payload), streaming );
+        CHK_TRUE( result.called_ );
+        CHK_NULL( result.err_.get() );
+        CHK_NONNULL( result.resp_.get() );
+        CHK_NONNULL( result.resp_->get_ctx().get() );
+        CHK_EQ( std::string("hello"), ctx_str(result.resp_->get_ctx()) );
+    }
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
+int hint_extension_test(bool streaming) {
+    reset_log_files();
+
+    // A hint 4 bytes longer than the one this version writes.
+    std::vector<uint8_t> payload = make_bytes([](buffer_serializer& bs) {
+        bs.put_u16(0);
+        bs.put_u16(12);
+        bs.put_i64(777);
+        bs.put_u32(0xEEEEEEEE);
+        bs.put_raw("hi", 2);
+        bs.put_i32(cmd_result_code::FAILED);
+    });
+    canned_response_result result = send_to_canned_peer
+        ( make_response( RESP_INCLUDE_HINT | RESP_INCLUDE_RESULT_CODE,
+                         (int32)payload.size(), payload ),
+          streaming );
+    CHK_TRUE( result.called_ );
+    CHK_NULL( result.err_.get() );
+    CHK_NONNULL( result.resp_.get() );
+    CHK_EQ( (int64)777, result.resp_->get_next_batch_size_hint_in_bytes() );
+    CHK_NONNULL( result.resp_->get_ctx().get() );
+    CHK_EQ( std::string("hi"), ctx_str(result.resp_->get_ctx()) );
+    CHK_EQ( cmd_result_code::FAILED, result.resp_->get_result_code() );
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
 }  // namespace asio_service_test;
 using namespace asio_service_test;
 
@@ -2263,6 +2601,21 @@ int main(int argc, char** argv) {
     ts.doTest( "connection timeout test",
                connection_timeout_test );
 #endif
+
+    for (const malformed_response_case& c: malformed_response_cases()) {
+        current_malformed_response_case = &c;
+        ts.doTest( std::string("malformed response test: ") + c.name_,
+                   malformed_response_test,
+                   TestRange<bool>( {false, true} ) );
+    }
+
+    ts.doTest( "well formed response test",
+               well_formed_response_test,
+               TestRange<bool>( {false, true} ) );
+
+    ts.doTest( "hint extension test",
+               hint_extension_test,
+               TestRange<bool>( {false, true} ) );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
