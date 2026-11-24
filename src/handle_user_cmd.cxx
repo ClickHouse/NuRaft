@@ -113,6 +113,7 @@ ptr< cmd_result< ptr<buffer> > > raft_server::append_entries_ext
 
 ptr< cmd_result< ptr<buffer> > > raft_server::flip_learner_flag(int32 srv_id, bool to)
 {
+    recur_lock(lock_);
     ptr<cmd_result<ptr<buffer>>> ret = cs_new<cmd_result<ptr<buffer>>>(nullptr);
     if (role_ != srv_role::leader || write_paused_) {
         p_er("this is not a leader, cannot handle flip_learner_flag");
@@ -126,6 +127,12 @@ ptr< cmd_result< ptr<buffer> > > raft_server::flip_learner_flag(int32 srv_id, bo
     }
 
     ptr<cluster_config> cur_conf = get_config();
+    if (uncommitted_config_) {
+        p_in("uncommitted config exists at log %" PRIu64 ", prev log %" PRIu64,
+             uncommitted_config_->get_log_idx(),
+             uncommitted_config_->get_prev_log_idx());
+        cur_conf = uncommitted_config_;
+    }
     ptr<buffer> enc_conf_buf = cur_conf->serialize();
     ptr<cluster_config> new_conf = cluster_config::deserialize(*enc_conf_buf);
     new_conf->set_log_idx(log_store_->next_slot());
@@ -140,6 +147,7 @@ ptr< cmd_result< ptr<buffer> > > raft_server::flip_learner_flag(int32 srv_id, bo
             p_in("server %d already has learner flag set to %s\n",
                  srv_id,
                  to ? "true" : "false");
+            ret->accept();
             ret->set_result_code(cmd_result_code::OK);
             return ret;
         }
@@ -164,6 +172,7 @@ ptr< cmd_result< ptr<buffer> > > raft_server::flip_learner_flag(int32 srv_id, bo
     uncommitted_config_ = new_conf;
     p_in("request append entries");
     request_append_entries();
+    ret->accept();
     ret->set_result_code(OK);
     return ret;
 }

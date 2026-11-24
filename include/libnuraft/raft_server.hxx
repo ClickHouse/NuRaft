@@ -500,6 +500,7 @@ public:
     /**
      * Set custom context to Raft cluster config.
      * It will create a new configuration log and replicate it.
+     * Only leader will accept this operation.
      *
      * @param ctx Custom context.
      */
@@ -698,6 +699,7 @@ public:
      * Change on endpoint will not be accepted (should be removed and then re-added).
      * If the server is in new joiner state, it will be rejected.
      * If the server ID does not exist, it will also be rejected.
+     * It is also rejected while a previous configuration change is not committed yet.
      *
      * @param new_config Server configuration to update.
      * @return `true` on success, `false` if rejected.
