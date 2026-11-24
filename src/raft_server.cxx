@@ -1254,6 +1254,8 @@ void raft_server::become_leader() {
 
             pp->set_next_log_idx(log_store_->next_slot());
             pp->set_next_log_idx_floor(0);
+            // Count a peer only for what it acknowledges in this term.
+            pp->set_matched_idx(0);
             pp->reset_stream();
             enable_hb_for_peer(*pp);
             pp->set_recovered();
