@@ -277,7 +277,9 @@ void peer::try_set_free(msg_type type, bool streaming) {
         msg_type::leave_cluster_request,
         msg_type::custom_notification_request,
         msg_type::reconnect_request,
-        msg_type::priority_change_request
+        msg_type::priority_change_request,
+        msg_type::join_cluster_request,
+        msg_type::sync_log_request
     } );
 
     if ( msg_types_to_free.find(type) !=
