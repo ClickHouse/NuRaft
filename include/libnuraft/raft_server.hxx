@@ -1196,6 +1196,7 @@ protected:
     void commit(ulong target_idx);
     bool snapshot_and_compact(ulong committed_idx, bool forced_creation = false);
     bool update_term(ulong term);
+    bool is_known_cluster_member(int32 srv_id);
     void reconfigure(const ptr<cluster_config>& new_config);
     void update_target_priority();
     void decay_target_priority();
