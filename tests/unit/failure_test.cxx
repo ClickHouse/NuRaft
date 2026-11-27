@@ -470,6 +470,240 @@ int uncommitted_conf_new_leader_test() {
     return 0;
 }
 
+int inherited_removal_while_other_server_leaves_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    RaftPkg s5(f_base, 5, "S5");
+    RaftPkg s6(f_base, 6, "S6");
+    RaftPkg s7(f_base, 7, "S7");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4, &s5, &s6, &s7};
+    std::vector<RaftPkg*> s1_to_s6 = {&s1, &s2, &s3, &s4, &s5, &s6};
+    std::vector<RaftPkg*> s2_to_s6 = {&s2, &s3, &s4, &s5, &s6};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        // Do not create snapshot.
+        param.snapshot_distance_ = 0;
+        pp->raftServer->update_params(param);
+    }
+
+    auto append_msg = [](RaftPkg& pkg, const std::string& str) {
+        ptr<buffer> msg = buffer::alloc(str.size() + 1);
+        msg->put(str);
+        pkg.raftServer->append_entries( {msg} );
+    };
+    // One request/response from `src` to each of `dsts`. Never deliver
+    // anything from S1 to S7 after it is told to leave: S1 must keep
+    // `srv_to_leave_` = S7 without S7 ever catching up.
+    auto exchange = [](RaftPkg& src, const std::vector<RaftPkg*>& dsts) {
+        for (RaftPkg* dd: dsts) {
+            src.fNet->execReqResp(dd->myEndpoint);
+        }
+    };
+    // Exchange until nothing from `src` to `dsts` is in flight, so that
+    // every peer of `src` is free to take the next request at once.
+    auto drain = [&exchange](RaftPkg& src, const std::vector<RaftPkg*>& dsts) {
+        for (size_t ii = 0; ii < 10; ++ii) {
+            bool in_flight = false;
+            for (RaftPkg* dd: dsts) {
+                if (src.fNet->getNumPendingReqs(dd->myEndpoint)) in_flight = true;
+            }
+            if (!in_flight) break;
+            exchange(src, dsts);
+        }
+    };
+    // `wait_for_sm_exec` can return before the state machines caught up, when
+    // the commit callback of an earlier wait wakes it; check and wait again.
+    auto wait_sm = [](const std::vector<RaftPkg*>& list) {
+        for (size_t ii = 0; ii < 3; ++ii) {
+            wait_for_sm_exec(list, COMMIT_TIMEOUT_SEC);
+            bool done = true;
+            for (RaftPkg* pp: list) {
+                if ( pp->raftServer->get_committed_log_idx() <
+                     pp->raftServer->get_target_committed_log_idx() ) {
+                    done = false;
+                }
+            }
+            if (done) return 0;
+        }
+        return -1;
+    };
+    auto committed_at_least = [](const std::vector<RaftPkg*>& list, ulong idx) {
+        for (RaftPkg* pp: list) {
+            if (pp->raftServer->get_committed_log_idx() < idx) return false;
+        }
+        return true;
+    };
+
+    append_msg(s1, "base0");
+    append_msg(s1, "base1");
+    for (size_t ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_sm(pkgs) );
+    CHK_GT( s1.getTestSm()->isCommitted("base1"), 0 );
+    ulong t1 = s1.raftServer->get_term();
+
+    // === Phase 1: S1 removes S7, and S7 never catches up. ===
+    CHK_TRUE( s1.raftServer->remove_srv(7)->get_accepted() );
+    for (size_t ii = 0; ii < 3 && !s1.fNet->getSrvToLeave(s1.raftServer.get()); ++ii) {
+        s1.fNet->execReqResp("S7");
+    }
+    CHK_NONNULL( s1.fNet->getSrvToLeave(s1.raftServer.get()).get() );
+    CHK_EQ( 7, s1.fNet->getSrvToLeave(s1.raftServer.get())->get_id() );
+    ulong conf_without_s7 = s1.raftServer->get_last_log_idx();
+
+    for (size_t ii = 0; ii < 10; ++ii) {
+        exchange(s1, s2_to_s6);
+        CHK_Z( wait_sm(s1_to_s6) );
+        if ( committed_at_least(s1_to_s6, conf_without_s7) &&
+             !s2.fNet->getPeer(s2.raftServer.get(), 7) ) {
+            break;
+        }
+    }
+    CHK_NULL( s1.raftServer->get_config()->get_server(7).get() );
+    CHK_NONNULL( s1.fNet->getPeer(s1.raftServer.get(), 7).get() );
+    CHK_EQ( 7, s1.fNet->getSrvToLeave(s1.raftServer.get())->get_id() );
+    CHK_TRUE( committed_at_least(s1_to_s6, conf_without_s7) );
+    CHK_NULL( s2.fNet->getPeer(s2.raftServer.get(), 7).get() );
+
+    // === Phase 2: S1 hands the leadership over to S2. ===
+    s1.raftServer->yield_leadership(false, 2);
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    for ( size_t ii = 0;
+          ii < 4 && (s1.raftServer->is_leader() || s2.raftServer->get_term() <= t1);
+          ++ii ) {
+        s1.fNet->execReqResp("S2");
+    }
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_GT( s2.raftServer->get_term(), t1 );
+    s2.fNet->execReqResp("S1");
+    s2.fNet->execReqResp("S3");
+    s2.fNet->execReqResp("S4");
+    s2.fNet->execReqResp("S5");
+    CHK_TRUE( s2.raftServer->is_leader() );
+    // Heartbeats S1 sent before it stepped down.
+    exchange(s1, {&s3, &s4, &s5, &s6});
+
+    ulong s2_leader_conf = s2.raftServer->get_last_log_idx();
+    std::vector<RaftPkg*> s1_s3_to_s6 = {&s1, &s3, &s4, &s5, &s6};
+    for (size_t ii = 0; ii < 10; ++ii) {
+        exchange(s2, s1_s3_to_s6);
+        CHK_Z( wait_sm(s1_to_s6) );
+        if ( committed_at_least(s1_to_s6, s2_leader_conf) &&
+             !s1.fNet->getPeer(s1.raftServer.get(), 7) ) {
+            break;
+        }
+        // A peer that was busy with a vote request when S2 became leader
+        // gets its first append with a heartbeat.
+        s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+    }
+    drain(s2, s1_s3_to_s6);
+    CHK_Z( wait_sm(s1_to_s6) );
+    ulong t2 = s2.raftServer->get_term();
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_GT( t2, t1 );
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_EQ( t2, s1.raftServer->get_term() );
+    CHK_TRUE( committed_at_least(s1_to_s6, s2_leader_conf) );
+    // As a follower, S1 dropped S7 from its peer list, but `srv_to_leave_`
+    // still names S7.
+    CHK_NULL( s1.fNet->getPeer(s1.raftServer.get(), 7).get() );
+    CHK_NONNULL( s1.fNet->getSrvToLeave(s1.raftServer.get()).get() );
+    CHK_EQ( 7, s1.fNet->getSrvToLeave(s1.raftServer.get())->get_id() );
+
+    // === Phase 3: S2 removes S6, and only S1 gets that config. ===
+    CHK_TRUE( s2.raftServer->remove_srv(6)->get_accepted() );
+    for (size_t ii = 0; ii < 3; ++ii) {
+        ptr<cluster_config> uc = s2.fNet->getUncommittedConfig(s2.raftServer.get());
+        if (uc && !uc->get_server(6)) break;
+        s2.fNet->execReqResp("S6");
+    }
+    ptr<cluster_config> s2_uncommitted =
+        s2.fNet->getUncommittedConfig(s2.raftServer.get());
+    CHK_NONNULL( s2_uncommitted.get() );
+    CHK_NULL( s2_uncommitted->get_server(6).get() );
+    ulong conf_without_s6 = s2.raftServer->get_last_log_idx();
+
+    s2.raftServer->yield_leadership(false, 1);
+    for (size_t ii = 0; ii < 4 && s1.raftServer->get_term() <= t2; ++ii) {
+        s2.fNet->execReqResp("S1");
+    }
+    CHK_GT( s1.raftServer->get_term(), t2 );
+    CHK_EQ( conf_without_s6, s1.raftServer->get_last_log_idx() );
+    CHK_SM( s1.raftServer->get_target_committed_log_idx(), conf_without_s6 );
+    CHK_SM( s2.raftServer->get_target_committed_log_idx(), conf_without_s6 );
+    CHK_FALSE( s2.raftServer->is_leader() );
+
+    // === Phase 4: S1 is the leader again and commits S2's config. ===
+    s1.fNet->execReqResp("S2");
+    s1.fNet->execReqResp("S3");
+    s1.fNet->execReqResp("S4");
+    ulong t3 = s1.raftServer->get_term();
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_GT( t3, t2 );
+    CHK_EQ( 7, s1.fNet->getSrvToLeave(s1.raftServer.get())->get_id() );
+    CHK_NULL( s1.fNet->getPeer(s1.raftServer.get(), 7).get() );
+    CHK_NONNULL( s1.fNet->getPeer(s1.raftServer.get(), 6).get() );
+    CHK_SM( s1.raftServer->get_target_committed_log_idx(), conf_without_s6 );
+
+    std::vector<RaftPkg*> s1_to_s4 = {&s1, &s2, &s3, &s4};
+    for (size_t ii = 0; ii < 10; ++ii) {
+        exchange(s1, {&s2, &s3, &s4});
+        CHK_Z( wait_sm(s1_to_s4) );
+        if (s1.raftServer->get_committed_log_idx() > conf_without_s6) break;
+        // S7 is in no peer list of S1 any more, so heartbeats are safe.
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    }
+    CHK_GT( s1.raftServer->get_committed_log_idx(), conf_without_s6 );
+    ptr<cluster_config> s1_conf = s1.raftServer->get_config();
+    CHK_EQ( 5, s1_conf->get_servers().size() );
+    CHK_NULL( s1_conf->get_server(6).get() );
+    CHK_NULL( s1_conf->get_server(7).get() );
+    // S6 was removed while `srv_to_leave_` named another server.
+    CHK_EQ( 7, s1.fNet->getSrvToLeave(s1.raftServer.get())->get_id() );
+
+    // S6 is not in the configuration, so it must not stay in the peer list.
+    CHK_NULL( s1.fNet->getPeer(s1.raftServer.get(), 6).get() );
+    CHK_EQ( 5, s1.fNet->getNumVotingMembers(s1.raftServer.get()) );
+
+    // S1, S2, S3 are a majority of the 5 servers: they commit without S4, S5.
+    append_msg(s1, "x");
+    for (size_t ii = 0; ii < 5; ++ii) {
+        s1.fNet->makeReqFailAll("S4");
+        s1.fNet->makeReqFailAll("S5");
+        s1.fNet->makeReqFailAll("S6");
+        exchange(s1, {&s2, &s3});
+    }
+    CHK_Z( wait_sm({&s1, &s2, &s3}) );
+    CHK_GT( s1.getTestSm()->isCommitted("x"), 0 );
+
+    // S6 can be added back.
+    ptr< cmd_result< ptr<buffer> > > ret =
+        s1.raftServer->add_srv( *s6.getTestMgr()->get_srv_config() );
+    CHK_Z( ret->get_result_code() );
+
+    print_stats(pkgs);
+
+    for (auto& entry: pkgs) {
+        entry->raftServer->shutdown();
+    }
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int removed_server_late_step_down_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -619,6 +853,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "uncommitted config for new leader test",
                uncommitted_conf_new_leader_test );
+
+    ts.doTest( "inherited removal while another server leaves test",
+               inherited_removal_while_other_server_leaves_test );
 
     ts.doTest( "removed server late step down test",
                removed_server_late_step_down_test );
