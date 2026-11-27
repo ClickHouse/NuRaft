@@ -1795,6 +1795,68 @@ int priority_broadcast_with_live_leader_test() {
     return 0;
 }
 
+int priority_change_for_unknown_server_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.auto_forwarding_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    // Followers forward a priority change only to a live leader.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader_alive() );
+
+    const int unknown_id = 9;
+    uint64_t last_idx = s1.raftServer->get_last_log_idx();
+
+    CHK_FALSE( s1.raftServer->set_priority_v2(unknown_id, 10) );
+    CHK_EQ( last_idx, s1.raftServer->get_last_log_idx() );
+
+    CHK_EQ( raft_server::PrioritySetResult::IGNORED,
+            s1.raftServer->set_priority(unknown_id, 10) );
+    CHK_EQ( last_idx, s1.raftServer->get_last_log_idx() );
+
+    // Forwarded by a follower, for a known server first.
+    s2.raftServer->set_priority_v2(3, 42);
+    s2.fNet->execReqResp();
+    CHK_EQ( last_idx + 1, s1.raftServer->get_last_log_idx() );
+    CHK_Z( drain_and_commit(s1, pkgs) );
+    CHK_Z( check_priorities(pkgs, {50, 50, 42}) );
+
+    last_idx = s1.raftServer->get_last_log_idx();
+    s2.raftServer->set_priority_v2(unknown_id, 10);
+    s2.fNet->execReqResp();
+    CHK_EQ( last_idx, s1.raftServer->get_last_log_idx() );
+
+    CHK_FALSE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+    CHK_TRUE( s1.raftServer->set_priority_v2(2, 100) );
+    CHK_Z( drain_and_commit(s1, pkgs) );
+    CHK_Z( check_priorities(pkgs, {50, 100, 42}) );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int custom_user_context_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3028,6 +3090,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "priority broadcast with live leader test",
                priority_broadcast_with_live_leader_test );
+
+    ts.doTest( "priority change for unknown server test",
+               priority_change_for_unknown_server_test );
 
     ts.doTest( "custom user context test",
                custom_user_context_test );
