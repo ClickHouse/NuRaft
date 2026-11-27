@@ -60,6 +60,36 @@ int srv_config_test() {
     return 0;
 }
 
+int srv_config_truncated_buffer_test() {
+    srv_config orig(1, 2, "tcp://server-1:9234", "aux", false, 5);
+    ptr<buffer> full = orig.serialize();
+
+    // Every prefix of the serialized config ends where its heap block ends,
+    // including the ones that cut the endpoint or aux before its terminator.
+    for (size_t len = 0; len < full->size(); ++len) {
+        ptr<buffer> part = buffer::alloc(len);
+        memcpy(part->data_begin(), full->data_begin(), len);
+
+        bool thrown = false;
+        try {
+            srv_config::deserialize(*part);
+        } catch (const std::overflow_error&) {
+            thrown = true;
+        }
+        CHK_TRUE( thrown );
+    }
+
+    ptr<srv_config> conf = srv_config::deserialize(*full);
+    CHK_EQ( orig.get_id(), conf->get_id() );
+    CHK_EQ( orig.get_dc_id(), conf->get_dc_id() );
+    CHK_EQ( orig.get_endpoint(), conf->get_endpoint() );
+    CHK_EQ( orig.get_aux(), conf->get_aux() );
+    CHK_EQ( orig.is_learner(), conf->is_learner() );
+    CHK_EQ( orig.get_priority(), conf->get_priority() );
+
+    return 0;
+}
+
 ptr<cluster_config> generate_random_config() {
     ptr<cluster_config> conf
                         ( cs_new<cluster_config>
@@ -288,6 +318,7 @@ int main(int argc, char** argv) {
     ts.options.printTestMessage = false;
 
     ts.doTest( "srv_config test", srv_config_test );
+    ts.doTest( "srv_config truncated buffer test", srv_config_truncated_buffer_test );
     ts.doTest( "cluster_config test", cluster_config_test );
     ts.doTest( "snapshot test", snapshot_test );
     ts.doTest( "snapshot_sync_req test",
