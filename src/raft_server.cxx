@@ -1305,6 +1305,7 @@ void raft_server::become_leader() {
         p_in("[BECOME LEADER] appended new config at %" PRIu64,
              index_at_becoming_leader_.load());
         config_changing_ = true;
+        uncommitted_config_ = last_config_cloned;
     }
 
     // The slow member backpressure lasts for one leadership, so a server that

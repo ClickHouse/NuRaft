@@ -1560,6 +1560,202 @@ int multiple_config_change_test() {
     return 0;
 }
 
+int config_change_waits_for_priority_change_before_join_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4};
+    std::vector<RaftPkg*> group = {&s1, &s2, &s3};
+    std::vector<RaftPkg*> leader_only = {&s1};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( group ) );
+
+    // The config entry adding S4 is appended only after the join handshake,
+    // so a priority change made in between comes first in the log.
+    CHK_TRUE( s1.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) )
+                           ->get_accepted() );
+    CHK_TRUE( s1.raftServer->set_priority_v2(2, 100) );
+    uint64_t priority_idx = s1.raftServer->get_last_log_idx();
+
+    // S2 stores the priority change, its response is held.
+    CHK_TRUE( s1.fNet->delieverReqTo("S2") );
+
+    // Join handshake, then one catch-up round (the log sync stop gap is 1).
+    CHK_TRUE( s1.fNet->delieverReqTo("S4") );
+    CHK_TRUE( s1.fNet->handleRespFrom("S4") );
+    CHK_TRUE( s1.fNet->delieverReqTo("S4") );
+    CHK_TRUE( s1.fNet->handleRespFrom("S4") );
+
+    CHK_EQ( priority_idx + 1, s1.raftServer->get_last_log_idx() );
+    ptr<cluster_config> pending =
+        s1.fNet->getUncommittedConfig(s1.raftServer.get());
+    CHK_NONNULL( pending.get() );
+    CHK_EQ( priority_idx + 1, pending->get_log_idx() );
+    CHK_NONNULL( pending->get_server(4).get() );
+    CHK_EQ( 100, pending->get_server(2)->get_priority() );
+
+    // The priority change commits, the join is still pending.
+    CHK_TRUE( s1.fNet->handleRespFrom("S2") );
+    CHK_Z( wait_for_sm_exec(leader_only, COMMIT_TIMEOUT_SEC) );
+    CHK_EQ( priority_idx, s1.raftServer->get_config()->get_log_idx() );
+    CHK_EQ( priority_idx, s1.raftServer->get_committed_log_idx() );
+
+    CHK_EQ( cmd_result_code::CONFIG_CHANGING,
+            s1.raftServer->remove_srv(3)->get_result_code() );
+    CHK_TRUE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+
+    CHK_Z( drain_and_commit(s1, pkgs) );
+    CHK_FALSE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+    ptr<cluster_config> c_conf = s1.raftServer->get_config();
+    CHK_NONNULL( c_conf->get_server(4).get() );
+    CHK_EQ( 100, c_conf->get_server(2)->get_priority() );
+    CHK_EQ( cmd_result_code::OK,
+            s1.raftServer->remove_srv(3)->get_result_code() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int config_change_waits_for_priority_change_before_removal_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    RaftPkg s5(f_base, 5, "S5");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4, &s5};
+    std::vector<RaftPkg*> group = {&s1, &s2, &s3, &s4};
+    std::vector<RaftPkg*> remaining = {&s1, &s2, &s4};
+    std::vector<RaftPkg*> leader_only = {&s1};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( group ) );
+
+    // The config entry removing S3 is appended only after S3 accepts to
+    // leave, so a priority change made in between comes first in the log.
+    CHK_EQ( cmd_result_code::OK,
+            s1.raftServer->remove_srv(3)->get_result_code() );
+    CHK_TRUE( s1.raftServer->set_priority_v2(4, 10) );
+    uint64_t priority_idx = s1.raftServer->get_last_log_idx();
+
+    // S2 and S4 store the priority change, their responses are held.
+    CHK_TRUE( s1.fNet->delieverReqTo("S2") );
+    CHK_TRUE( s1.fNet->delieverReqTo("S4") );
+
+    // Leave handshake.
+    CHK_TRUE( s1.fNet->delieverReqTo("S3") );
+    CHK_TRUE( s1.fNet->handleRespFrom("S3") );
+
+    CHK_EQ( priority_idx + 1, s1.raftServer->get_last_log_idx() );
+    ptr<cluster_config> pending =
+        s1.fNet->getUncommittedConfig(s1.raftServer.get());
+    CHK_NONNULL( pending.get() );
+    CHK_EQ( priority_idx + 1, pending->get_log_idx() );
+    CHK_NULL( pending->get_server(3).get() );
+    CHK_EQ( 10, pending->get_server(4)->get_priority() );
+
+    // The priority change commits, the removal is still pending.
+    CHK_TRUE( s1.fNet->handleRespFrom("S2") );
+    CHK_TRUE( s1.fNet->handleRespFrom("S4") );
+    CHK_Z( wait_for_sm_exec(leader_only, COMMIT_TIMEOUT_SEC) );
+    CHK_EQ( priority_idx, s1.raftServer->get_config()->get_log_idx() );
+    CHK_EQ( priority_idx, s1.raftServer->get_committed_log_idx() );
+
+    CHK_EQ( cmd_result_code::CONFIG_CHANGING,
+            s1.raftServer->add_srv( *(s5.getTestMgr()->get_srv_config()) )
+                         ->get_result_code() );
+    CHK_TRUE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+
+    CHK_Z( drain_and_commit(s1, remaining) );
+    CHK_FALSE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+    ptr<cluster_config> c_conf = s1.raftServer->get_config();
+    CHK_NULL( c_conf->get_server(3).get() );
+    CHK_EQ( 10, c_conf->get_server(4)->get_priority() );
+    CHK_TRUE( s1.raftServer->add_srv( *(s5.getTestMgr()->get_srv_config()) )
+                           ->get_accepted() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+    s5.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int new_leader_publishes_its_pending_config_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Only S2 stores the priority change, so S1 cannot commit it.
+    CHK_TRUE( s1.raftServer->set_priority_v2(3, 42) );
+    uint64_t priority_idx = s1.raftServer->get_last_log_idx();
+    CHK_TRUE( s1.fNet->delieverReqTo("S2") );
+
+    // S2 is elected with S3's vote.
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    s3.fNet->execReqResp();
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->execReqResp();
+    s2.fNet->execReqResp();
+
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_EQ( priority_idx + 1, s2.raftServer->get_last_log_idx() );
+    CHK_GT( priority_idx, s2.raftServer->get_committed_log_idx() );
+    CHK_TRUE( s2.fNet->isConfigChanging(s2.raftServer.get()) );
+
+    // The config entry S2 appended as leader is its pending config.
+    ptr<cluster_config> pending =
+        s2.fNet->getUncommittedConfig(s2.raftServer.get());
+    CHK_NONNULL( pending.get() );
+    CHK_EQ( priority_idx + 1, pending->get_log_idx() );
+    CHK_EQ( 42, pending->get_server(3)->get_priority() );
+
+    CHK_Z( drain_and_commit(s2, pkgs) );
+    CHK_FALSE( s2.fNet->isConfigChanging(s2.raftServer.get()) );
+    CHK_NULL( s2.fNet->getUncommittedConfig(s2.raftServer.get()).get() );
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( 42, pp->raftServer->get_srv_config(3)->get_priority() );
+    }
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int check_priorities(const std::vector<RaftPkg*>& pkgs,
                      const std::vector<int>& priorities) {
     for (auto& entry: pkgs)
@@ -3022,6 +3218,15 @@ int main(int argc, char** argv) {
 
     ts.doTest( "multiple config change test",
                multiple_config_change_test );
+
+    ts.doTest( "config change waits for priority change before join test",
+               config_change_waits_for_priority_change_before_join_test );
+
+    ts.doTest( "config change waits for priority change before removal test",
+               config_change_waits_for_priority_change_before_removal_test );
+
+    ts.doTest( "new leader publishes its pending config test",
+               new_leader_publishes_its_pending_config_test );
 
     ts.doTest( "priority broadcast test",
                priority_broadcast_test );
