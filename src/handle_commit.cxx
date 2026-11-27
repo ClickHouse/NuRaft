@@ -511,7 +511,11 @@ void raft_server::commit_conf(ulong idx_to_commit,
     p_in( "config at index %" PRIu64 " is committed, prev config log idx %" PRIu64 "",
           new_conf->get_log_idx(), cur_conf->get_log_idx() );
 
-    config_changing_ = false;
+    // A config entry appended after this one may still be pending.
+    if ( !uncommitted_config_ ||
+         uncommitted_config_->get_log_idx() <= new_conf->get_log_idx() ) {
+        config_changing_ = false;
+    }
     if (cur_conf->get_log_idx() < new_conf->get_log_idx()) {
         // WARNING: Should not overwrite newer config with older one.
         ctx_->state_mgr_->save_config(*new_conf);
