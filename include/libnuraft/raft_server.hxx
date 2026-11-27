@@ -402,8 +402,8 @@ public:
      *     priority to 0, or we're not a leader and broadcast_when_leader_exists = true.
      *     We have sent messages to other peers about priority change but haven't
      *     committed this change.
-     * @return IGNORED If we're not a leader and broadcast_when_leader_exists = false. We
-     *     ignored the request.
+     * @return IGNORED If we're not a leader and broadcast_when_leader_exists = false,
+     *     or `srv_id` is not in the cluster config. We ignored the request.
      */
     PrioritySetResult set_priority(const int srv_id,
                                    const int new_priority,
@@ -416,6 +416,7 @@ public:
      * - If we're not a leader and a leader exists and auto_forwarding is on -- forward request to the leader.
      * - Doesn't allow to set leader priority to 0, if you want to do it you can do request_leadership first.
      * - Don't broadcast priority change in any case.
+     * - Returns false and changes nothing if `srv_id` is not in the cluster config.
      */
     bool set_priority_v2(const int srv_id,
                          const int new_priority);

@@ -858,6 +858,59 @@ int auto_forwarding_test(bool async) {
     return 0;
 }
 
+int priority_change_forwarded_for_unknown_server_test() {
+    reset_log_files();
+
+    std::string s1_addr = "tcp://127.0.0.1:20010";
+    std::string s2_addr = "tcp://127.0.0.1:20020";
+    std::string s3_addr = "tcp://127.0.0.1:20030";
+
+    RaftAsioPkg s1(1, s1_addr);
+    RaftAsioPkg s2(2, s2_addr);
+    RaftAsioPkg s3(3, s3_addr);
+    std::vector<RaftAsioPkg*> pkgs = {&s1, &s2, &s3};
+
+    _msg("launching asio-raft servers\n");
+    CHK_Z( launch_servers(pkgs, false) );
+
+    _msg("organizing raft group\n");
+    CHK_Z( make_group(pkgs) );
+
+    for (auto& entry: pkgs) {
+        RaftAsioPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.auto_forwarding_ = true;
+        pp->raftServer->update_params(param);
+    }
+
+    // In blocking mode a follower returns the leader's decision.
+    CHK_TRUE( s2.raftServer->set_priority_v2(3, 42) );
+    bool replicated = false;
+    for (size_t ii = 0; ii < 50 && !replicated; ++ii) {
+        TestSuite::sleep_ms(RaftAsioPkg::HEARTBEAT_MS, "wait for replication");
+        replicated = true;
+        for (auto& entry: pkgs) {
+            if (entry->raftServer->get_srv_config(3)->get_priority() != 42) {
+                replicated = false;
+            }
+        }
+    }
+    CHK_TRUE( replicated );
+
+    uint64_t last_idx = s1.raftServer->get_last_log_idx();
+    CHK_FALSE( s2.raftServer->set_priority_v2(9, 10) );
+    TestSuite::sleep_ms(RaftAsioPkg::HEARTBEAT_MS * 5, "wait for replication");
+    CHK_EQ( last_idx, s1.raftServer->get_last_log_idx() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    TestSuite::sleep_sec(1, "shutting down");
+
+    SimpleLogger::shutdown();
+    return 0;
+}
+
 int enforced_state_machine_catchup_test() {
     reset_log_files();
 
@@ -2211,6 +2264,9 @@ int main(int argc, char** argv) {
     ts.doTest( "auto forwarding test",
                auto_forwarding_test,
                TestRange<bool>( {false, true} ) );
+
+    ts.doTest( "priority change forwarded for unknown server test",
+               priority_change_forwarded_for_unknown_server_test );
 
     ts.doTest( "enforced state machine catch-up test",
                enforced_state_machine_catchup_test );

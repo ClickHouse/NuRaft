@@ -86,7 +86,8 @@ bool raft_server::set_priority_v2(const int srv_id,
         v.push_back(le);
 
         auto result = send_msg_to_leader(req);
-        return result->get_result_code() == cmd_result_code::OK;
+        return result->get_result_code() == cmd_result_code::OK &&
+               result->get_accepted();
     }
     else {
         p_in("I am the leader, will set priority directly");
@@ -105,6 +106,11 @@ bool raft_server::set_priority_v2(const int srv_id,
                  uncommitted_config_->get_log_idx(),
                  uncommitted_config_->get_prev_log_idx());
             cur_config = uncommitted_config_;
+        }
+
+        if (!cur_config->get_server(srv_id)) {
+            p_wn("cannot change priority of server %d: not in the config", srv_id);
+            return false;
         }
 
         ptr<buffer> enc_conf = cur_config->serialize();
@@ -184,6 +190,11 @@ raft_server::set_priority(const int srv_id,
              uncommitted_config_->get_log_idx(),
              uncommitted_config_->get_prev_log_idx());
         cur_config = uncommitted_config_;
+    }
+
+    if (!cur_config->get_server(srv_id)) {
+        p_wn("cannot change priority of server %d: not in the config", srv_id);
+        return PrioritySetResult::IGNORED;
     }
 
     ptr<buffer> enc_conf = cur_config->serialize();
@@ -369,6 +380,11 @@ ptr<resp_msg> raft_server::handle_priority_change_req_v2(req_msg& req) {
              uncommitted_config_->get_log_idx(),
              uncommitted_config_->get_prev_log_idx());
         cur_config = uncommitted_config_;
+    }
+
+    if (!cur_config->get_server(t_id)) {
+        p_wn("cannot change priority of server %d: not in the config", t_id);
+        return resp;
     }
 
     ptr<buffer> enc_conf = cur_config->serialize();
