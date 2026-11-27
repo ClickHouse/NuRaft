@@ -104,6 +104,57 @@ int leader_election_basic_test() {
     return 0;
 }
 
+int vote_log_freshness_after_compaction_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Compact all logs of S2 into a snapshot, so that its log store
+    // becomes empty and `last_entry()` returns a dummy entry with term 0.
+    raft_params param = s2.raftServer->get_current_params();
+    param.reserved_log_items_ = 0;
+    s2.raftServer->update_params(param);
+
+    ptr<log_store> store = s2.sMgr->load_log_store();
+    const ulong last_idx = store->next_slot() - 1;
+    raft_server::create_snapshot_options opt;
+    opt.serialize_commit_ = true;
+    CHK_EQ( last_idx, s2.raftServer->create_snapshot(opt) );
+    CHK_EQ( store->start_index(), store->next_slot() );
+    const ulong last_term = s2.sm->last_snapshot()->get_last_log_term();
+
+    auto vote = [&](ulong log_term, ulong log_idx) -> bool {
+        ptr<req_msg> req = cs_new<req_msg>
+                           ( s2.raftServer->get_term() + 1,
+                             msg_type::request_vote_request,
+                             3, 2, log_term, log_idx, 0 );
+        return s2.fNet->gotMsg(req)->get_accepted();
+    };
+    // Candidates whose log is older than S2's snapshot should be rejected.
+    CHK_FALSE( vote(last_term, last_idx - 1) );
+    CHK_FALSE( vote(last_term - 1, last_idx + 1) );
+    // Candidate whose log is as up-to-date as S2's snapshot should be granted.
+    CHK_TRUE( vote(last_term, last_idx) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
 int leader_election_priority_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -964,6 +1015,219 @@ int temporary_leader_test() {
     return 0;
 }
 
+int new_leader_ignores_earlier_term_match_test() {
+    // A peer's matched index from this server's earlier leadership must not
+    // count in a new one: it can cover entries of the new term the peer lacks.
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+    std::string s4_addr = "S4";
+    std::string s5_addr = "S5";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    RaftPkg s4(f_base, 4, s4_addr);
+    RaftPkg s5(f_base, 5, s5_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4, &s5};
+
+    raft_params custom_params;
+    custom_params.election_timeout_lower_bound_ = 0;
+    custom_params.election_timeout_upper_bound_ = 10000;
+    custom_params.heart_beat_interval_ = 5000;
+    custom_params.client_req_timeout_ = 1000000;
+    custom_params.snapshot_distance_ = 0;
+    custom_params.reserved_log_items_ = 0;
+    CHK_Z( launch_servers( pkgs, &custom_params ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.leadership_expiry_ = -1;
+        pp->raftServer->update_params(param);
+    }
+
+    auto append_msg = [](RaftPkg& pkg, const std::string& str) {
+        ptr<buffer> msg = buffer::alloc(str.size() + 1);
+        msg->put(str);
+        pkg.raftServer->append_entries( {msg} );
+    };
+    auto matched_on_s1 = [&](int peer_id) {
+        return s1.fNet->getPeerMatchedIdx(s1.raftServer.get(), peer_id);
+    };
+    auto fail_all_from = [&](RaftPkg& src) {
+        for (RaftPkg* dst: pkgs) {
+            if (dst != &src) src.fNet->makeReqFailAll(dst->myEndpoint);
+        }
+    };
+
+    // Committed base, on every server.
+    for (size_t ii = 0; ii < 3; ++ii) {
+        append_msg(s1, "base" + std::to_string(ii));
+    }
+    uint64_t b = s1.raftServer->get_last_log_idx();
+    for (size_t ii = 0; ii < 5; ++ii) {
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        bool all_applied = true;
+        for (RaftPkg* pp: pkgs) {
+            all_applied &= pp->raftServer->get_committed_log_idx() == b;
+        }
+        if (all_applied) break;
+    }
+    uint64_t t1 = s1.raftServer->get_term();
+    TestSuite::Msg mm;
+    mm << "base: last idx " << b << ", term " << t1 << std::endl;
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( b, pp->raftServer->get_committed_log_idx() );
+        if (pp != &s1) CHK_OK( pp->getTestSm()->isSame( *s1.getTestSm() ) );
+    }
+
+    // Term T1: `b + 1 .. b + 3` reach S2 only.
+    append_msg(s1, "x0");
+    append_msg(s1, "x1");
+    append_msg(s1, "x2");
+    for (size_t ii = 0; ii < 5 && matched_on_s1(2) < b + 3; ++ii) {
+        s1.fNet->execReqResp(s2_addr);
+    }
+    s1.fNet->makeReqFailAll(s3_addr);
+    s1.fNet->makeReqFailAll(s4_addr);
+    s1.fNet->makeReqFailAll(s5_addr);
+    mm << "S2 last idx " << s2.raftServer->get_last_log_idx()
+       << ", matched S2 " << matched_on_s1(2)
+       << ", S1 commit " << s1.raftServer->get_target_committed_log_idx()
+       << std::endl;
+    CHK_EQ( b + 3, s2.raftServer->get_last_log_idx() );
+    CHK_EQ( b + 3, matched_on_s1(2) );
+    CHK_EQ( b, s1.raftServer->get_target_committed_log_idx() );
+
+    // Term T2: S3 is elected by S4 and S5, and its first entry replaces
+    // S1's tail. S2 hears nothing of it.
+    s4.fTimer->invoke( timer_task_type::election_timer );
+    fail_all_from(s4);
+    s5.fTimer->invoke( timer_task_type::election_timer );
+    fail_all_from(s5);
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    s3.fNet->makeReqFailAll(s1_addr);
+    s3.fNet->makeReqFailAll(s2_addr);
+    // Pre-vote, then vote.
+    s3.fNet->execReqResp(s4_addr);
+    s3.fNet->execReqResp(s5_addr);
+    s3.fNet->execReqResp(s4_addr);
+    s3.fNet->execReqResp(s5_addr);
+    CHK_TRUE( s3.raftServer->is_leader() );
+    s3.fNet->makeReqFailAll(s2_addr);
+    for (size_t ii = 0; ii < 10; ++ii) {
+        s3.fNet->execReqResp(s1_addr);
+        s3.fNet->execReqResp(s4_addr);
+        s3.fNet->execReqResp(s5_addr);
+        CHK_Z( wait_for_sm_exec({&s1, &s3, &s4, &s5}, COMMIT_TIMEOUT_SEC) );
+        if ( s1.raftServer->get_committed_log_idx() >= b + 1 &&
+             s4.raftServer->get_committed_log_idx() >= b + 1 &&
+             s5.raftServer->get_committed_log_idx() >= b + 1 ) break;
+    }
+    s3.fNet->makeReqFailAll(s2_addr);
+
+    uint64_t t2 = s3.raftServer->get_term();
+    const std::list<uint64_t> r_idxs = s1.getTestSm()->getRollbackIdxs();
+    mm << "T2 " << t2 << ", S1 term " << s1.raftServer->get_term()
+       << ", S1 last idx " << s1.raftServer->get_last_log_idx()
+       << " term " << s1.raftServer->get_last_log_term()
+       << ", S1 commit " << s1.raftServer->get_committed_log_idx()
+       << ", S1 rollbacks " << r_idxs.size()
+       << ", matched S2 on S1 " << matched_on_s1(2) << std::endl;
+    CHK_GT( t2, t1 );
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_EQ( t2, s1.raftServer->get_term() );
+    CHK_EQ( b + 1, s1.raftServer->get_last_log_idx() );
+    CHK_EQ( t2, s1.raftServer->get_last_log_term() );
+    CHK_EQ( b + 1, s3.raftServer->get_committed_log_idx() );
+    CHK_EQ( b + 1, s1.raftServer->get_committed_log_idx() );
+    CHK_EQ( b + 1, s4.raftServer->get_committed_log_idx() );
+    CHK_EQ( b + 1, s5.raftServer->get_committed_log_idx() );
+    CHK_EQ( 3, r_idxs.size() );
+    uint64_t r_expected = b + 3;
+    for (uint64_t idx: r_idxs) {
+        CHK_EQ( r_expected--, idx );
+    }
+    // What S1 keeps from term T1, above its own log end now.
+    CHK_EQ( b + 3, matched_on_s1(2) );
+    CHK_EQ( b + 3, s2.raftServer->get_last_log_idx() );
+
+    // Term T3: S1 is elected by S4 and S5. S2 is slow: S1's requests to it
+    // stay pending.
+    s4.fTimer->invoke( timer_task_type::election_timer );
+    fail_all_from(s4);
+    s5.fTimer->invoke( timer_task_type::election_timer );
+    fail_all_from(s5);
+    s1.fTimer->invoke( timer_task_type::election_timer );
+    // Pre-vote, then vote.
+    s1.fNet->execReqResp(s4_addr);
+    s1.fNet->execReqResp(s5_addr);
+    s1.fNet->execReqResp(s4_addr);
+    s1.fNet->execReqResp(s5_addr);
+    s1.fNet->makeReqFailAll(s3_addr);
+
+    uint64_t t3 = s1.raftServer->get_term();
+    uint64_t own_term_start = s1.raftServer->get_log_idx_at_becoming_leader();
+    mm << "T3 " << t3 << ", S1 leader " << s1.raftServer->is_leader()
+       << ", first log of T3 " << own_term_start
+       << ", pending to S2 " << s1.fNet->getNumPendingReqs(s2_addr)
+       << ", matched S2 " << matched_on_s1(2) << std::endl;
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_GT( t3, t2 );
+    CHK_EQ( b + 2, own_term_start );
+    CHK_GT( s1.fNet->getNumPendingReqs(s2_addr), 0 );
+
+    // `z` at `b + 3` reaches S4.
+    append_msg(s1, "z");
+    for (size_t ii = 0; ii < 5 && matched_on_s1(4) < b + 3; ++ii) {
+        s1.fNet->execReqResp(s4_addr);
+    }
+    mm << "matched S4 " << matched_on_s1(4)
+       << ", S4 last idx " << s4.raftServer->get_last_log_idx()
+       << " term " << s4.raftServer->get_last_log_term()
+       << ", S1 commit " << s1.raftServer->get_target_committed_log_idx()
+       << std::endl;
+    CHK_EQ( b + 3, matched_on_s1(4) );
+    CHK_EQ( b + 3, s4.raftServer->get_last_log_idx() );
+    CHK_EQ( t3, s4.raftServer->get_last_log_term() );
+
+    // Only S1 and S4 hold `b + 2 .. b + 3`: 2 of 5, not committed.
+    CHK_SM( s1.raftServer->get_target_committed_log_idx(), own_term_start );
+    CHK_Z( wait_for_sm_exec({&s1}, COMMIT_TIMEOUT_SEC) );
+    CHK_Z( s1.getTestSm()->isCommitted("z") );
+
+    // S5 makes it 3 of 5.
+    for (size_t ii = 0; ii < 5 && matched_on_s1(5) < b + 3; ++ii) {
+        s1.fNet->execReqResp(s5_addr);
+    }
+    mm << "matched S5 " << matched_on_s1(5)
+       << ", S1 commit " << s1.raftServer->get_target_committed_log_idx()
+       << std::endl;
+    CHK_EQ( b + 3, s1.raftServer->get_target_committed_log_idx() );
+    CHK_Z( wait_for_sm_exec({&s1}, COMMIT_TIMEOUT_SEC) );
+    CHK_GT( s1.getTestSm()->isCommitted("z"), 0 );
+
+    print_stats(pkgs);
+
+    for (RaftPkg* pp: pkgs) {
+        fail_all_from(*pp);
+    }
+    for (RaftPkg* pp: pkgs) {
+        pp->raftServer->shutdown();
+    }
+
+    f_base->destroy();
+
+    return 0;
+}
+
 }  // namespace leader_election_test;
 using namespace leader_election_test;
 
@@ -977,6 +1241,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leader election basic test",
                leader_election_basic_test );
+
+    ts.doTest( "vote log freshness after compaction test",
+               vote_log_freshness_after_compaction_test );
 
     ts.doTest( "leader election priority test",
                leader_election_priority_test );
@@ -1001,6 +1268,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "temporary leader test",
                temporary_leader_test );
+
+    ts.doTest( "new leader ignores earlier term match test",
+               new_leader_ignores_earlier_term_match_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");

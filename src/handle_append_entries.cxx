@@ -342,6 +342,16 @@ bool raft_server::request_append_entries(ptr<peer> p) {
                  last_streamed_log_idx);
             last_streamed_log_idx = 0;
             p->reset_stream();
+        } else if (last_streamed_log_idx > 0) {
+            ulong log_start_idx = log_store_->start_index();
+            if (last_streamed_log_idx + 1 < log_start_idx) {
+                // The next streamed entry is compacted: use the peer's next log index.
+                p_in("stop stream mode for peer %d at idx: %" PRIu64 ", "
+                     "log start idx: %" PRIu64 "",
+                     p->get_id(), last_streamed_log_idx, log_start_idx);
+                last_streamed_log_idx = 0;
+                p->reset_stream();
+            }
         }
         bool streaming = last_streamed_log_idx > 0;
 
