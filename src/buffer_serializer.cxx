@@ -359,8 +359,9 @@ std::string buffer_serializer::get_str() {
 
 const char* buffer_serializer::get_cstr() {
     char* ptr = (char*)buf_.data_begin() + pos_;
-    size_t len = strlen(ptr);
-    pos( pos() + len + 1 );
+    const char* end = (const char*)memchr(ptr, 0, buf_.size() - pos_);
+    if (!end) throw std::overflow_error("not enough space");
+    pos( pos() + (end - ptr) + 1 );
     return ptr;
 }
 
