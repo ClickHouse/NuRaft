@@ -212,6 +212,14 @@ ptr<resp_msg> raft_server::handle_out_of_log_msg(req_msg& req,
                                                  ptr<custom_notification_msg> msg,
                                                  ptr<resp_msg> resp)
 {
+    if (!msg->ctx_) {
+        p_er("[OUT OF LOG RANGE] got warning from peer %d without context",
+             req.get_src());
+        return resp;
+    }
+
+    ptr<out_of_log_msg> ool_msg = out_of_log_msg::deserialize(*msg->ctx_);
+
     static timer_helper msg_timer(5000000);
     int log_lv = msg_timer.timeout_and_reset() ? L_WARN : L_TRACE;
 
@@ -220,7 +228,6 @@ ptr<resp_msg> raft_server::handle_out_of_log_msg(req_msg& req,
 
     out_of_log_range_ = true;
 
-    ptr<out_of_log_msg> ool_msg = out_of_log_msg::deserialize(*msg->ctx_);
     p_lv(log_lv, "this node is out of log range. leader's start index: %" PRIu64 ", "
          "my last index: %" PRIu64,
          ool_msg->start_idx_of_leader_,
