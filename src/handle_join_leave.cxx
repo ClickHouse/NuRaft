@@ -557,6 +557,12 @@ ptr<resp_msg> raft_server::handle_leave_cluster_req(req_msg& req) {
 }
 
 void raft_server::handle_leave_cluster_resp(resp_msg& resp) {
+    if (role_ != srv_role::leader) {
+        p_wn("not a leader any more, ignore leave cluster response from peer %d",
+             resp.get_src());
+        return;
+    }
+
     if (!resp.get_accepted()) {
         p_db("peer doesn't accept to stepping down, stop proceeding");
         return;
@@ -628,6 +634,12 @@ void raft_server::rm_srv_from_cluster(int32 srv_id) {
 
 void raft_server::handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p) {
     if (t_msg == msg_type::leave_cluster_request) {
+        if (role_ != srv_role::leader) {
+            p_wn("not a leader any more, ignore rpc failure for removing server (%d)",
+                 p->get_id());
+            return;
+        }
+
         p_in( "rpc failed for removing server (%d), "
               "will remove this server directly",
               p->get_id() );
