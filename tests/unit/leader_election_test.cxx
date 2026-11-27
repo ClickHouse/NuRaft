@@ -1228,6 +1228,156 @@ int new_leader_ignores_earlier_term_match_test() {
     return 0;
 }
 
+// From https://github.com/eBay/NuRaft/issues/679.
+// An answer to a pre-vote that arrives after the server has left that
+// pre-vote must not start an election.
+//   same_term == false: the server granted a vote of a NEWER term
+//                       (it is a follower of the new leader).
+//   same_term == true:  the server accepted the leader of its OWN term
+//                       while a pre-vote of that term was open.
+int stale_prevote_resp_test(bool same_term) {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // --- From here on S1 (the leader) is unreachable. ---
+    const uint64_t term = s2.raftServer->get_term();
+
+    // S2 and S3 both time out and send pre-votes of `term`.
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->makeReqFailAll(s1_addr);
+    s3.fNet->makeReqFailAll(s1_addr);
+
+    // S3's pre-vote reaches S2 and is granted.
+    s3.fNet->delieverReqTo(s2_addr);
+
+    if (!same_term) {
+        // S2's pre-vote reaches S3 and is granted,
+        // but the answer is still in flight.
+        s2.fNet->delieverReqTo(s3_addr);
+    } else {
+        // S2's pre-vote to S3 is lost.
+        s2.fNet->makeReqFailAll(s3_addr);
+    }
+
+    // S3 completes its pre-vote and sends a vote request of `term + 1`.
+    s3.fNet->handleRespFrom(s2_addr);
+    s3.fNet->makeReqFailAll(s1_addr);
+
+    if (!same_term) {
+        // S2 grants it, S3 becomes the leader of `term + 1`.
+        s3.fNet->execReqResp(s2_addr);
+        CHK_TRUE( s3.raftServer->is_leader() );
+        CHK_EQ( term + 1, s2.raftServer->get_term() );
+    } else {
+        // S2 grants it (S3 has not seen the grant yet).
+        s3.fNet->delieverReqTo(s2_addr);
+        CHK_EQ( term + 1, s2.raftServer->get_term() );
+
+        // The new leader's first message is late: S2 times out again
+        // and sends a pre-vote of `term + 1`.
+        s2.fTimer->invoke( timer_task_type::election_timer );
+        s2.fNet->makeReqFailAll(s1_addr);
+        // It reaches S3 (still a candidate) and is granted;
+        // the answer is still in flight.
+        s2.fNet->delieverReqTo(s3_addr);
+
+        // S3 becomes the leader of `term + 1`, S2 accepts it.
+        s3.fNet->handleRespFrom(s2_addr);
+        CHK_TRUE( s3.raftServer->is_leader() );
+        s3.fNet->makeReqFailAll(s1_addr);
+        s3.fNet->execReqResp(s2_addr);
+        CHK_EQ( 3, s2.raftServer->get_leader() );
+    }
+
+    // The answer to S2's (now outdated) pre-vote arrives.
+    s2.fNet->handleRespFrom(s3_addr);
+
+    // S2 must not have started an election.
+    CHK_EQ( term + 1, s2.raftServer->get_term() );
+    s2.fNet->makeReqFailAll(s1_addr);
+    s2.fNet->execReqResp(s3_addr);
+    CHK_TRUE( s3.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
+// A forced vote (leadership takeover) started while a pre-vote of the
+// previous term is open ends that pre-vote.
+int prevote_resp_during_forced_vote_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    const uint64_t term = s2.raftServer->get_term();
+
+    // S3 stops hearing the leader and pre-votes; its requests are lost.
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    s3.fNet->makeReqFailAll(s1_addr);
+    s3.fNet->makeReqFailAll(s2_addr);
+
+    // S2 pre-votes in `term`. The leader S1 denies it, S3 grants it;
+    // the answer from S3 is still in flight.
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->execReqResp(s1_addr);
+    s2.fNet->delieverReqTo(s3_addr);
+    CHK_EQ( term, s2.raftServer->get_term() );
+
+    // S1 hands the leadership to S2: S2 accepts S1's append, S1 resigns and
+    // sends the takeover, and S2 starts a forced vote of `term + 1`.
+    s1.raftServer->yield_leadership(false, 2);
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->makeReqFailAll(s3_addr);
+    s1.fNet->execReqResp(s2_addr);
+    s1.fNet->execReqResp(s2_addr);
+    CHK_EQ( term + 1, s2.raftServer->get_term() );
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+
+    // The answer to S2's pre-vote of `term` arrives.
+    s2.fNet->handleRespFrom(s3_addr);
+
+    // S2 must not have started another election.
+    CHK_EQ( term + 1, s2.raftServer->get_term() );
+
+    // S1 grants the forced vote.
+    s2.fNet->execReqResp(s1_addr);
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+    return 0;
+}
+
 }  // namespace leader_election_test;
 using namespace leader_election_test;
 
@@ -1271,6 +1421,13 @@ int main(int argc, char** argv) {
 
     ts.doTest( "new leader ignores earlier term match test",
                new_leader_ignores_earlier_term_match_test );
+
+    ts.doTest( "stale pre-vote response test",
+               stale_prevote_resp_test,
+               TestRange<bool>({false, true}) );
+
+    ts.doTest( "pre-vote response during forced vote test",
+               prevote_resp_during_forced_vote_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");

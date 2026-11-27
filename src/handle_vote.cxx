@@ -496,6 +496,16 @@ void raft_server::handle_prevote_resp(resp_msg& resp) {
         return;
     }
 
+    if ( role_ != srv_role::candidate ||
+         pre_vote_.term_ != state_->get_term() ) {
+        // This pre-vote has ended: a leader was accepted or the term moved on.
+        p_in("[PRE-VOTE RESP] from peer %d, pre-vote term %" PRIu64 " has ended, "
+             "my role %s, term %" PRIu64 ". ignore it.",
+             resp.get_src(), pre_vote_.term_,
+             srv_role_to_string(role_).c_str(), state_->get_term());
+        return;
+    }
+
     if (resp.get_accepted()) {
         // Accept: means that this peer is not receiving HB.
         pre_vote_.dead_++;
