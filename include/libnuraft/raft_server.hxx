@@ -403,7 +403,8 @@ public:
      *     We have sent messages to other peers about priority change but haven't
      *     committed this change.
      * @return IGNORED If we're not a leader and broadcast_when_leader_exists = false,
-     *     or `srv_id` is not in the cluster config. We ignored the request.
+     *     or we're a leader and `srv_id` is not in the cluster config. We ignored
+     *     the request.
      */
     PrioritySetResult set_priority(const int srv_id,
                                    const int new_priority,
