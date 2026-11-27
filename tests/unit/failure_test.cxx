@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "debugging_options.hxx"
 #include "fake_network.hxx"
+#include "handle_custom_notification.hxx"
 #include "raft_package_fake.hxx"
 
 #include "event_awaiter.hxx"
@@ -360,6 +361,105 @@ int force_log_compaction_test() {
     return 0;
 }
 
+// Sends an out of log range warning with the given term and context from `leader`
+// to `follower`, the way `create_out_of_log_range_req` does. With `parse_fails`,
+// processing must throw `std::overflow_error`, which `rpc_session` would catch.
+static int send_out_of_log_warning(RaftPkg& leader,
+                                   RaftPkg& follower,
+                                   ulong term,
+                                   ptr<buffer> ctx,
+                                   bool parse_fails = false)
+{
+    custom_notification_msg msg(custom_notification_msg::out_of_log_range_warning);
+    msg.ctx_ = ctx;
+
+    ptr<req_msg> req = cs_new<req_msg>(term,
+                                       msg_type::custom_notification_request,
+                                       leader.myId,
+                                       follower.myId,
+                                       0,
+                                       leader.raftServer->get_last_log_idx(),
+                                       leader.raftServer->get_committed_log_idx());
+    req->log_entries().push_back(
+        cs_new<log_entry>(0, msg.serialize(), log_val_type::custom));
+
+    bool responded = false;
+    rpc_handler handler = [&](ptr<resp_msg>& resp, ptr<rpc_exception>&) {
+        responded = resp != nullptr;
+    };
+    ptr<FakeClient> client = leader.fNet->findClient(follower.myEndpoint);
+    CHK_NONNULL( client.get() );
+    CHK_EQ( 0, leader.fNet->getNumPendingReqs(follower.myEndpoint) );
+    client->send(req, handler);
+    if (parse_fails) {
+        bool thrown = false;
+        try {
+            leader.fNet->delieverReqTo(follower.myEndpoint);
+        } catch (const std::overflow_error&) {
+            thrown = true;
+        }
+        CHK_TRUE( thrown );
+        // A request whose processing threw stays queued.
+        CHK_TRUE( leader.fNet->makeReqFail(follower.myEndpoint) );
+        CHK_FALSE( responded );
+        return 0;
+    }
+    CHK_TRUE( leader.fNet->delieverReqTo(follower.myEndpoint) );
+    CHK_TRUE( leader.fNet->handleRespFrom(follower.myEndpoint) );
+    CHK_TRUE( responded );
+    return 0;
+}
+
+int out_of_log_warning_without_context_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ulong term = s2.raftServer->get_term();
+    CHK_EQ( s1.myId, s2.raftServer->get_leader() );
+
+    out_of_log_msg ool_msg;
+    ool_msg.start_idx_of_leader_ = 1;
+    ptr<buffer> ctx = ool_msg.serialize();
+
+    // Without a context, the warning is answered and ignored, even with a newer term.
+    CHK_Z( send_out_of_log_warning(s1, s2, term + 1, nullptr) );
+    CHK_FALSE( s2.fNet->isServerOutOfLogRange(s2.raftServer.get()) );
+    CHK_EQ( term, s2.raftServer->get_term() );
+    CHK_EQ( s1.myId, s2.raftServer->get_leader() );
+
+    // A context one byte short fails to parse before the warning changes anything.
+    ptr<buffer> truncated = buffer::alloc(ctx->size() - 1);
+    memcpy(truncated->data_begin(), ctx->data_begin(), truncated->size());
+    CHK_Z( send_out_of_log_warning(s1, s2, term + 1, truncated, true) );
+    CHK_FALSE( s2.fNet->isServerOutOfLogRange(s2.raftServer.get()) );
+    CHK_EQ( term, s2.raftServer->get_term() );
+    CHK_EQ( s1.myId, s2.raftServer->get_leader() );
+
+    // The same warning with its context is handled.
+    CHK_Z( send_out_of_log_warning(s1, s2, term, ctx) );
+    CHK_TRUE( s2.fNet->isServerOutOfLogRange(s2.raftServer.get()) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int uncommitted_conf_new_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -616,6 +716,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "force log compaction test",
                force_log_compaction_test );
+
+    ts.doTest( "out of log range warning without context test",
+               out_of_log_warning_without_context_test );
 
     ts.doTest( "uncommitted config for new leader test",
                uncommitted_conf_new_leader_test );
