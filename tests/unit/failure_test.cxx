@@ -551,6 +551,243 @@ int removed_server_late_step_down_test() {
     return 0;
 }
 
+// S1 leads S2 and S3, which have committed S1's log up to `b`.
+static int start_group_for_leave_test(const std::vector<RaftPkg*>& pkgs, uint64_t& b) {
+    RaftPkg& s1 = *pkgs[0];
+
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(0);
+    params.with_log_sync_stopping_gap(1);
+    CHK_Z( launch_servers(pkgs, &params) );
+    CHK_Z( make_group(pkgs) );
+
+    for (RaftPkg* pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    for (size_t ii = 0; ii < 3; ++ii) {
+        std::string msg_str = "base" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(msg_str.size() + 1);
+        msg->put(msg_str);
+        s1.raftServer->append_entries( {msg} );
+    }
+    b = s1.raftServer->get_last_log_idx();
+    for (size_t ii = 0; ii < 10; ++ii) {
+        bool done = true;
+        for (RaftPkg* pp: pkgs) {
+            if (pp->raftServer->get_target_committed_log_idx() < b) done = false;
+        }
+        if (done) break;
+        if (!s1.fNet->getNumPendingReqs(pkgs[1]->myEndpoint)) {
+            s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        }
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( b, pp->raftServer->get_committed_log_idx() );
+        if (pp != &s1) CHK_OK( pp->getTestSm()->isSame( *s1.getTestSm() ) );
+    }
+    return 0;
+}
+
+// S1 resigns, and S2 is elected in the next term with S1's vote only.
+static int elect_s2_without_s3(RaftPkg& s1, RaftPkg& s2, RaftPkg& s3,
+                               uint64_t b, bool replicate_to_s1)
+{
+    uint64_t t1 = s1.raftServer->get_term();
+    s1.raftServer->yield_leadership(true);
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    // Pre-vote, then vote, to S1.
+    for (size_t ii = 0; ii < 5 && !s2.raftServer->is_leader(); ++ii) {
+        s2.fNet->execReqResp(s1.myEndpoint);
+    }
+    s2.fNet->makeReqFailAll(s3.myEndpoint);
+
+    uint64_t t2 = s2.raftServer->get_term();
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_GT( t2, t1 );
+    CHK_EQ( t2, s1.raftServer->get_term() );
+    CHK_EQ( b, s1.raftServer->get_last_log_idx() );
+    CHK_EQ( b + 1, s2.raftServer->get_last_log_idx() );
+
+    if (replicate_to_s1) {
+        for (size_t ii = 0; ii < 5 && s1.raftServer->get_last_log_idx() <= b; ++ii) {
+            if (!s2.fNet->getNumPendingReqs(s1.myEndpoint)) {
+                s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+            }
+            s2.fNet->execReqResp(s1.myEndpoint);
+        }
+        CHK_EQ( b + 1, s1.raftServer->get_last_log_idx() );
+    }
+    return 0;
+}
+
+// S2 commits client write "x" with S1 and S3; S1 must then match S2 from `b + 1` on.
+static int check_s1_follows_s2(const std::vector<RaftPkg*>& pkgs, uint64_t b) {
+    RaftPkg& s1 = *pkgs[0];
+    RaftPkg& s2 = *pkgs[1];
+    RaftPkg& s3 = *pkgs[2];
+
+    ptr<buffer> msg = buffer::alloc(2);
+    msg->put("x");
+    s2.raftServer->append_entries( {msg} );
+    uint64_t last = s2.raftServer->get_last_log_idx();
+    for (size_t ii = 0; ii < 20; ++ii) {
+        if ( s1.raftServer->get_target_committed_log_idx() >= last &&
+             s3.raftServer->get_target_committed_log_idx() >= last ) break;
+        for (RaftPkg* ff: {&s1, &s3}) {
+            if (!s2.fNet->getNumPendingReqs(ff->myEndpoint)) {
+                s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+            }
+            s2.fNet->execReqResp(ff->myEndpoint);
+        }
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    TestSuite::Msg mm;
+    for (RaftPkg* pp: pkgs) {
+        ptr<inmem_log_store> ls = pp->getTestMgr()->get_inmem_log_store();
+        mm << pp->myEndpoint << ": last idx " << pp->raftServer->get_last_log_idx()
+           << ", commit " << pp->raftServer->get_committed_log_idx()
+           << ", servers " << pp->raftServer->get_config()->get_servers().size()
+           << ", x at " << pp->getTestSm()->isCommitted("x") << ", entries";
+        for (uint64_t ii = b + 1; ii < ls->next_slot(); ++ii) {
+            ptr<log_entry> le = ls->entry_at(ii);
+            mm << " " << ii << ":" << le->get_term() << ":"
+               << (le->get_val_type() == log_val_type::conf ? "conf" : "app");
+        }
+        mm << std::endl;
+    }
+
+    CHK_EQ( last, s2.raftServer->get_committed_log_idx() );
+    CHK_GT( s3.getTestSm()->isCommitted("x"), 0 );
+    CHK_OK( s3.getTestSm()->isSame( *s2.getTestSm() ) );
+
+    CHK_NONNULL( s1.raftServer->get_config()->get_server(3).get() );
+    CHK_GT( s1.getTestSm()->isCommitted("x"), 0 );
+    CHK_OK( s1.getTestSm()->isSame( *s2.getTestSm() ) );
+    CHK_EQ( last, s1.raftServer->get_last_log_idx() );
+    for (uint64_t ii = b + 1; ii <= last; ++ii) {
+        ptr<log_entry> e1 = s1.getTestMgr()->get_inmem_log_store()->entry_at(ii);
+        ptr<log_entry> e2 = s2.getTestMgr()->get_inmem_log_store()->entry_at(ii);
+        TestSuite::setInfo("log idx %zu", (size_t)ii);
+        CHK_EQ( e2->get_term(), e1->get_term() );
+        CHK_EQ( (int)e2->get_val_type(), (int)e1->get_val_type() );
+        CHK_EQ( e2->get_buf().size(), e1->get_buf().size() );
+        CHK_Z( memcmp( e1->get_buf().data_begin(),
+                       e2->get_buf().data_begin(),
+                       e1->get_buf().size() ) );
+    }
+    return 0;
+}
+
+static void fail_pending_requests(const std::vector<RaftPkg*>& pkgs) {
+    for (RaftPkg* src: pkgs) {
+        for (RaftPkg* dst: pkgs) {
+            if (src != dst) src->fNet->makeReqFailAll(dst->myEndpoint);
+        }
+    }
+}
+
+int deposed_leader_ignores_leave_response_test(bool after_new_leader_entry) {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    uint64_t b = 0;
+    CHK_Z( start_group_for_leave_test(pkgs, b) );
+
+    CHK_TRUE( s1.raftServer->remove_srv(3)->get_accepted() );
+    ptr<req_msg> leave_req = s1.fNet->getFirstPendingReq(s3.myEndpoint);
+    CHK_NONNULL( leave_req.get() );
+    CHK_EQ( (int)msg_type::leave_cluster_request, (int)leave_req->get_type() );
+
+    // S3 accepts to leave, and its response is held.
+    CHK_TRUE( s1.fNet->delieverReqTo(s3.myEndpoint) );
+    CHK_EQ( 1, s1.fNet->getNumPendingResps(s3.myEndpoint) );
+
+    CHK_Z( elect_s2_without_s3(s1, s2, s3, b, after_new_leader_entry) );
+    uint64_t x0 = s1.raftServer->get_last_log_idx();
+
+    CHK_TRUE( s1.fNet->handleRespFrom(s3.myEndpoint) );
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_EQ( x0, s1.raftServer->get_last_log_idx() );
+
+    CHK_Z( check_s1_follows_s2(pkgs, b) );
+
+    print_stats(pkgs);
+
+    fail_pending_requests(pkgs);
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int deposed_leader_ignores_leave_rpc_error_test(bool heartbeat_error) {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    uint64_t b = 0;
+    CHK_Z( start_group_for_leave_test(pkgs, b) );
+
+    if (heartbeat_error) {
+        // The leave request waits behind this heartbeat.
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        CHK_EQ( 1, s1.fNet->getNumPendingReqs(s3.myEndpoint) );
+    }
+    CHK_TRUE( s1.raftServer->remove_srv(3)->get_accepted() );
+    CHK_EQ( 1, s1.fNet->getNumPendingReqs(s3.myEndpoint) );
+    ptr<req_msg> pending = s1.fNet->getFirstPendingReq(s3.myEndpoint);
+    CHK_NONNULL( pending.get() );
+    CHK_EQ( (int)( heartbeat_error ? msg_type::append_entries_request
+                                   : msg_type::leave_cluster_request ),
+            (int)pending->get_type() );
+
+    CHK_Z( elect_s2_without_s3(s1, s2, s3, b, true) );
+    uint64_t x0 = s1.raftServer->get_last_log_idx();
+
+    CHK_TRUE( s1.fNet->makeReqFail(s3.myEndpoint) );
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_EQ( x0, s1.raftServer->get_last_log_idx() );
+
+    CHK_Z( check_s1_follows_s2(pkgs, b) );
+
+    print_stats(pkgs);
+
+    fail_pending_requests(pkgs);
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int remove_server_on_pending_configs_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -622,6 +859,14 @@ int main(int argc, char** argv) {
 
     ts.doTest( "removed server late step down test",
                removed_server_late_step_down_test );
+
+    ts.doTest( "deposed leader ignores leave response test",
+               deposed_leader_ignores_leave_response_test,
+               TestRange<bool>({false, true}) );
+
+    ts.doTest( "deposed leader ignores leave rpc error test",
+               deposed_leader_ignores_leave_rpc_error_test,
+               TestRange<bool>({false, true}) );
 
     ts.doTest( "remove server on pending configs test",
                remove_server_on_pending_configs_test );
