@@ -781,6 +781,16 @@ bool raft_server::handle_snapshot_sync_req(snapshot_sync_req& req, std::unique_l
                                              is_first_obj,
                                              is_last_obj);
         req.set_offset(obj_id);
+        if (is_last_obj && !is_first_obj && obj_id == 0) {
+            // Resetting a later object's ID to 0 asks to restart the transfer:
+            // the snapshot is incomplete.
+            p_wn("state machine asked to restart the transfer of snapshot (idx %" PRIu64
+                 ", term %" PRIu64 ") at its last object",
+                 req.get_snapshot().get_last_log_idx(),
+                 req.get_snapshot().get_last_log_term());
+            req.set_done(false);
+            return true;
+        }
     }
 
     if (is_last_obj) {
