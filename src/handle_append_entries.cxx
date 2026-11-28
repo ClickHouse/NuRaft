@@ -1317,6 +1317,31 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
                     resp->set_async_cb([promise]() { return promise; });
                 }
             } else {
+                // Blocking mode (no streaming): apply the leader's commit index
+                // for entries this node already holds durably before waiting for
+                // the new entries of this request (they start at
+                // `get_last_log_idx() + 1`). Entries <= `get_last_log_idx()`
+                // match the leader's log (`log_okay` check above) and are
+                // committed by its quorum. Bounded by `precommit_index_` because
+                // `commit_app_log` aborts if an applied index exceeds it (the
+                // commit after the wait gets that guarantee from
+                // `try_update_precommit_index`, which runs only after the wait).
+                // The response still waits for durability below, and the commit
+                // covering the new entries still happens after the wait.
+                uint64_t early_commit_idx = std::min<uint64_t>(
+                    { req.get_commit_idx(),
+                      req.get_last_log_idx(),
+                      log_store_->last_durable_index(),
+                      precommit_index_.load() } );
+                if (early_commit_idx > quick_commit_index_) {
+                    leader_commit_index_.store(req.get_commit_idx());
+                    p_ts( "early commit upto %" PRIu64 " before durability wait, "
+                          "req commit idx %" PRIu64 ", req last log idx %" PRIu64,
+                          early_commit_idx, req.get_commit_idx(),
+                          req.get_last_log_idx() );
+                    commit(early_commit_idx);
+                }
+
                 uint64_t last_durable_index = log_store_->last_durable_index();
                 while ( last_durable_index < required_durable ) {
                     if (stopping_) return resp;
