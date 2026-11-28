@@ -596,6 +596,124 @@ int remove_server_on_pending_configs_test() {
     return 0;
 }
 
+int retry_join_after_rpc_error_test(bool log_sync) {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(0);
+    params.with_log_sync_stopping_gap(1);
+
+    bool join_failed = false;
+    auto callback = [&](cb_func::Type type, cb_func::Param* param) {
+        if (type == cb_func::Type::ServerJoinFailed) {
+            join_failed = true;
+            return cb_func::ReturnCode::Ok;
+        }
+        return cb_default(type, param);
+    };
+    CHK_Z( launch_servers( pkgs, &params, false, callback ) );
+
+    // A failed join or log sync request is retried only while the peer's
+    // backoff is below `max_hb_interval()`, which the election timeout above
+    // makes equal to the heartbeat interval (no retry at all).
+    raft_params s1_params = s1.raftServer->get_current_params();
+    s1_params.with_election_timeout_lower(20000);
+    s1_params.with_election_timeout_upper(30000);
+    s1.raftServer->update_params(s1_params);
+
+    if (log_sync) {
+        // Committed entries S2 lacks: the join is followed by a log sync.
+        for (size_t ii = 0; ii < 5; ++ii) {
+            std::string test_msg = "test" + std::to_string(ii);
+            ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+            msg->put(test_msg);
+            ptr< cmd_result< ptr<buffer> > > ret =
+                s1.raftServer->append_entries( {msg} );
+            CHK_TRUE( ret->get_accepted() );
+        }
+        CHK_Z( wait_for_sm_exec({&s1}, COMMIT_TIMEOUT_SEC) );
+    }
+
+    CHK_TRUE( s1.raftServer->add_srv( *s2.getTestMgr()->get_srv_config() )
+                  ->get_accepted() );
+    ptr<peer> joiner = s1.fNet->getServerToJoin(s1.raftServer.get());
+    CHK_NONNULL( joiner.get() );
+    if (log_sync) {
+        // Join req/resp.
+        CHK_TRUE( s1.fNet->execReqResp(s2_addr) );
+    }
+    int type = log_sync ? msg_type::sync_log_request
+                        : msg_type::join_cluster_request;
+    CHK_EQ( 1, s1.fNet->getNumPendingReqs(s2_addr) );
+    CHK_EQ( type, (int)s1.fNet->getFirstPendingReq(s2_addr)->get_type() );
+
+    // One transient error: the request is scheduled for a retry.
+    CHK_TRUE( s1.fNet->makeReqFail(s2_addr) );
+    CHK_EQ( 1, s1.fTimer->getNumPendingTasks(0) );
+    CHK_FALSE( join_failed );
+    CHK_TRUE( joiner == s1.fNet->getServerToJoin(s1.raftServer.get()) );
+    CHK_EQ( 0, s1.fNet->getNumPendingReqs(s2_addr) );
+
+    // The retry fires; the network is healthy again.
+    s1.fTimer->invoke(0);
+    _msg( "after the retry: %zu pending reqs to S2, joiner busy %d, "
+          "join failed %d\n",
+          s1.fNet->getNumPendingReqs(s2_addr),
+          (int)joiner->is_busy(), (int)join_failed );
+
+    // The retried request is sent.
+    CHK_EQ( 1, s1.fNet->getNumPendingReqs(s2_addr) );
+    CHK_EQ( type, (int)s1.fNet->getFirstPendingReq(s2_addr)->get_type() );
+
+    // Its response releases the peer.
+    CHK_TRUE( s1.fNet->delieverReqTo(s2_addr) );
+    CHK_TRUE( s1.fNet->handleRespFrom(s2_addr) );
+    CHK_FALSE( joiner->is_busy() );
+
+    // The join completes.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    std::vector< ptr<srv_config> > s2_configs;
+    for (size_t ii = 0; ii < 5; ++ii) {
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->execReqResp();
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+        s2_configs.clear();
+        s2.raftServer->get_srv_config_all(s2_configs);
+        if (s1.raftServer->get_srv_config(2) && s2_configs.size() == 2) break;
+    }
+    CHK_NONNULL( s1.raftServer->get_srv_config(2).get() );
+    CHK_EQ( 2, s2_configs.size() );
+    CHK_FALSE( join_failed );
+    if (log_sync) {
+        CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    }
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 }  // namespace failure_test;
 using namespace failure_test;
 
@@ -625,6 +743,10 @@ int main(int argc, char** argv) {
 
     ts.doTest( "remove server on pending configs test",
                remove_server_on_pending_configs_test );
+
+    ts.doTest( "retry join after rpc error test",
+               retry_join_after_rpc_error_test,
+               TestRange<bool>({false, true}) );
 
     return 0;
 }

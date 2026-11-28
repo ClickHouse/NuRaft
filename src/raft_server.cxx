@@ -2015,8 +2015,16 @@ void raft_server::handle_ext_resp_err(rpc_exception& err) {
 }
 
 void raft_server::on_retryable_req_err(ptr<peer>& p, ptr<req_msg>& req) {
+    recur_lock(lock_);
     p_db( "retry the request %s for %d",
           msg_type_to_string(req->get_type()).c_str(), p->get_id() );
+    // The failed request closed the connection; nothing else reconnects
+    // the server being added.
+    if (!stopping_ && p == srv_to_join_ && p->need_to_reconnect()) {
+        ptr<srv_config> s_config =
+            srv_config::deserialize( *p->get_config().serialize() );
+        p->recreate_rpc(s_config, *ctx_);
+    }
     if (p->make_busy()) {
         p->send_req(p, req, ex_resp_handler_);
     } else {
