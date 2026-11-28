@@ -482,8 +482,10 @@ private:
 };
 
 static VOID_UNUSED reset_log_files() {
+    // `srv*.log*`: a stale rotated `srv<N>.log.1` makes SimpleLogger log into it
+    // instead of `srv<N>.log`.
     std::stringstream ss;
-    ss << "srv*.log ";
+    ss << "srv*.log* ";
 
 #if defined(__linux__) || defined(__APPLE__)
     std::string cmd = "rm -f base.log " + ss.str() + "2> /dev/null";
