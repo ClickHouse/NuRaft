@@ -19,6 +19,7 @@ limitations under the License.
 #include "fake_network.hxx"
 #include "raft_package_fake.hxx"
 #include "fake_executer.hxx"
+#include "handle_custom_notification.hxx"
 
 #include "event_awaiter.hxx"
 #include "raft_params.hxx"
@@ -781,6 +782,329 @@ int leadership_takeover_by_request_test() {
     return 0;
 }
 
+// S1 (priority 3) is the leader, S2 is a learner with `learner_priority`,
+// S3 (priority 1) is a voting member.
+static int launch_with_learner(const std::vector<RaftPkg*>& pkgs,
+                               int32 learner_priority)
+{
+    auto init_cb = [&](RaftPkg* pp) {
+        ptr<srv_config> s_conf = pp->getTestMgr()->get_srv_config();
+        if (pp->myId == 1) {
+            s_conf->set_priority(3);
+        } else if (pp->myId == 2) {
+            s_conf->set_learner(true);
+            s_conf->set_priority(learner_priority);
+        } else {
+            s_conf->set_priority(1);
+        }
+    };
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb_default, init_cb ) );
+    CHK_Z( make_group( pkgs ) );
+
+    RaftPkg& s1 = *pkgs[0];
+    CHK_TRUE( s1.raftServer->is_leader() );
+    ptr<cluster_config> c_conf = s1.raftServer->get_config();
+    CHK_FALSE( c_conf->get_server(1)->is_learner() );
+    CHK_EQ( 3, c_conf->get_server(1)->get_priority() );
+    CHK_TRUE( c_conf->get_server(2)->is_learner() );
+    CHK_EQ( learner_priority, c_conf->get_server(2)->get_priority() );
+    CHK_FALSE( c_conf->get_server(3)->is_learner() );
+    CHK_EQ( 1, c_conf->get_server(3)->get_priority() );
+    return 0;
+}
+
+// S1 resigned to S3: S3 becomes the leader, and the learner S2 never
+// started an election.
+static int check_s3_takes_over(const std::vector<RaftPkg*>& pkgs) {
+    RaftPkg& s1 = *pkgs[0];
+    RaftPkg& s2 = *pkgs[1];
+    RaftPkg& s3 = *pkgs[2];
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_Z( s2.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_Z( s2.fNet->getNumPendingReqs(s3.myEndpoint) );
+    CHK_GT( s3.fNet->getNumPendingReqs(s1.myEndpoint), 0 );
+
+    // Send vote requests.
+    s3.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Send new config as a new leader.
+    s3.fNet->execReqResp();
+    // Follow-up: commit.
+    s3.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+    CHK_TRUE( s3.raftServer->is_leader() );
+    CHK_EQ( 3, s1.raftServer->get_leader() );
+    CHK_EQ( 3, s2.raftServer->get_leader() );
+    CHK_EQ( 3, s3.raftServer->get_leader() );
+    return 0;
+}
+
+int learner_not_chosen_as_yield_successor_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_with_learner(pkgs, 2) );
+
+    // Yield leadership without a successor.
+    s1.dbgLog(" --- yield leadership ---");
+    s1.raftServer->yield_leadership();
+    // Send heartbeat.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    // After getting response of heartbeat, S1 will resign.
+    s1.fNet->execReqResp();
+
+    CHK_Z( check_s3_takes_over(pkgs) );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int learner_designated_as_yield_successor_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_with_learner(pkgs, 2) );
+
+    // The learner requests the leadership.
+    s2.dbgLog(" --- request leadership ---");
+    CHK_TRUE( s2.raftServer->request_leadership() );
+    // Send request.
+    s2.fNet->execReqResp();
+
+    // Send heartbeat.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    // After getting response of heartbeat, S1 will resign.
+    s1.fNet->execReqResp();
+
+    CHK_Z( check_s3_takes_over(pkgs) );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+// Delivers a leadership takeover request from `src` to `dst` in `term`,
+// as a resigning leader sends it.
+static int send_leadership_takeover(RaftPkg& src, RaftPkg& dst, ulong term) {
+    ptr<req_msg> req = cs_new<req_msg>
+                       ( term,
+                         msg_type::custom_notification_request,
+                         src.myId,
+                         dst.myId,
+                         src.raftServer->get_last_log_term(),
+                         src.raftServer->get_last_log_idx(),
+                         src.raftServer->get_committed_log_idx() );
+    ptr<custom_notification_msg> custom_noti =
+        cs_new<custom_notification_msg>
+        ( custom_notification_msg::leadership_takeover );
+    req->log_entries().push_back
+        ( cs_new<log_entry>(0, custom_noti->serialize(), log_val_type::custom) );
+
+    rpc_handler ignore_response =
+        [](ptr<resp_msg>&, ptr<rpc_exception>&) { return 0; };
+    src.fNet->findClient(dst.myEndpoint)->send(req, ignore_response);
+    CHK_TRUE( src.fNet->delieverReqTo(dst.myEndpoint) );
+    CHK_TRUE( src.fNet->handleRespFrom(dst.myEndpoint) );
+    return 0;
+}
+
+int learner_ignores_leadership_takeover_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_with_learner(pkgs, 2) );
+
+    ulong term = s1.raftServer->get_term();
+    CHK_EQ( term, s2.raftServer->get_term() );
+    CHK_Z( s1.fNet->getNumPendingReqs(s2.myEndpoint) );
+
+    // The learner gets a takeover request, e.g. from a leader of an older
+    // version that chose it as the successor.
+    s1.dbgLog(" --- send leadership takeover request to the learner ---");
+    CHK_Z( send_leadership_takeover(s1, s2, term) );
+
+    // It does not start an election.
+    CHK_EQ( term, s2.raftServer->get_term() );
+    CHK_Z( s2.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_Z( s2.fNet->getNumPendingReqs(s3.myEndpoint) );
+    CHK_FALSE( s2.raftServer->is_leader() );
+    CHK_EQ( 1, s2.raftServer->get_leader() );
+    CHK_TRUE( s1.raftServer->is_leader() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int learner_not_chosen_by_leadership_transfer_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    // The learner has the highest priority.
+    CHK_Z( launch_with_learner(pkgs, 5) );
+
+    // Enable leadership transfer, checked once per heartbeat interval.
+    raft_params params = s1.raftServer->get_current_params();
+    params.leadership_transfer_min_wait_time_ = 1;
+    params.heart_beat_interval_ = 100;
+    params.election_timeout_lower_bound_ = 10000;
+    params.election_timeout_upper_bound_ = 20000;
+    s1.raftServer->update_params(params);
+    TestSuite::sleep_ms(250);
+
+    for (size_t ii = 0; ii < 3; ++ii) {
+        // Send heartbeat, S3 first so that it has responded just now when
+        // the leadership transfer is checked.
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->execReqResp(s3.myEndpoint);
+        s1.fNet->execReqResp(s2.myEndpoint);
+        s1.fNet->execReqResp();
+    }
+    s3.fNet->execReqResp();
+    s2.fNet->execReqResp();
+
+    // No server has a higher priority than S1 except the learner,
+    // so S1 keeps the leadership.
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_EQ( 1, s1.raftServer->get_leader() );
+    CHK_EQ( 1, s2.raftServer->get_leader() );
+    CHK_EQ( 1, s3.raftServer->get_leader() );
+    CHK_Z( s2.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_Z( s2.fNet->getNumPendingReqs(s3.myEndpoint) );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int learner_flipped_during_pre_vote_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3, &s4};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    ulong term = s3.raftServer->get_term();
+
+    // S3 sends pre-vote requests while it is a voting member.
+    s3.dbgLog(" --- invoke election timer of S3 ---");
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s2.myEndpoint) );
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s4.myEndpoint) );
+
+    // Before the responses arrive, S3 becomes a learner.
+    s1.dbgLog(" --- update config to make S3 a learner ---");
+    auto enc_config = s1.raftServer->get_srv_config(s3.myId)->serialize();
+    ptr<srv_config> new_config = srv_config::deserialize(*enc_config);
+    new_config->set_learner(true);
+    CHK_TRUE( s1.raftServer->update_srv_config(*new_config) );
+
+    // Packet for pre-commit.
+    s1.fNet->execReqResp();
+    // Packet for commit.
+    s1.fNet->execReqResp();
+    // Wait for bg commit.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // One more time for member that was not in quorum.
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_TRUE( s3.raftServer->get_srv_config(s3.myId)->is_learner() );
+    CHK_EQ( term, s3.raftServer->get_term() );
+
+    // The leader fails, S2 and S4 stop seeing it.
+    s1.fNet->goesOffline();
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s4.fTimer->invoke( timer_task_type::election_timer );
+    CHK_FALSE( s2.raftServer->is_leader_alive() );
+    CHK_FALSE( s4.raftServer->is_leader_alive() );
+
+    // S2 and S4 grant the pre-vote of S3, which does not start a vote.
+    CHK_TRUE( s3.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_TRUE( s3.fNet->handleRespFrom(s2.myEndpoint) );
+    CHK_TRUE( s3.fNet->delieverReqTo(s4.myEndpoint) );
+    CHK_TRUE( s3.fNet->handleRespFrom(s4.myEndpoint) );
+
+    CHK_EQ( term, s3.raftServer->get_term() );
+    CHK_EQ( 1, s3.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_Z( s3.fNet->getNumPendingReqs(s2.myEndpoint) );
+    CHK_Z( s3.fNet->getNumPendingReqs(s4.myEndpoint) );
+    CHK_FALSE( s3.raftServer->is_leader() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int leadership_takeover_offline_candidate_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -1262,6 +1586,21 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leadership takeover by request test",
                leadership_takeover_by_request_test );
+
+    ts.doTest( "learner not chosen as yield successor test",
+               learner_not_chosen_as_yield_successor_test );
+
+    ts.doTest( "learner designated as yield successor test",
+               learner_designated_as_yield_successor_test );
+
+    ts.doTest( "learner ignores leadership takeover test",
+               learner_ignores_leadership_takeover_test );
+
+    ts.doTest( "learner not chosen by leadership transfer test",
+               learner_not_chosen_by_leadership_transfer_test );
+
+    ts.doTest( "learner flipped during pre-vote test",
+               learner_flipped_during_pre_vote_test );
 
     ts.doTest( "leadership takeover with offline candidate test",
                leadership_takeover_offline_candidate_test );

@@ -1431,7 +1431,7 @@ void raft_server::check_leadership_transfer() {
         ptr<peer> peer_elem = entry.second;
         const srv_config& s_conf = peer_elem->get_config();
         int32 cur_priority = s_conf.get_priority();
-        if (cur_priority > max_priority) {
+        if (cur_priority > max_priority && is_regular_member(peer_elem)) {
             max_priority = cur_priority;
             successor_id = s_conf.get_id();
         }
@@ -1521,7 +1521,7 @@ void raft_server::yield_leadership(bool immediate_yield,
     if (successor_id >= 0) {
         // If successor is given, find that one.
         auto entry = peers_.find(successor_id);
-        if (entry != peers_.end()) {
+        if (entry != peers_.end() && is_regular_member(entry->second)) {
             int32 srv_id = entry->first;
             ptr<peer>& pp = entry->second;
             max_priority = pp->get_config().get_priority();
@@ -1540,6 +1540,7 @@ void raft_server::yield_leadership(bool immediate_yield,
             uint64_t pp_last_resp_ms = pp->get_resp_timer_us() / 1000;
 
             if ( srv_id != id_ &&
+                 is_regular_member(pp) &&
                  pp_last_resp_ms <= hb_interval_ms &&
                  pp->get_config().get_priority() > max_priority ) {
                 max_priority = pp->get_config().get_priority();

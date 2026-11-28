@@ -197,6 +197,11 @@ void raft_server::request_prevote() {
 }
 
 void raft_server::initiate_vote(bool force_vote) {
+    if (im_learner_) {
+        p_wn("this server is a learner, will not initiate vote");
+        return;
+    }
+
     int grace_period = ctx_->get_params()->grace_period_of_lagging_state_machine_;
     ulong cur_term = state_->get_term();
     if ( !force_vote &&
