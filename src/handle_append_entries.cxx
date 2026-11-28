@@ -1478,6 +1478,16 @@ bool raft_server::try_update_precommit_index(ulong desired, const size_t MAX_ATT
 }
 
 void raft_server::handle_append_entries_resp(resp_msg& resp) {
+    // Only the leader that sent the request may act on its acknowledgement.
+    if ( role_ != srv_role::leader ||
+         ( resp.get_accepted() && resp.get_term() != state_->get_term() ) ) {
+        p_db( "ignore append_entries response from peer %d: role %s, "
+              "response term %" PRIu64 ", my term %" PRIu64,
+              resp.get_src(), srv_role_to_string(role_).c_str(),
+              resp.get_term(), state_->get_term() );
+        return;
+    }
+
     peer_itor it = peers_.find(resp.get_src());
     if (it == peers_.end()) {
         p_in("the response is from an unknown peer %d", resp.get_src());
@@ -2171,6 +2181,8 @@ void raft_server::notify_log_append_completion(bool ok) {
 
     if (role_ == srv_role::leader) {
         recur_lock(lock_);
+        // The role can change while waiting for `lock_`.
+        if (role_ != srv_role::leader) return;
         // Leader: commit the log and send append_entries request, if needed.
         uint64_t prev_committed_index = quick_commit_index_.load();
         uint64_t committed_index = get_expected_committed_log_idx();
