@@ -66,6 +66,7 @@ public:
 
     ptr<buffer> commit(const ulong log_idx, buffer& data) {
         std::lock_guard<std::mutex> ll(dataLock);
+        if (!matchesPreCommit(log_idx, data)) numCommitsWithoutPreCommit++;
         commits[log_idx] = buffer::copy(data);
 
         ptr<buffer> ret = buffer::alloc(sizeof(ulong));
@@ -81,6 +82,7 @@ public:
     ptr<buffer> pre_commit(const ulong log_idx, buffer& data) {
         std::lock_guard<std::mutex> ll(dataLock);
         preCommits[log_idx] = buffer::copy(data);
+        preCommitIdxs.push_back(log_idx);
 
         ptr<buffer> ret = buffer::alloc(sizeof(ulong));
         buffer_serializer bs(ret);
@@ -90,7 +92,9 @@ public:
 
     void rollback(const ulong log_idx, buffer& data) {
         std::lock_guard<std::mutex> ll(dataLock);
+        if (!matchesPreCommit(log_idx, data)) numRollbacksWithoutPreCommit++;
         rollbacks.push_back(log_idx);
+        preCommits.erase(log_idx);
     }
 
     void save_logical_snp_obj(snapshot& s,
@@ -290,6 +294,20 @@ public:
         return rollbacks;
     }
 
+    const std::list<uint64_t>& getPreCommitIdxs() const {
+        return preCommitIdxs;
+    }
+
+    uint64_t getNumCommitsWithoutPreCommit() const {
+        std::lock_guard<std::mutex> ll(dataLock);
+        return numCommitsWithoutPreCommit;
+    }
+
+    uint64_t getNumRollbacksWithoutPreCommit() const {
+        std::lock_guard<std::mutex> ll(dataLock);
+        return numRollbacksWithoutPreCommit;
+    }
+
     bool isSame(const TestSm& with, bool check_precommit = false) {
         // NOTE:
         //   To avoid false alarm by TSAN (regarding lock order inversion),
@@ -389,7 +407,20 @@ public:
     }
 
 private:
+    // Caller holds `dataLock`.
+    bool matchesPreCommit(ulong log_idx, buffer& data) const {
+        auto entry = preCommits.find(log_idx);
+        if (entry == preCommits.end()) return false;
+        const ptr<buffer>& pre = entry->second;
+        size_t len = data.size() - data.pos();
+        return pre->size() == len &&
+               !memcmp(pre->data_begin(), data.data(), len);
+    }
+
     std::map<uint64_t, ptr<buffer>> preCommits;
+    std::list<uint64_t> preCommitIdxs;
+    uint64_t numCommitsWithoutPreCommit = 0;
+    uint64_t numRollbacksWithoutPreCommit = 0;
     std::map<uint64_t, ptr<buffer>> commits;
     std::list<uint64_t> rollbacks;
     mutable std::mutex dataLock;

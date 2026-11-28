@@ -424,10 +424,45 @@ ptr<resp_msg> raft_server::handle_log_sync_req(req_msg& req) {
         return resp;
     }
 
-    log_store_->apply_pack(req.get_last_log_idx() + 1, entries[0]->get_buf());
-    p_db("last log %" PRIu64, log_store_->next_slot() - 1);
-    precommit_index_ = log_store_->next_slot() - 1;
-    commit(log_store_->next_slot() - 1);
+    ulong first_idx = req.get_last_log_idx() + 1;
+    // Committed entries are kept. Pre-committed entries above them are
+    // replaced by the pack, so roll them back first, backwards.
+    ulong precommit_from = std::max(first_idx, quick_commit_index_.load() + 1);
+    ulong rollback_to = std::min( precommit_index_.load(),
+                                  log_store_->next_slot() - 1 );
+    for (ulong idx = rollback_to; idx >= precommit_from; --idx) {
+        ptr<log_entry> old_entry = log_store_->entry_at(idx);
+        ptr<buffer> buf = old_entry->get_buf_ptr();
+        if (old_entry->get_val_type() == log_val_type::app_log) {
+            buf->pos(0);
+            state_machine_->rollback_ext
+                ( state_machine::ext_op_params( idx, buf, old_entry ) );
+            p_in( "rollback log %" PRIu64 ", term %" PRIu64,
+                  idx, old_entry->get_term() );
+
+        } else if (old_entry->get_val_type() == log_val_type::conf) {
+            ptr<cluster_config> conf_to_rollback =
+                cluster_config::deserialize(*buf);
+            state_machine_->rollback_config(idx, conf_to_rollback);
+            p_in( "revert from a prev config change to config at %" PRIu64,
+                  get_config()->get_log_idx() );
+            config_changing_ = false;
+        }
+    }
+
+    log_store_->apply_pack(first_idx, entries[0]->get_buf());
+    ulong last_idx = log_store_->next_slot() - 1;
+    p_db("last log %" PRIu64, last_idx);
+    for (ulong idx = precommit_from; idx <= last_idx; ++idx) {
+        ptr<log_entry> entry = log_store_->entry_at(idx);
+        if (entry->get_val_type() != log_val_type::app_log) continue;
+        ptr<buffer> buf = entry->get_buf_ptr();
+        buf->pos(0);
+        state_machine_->pre_commit_ext
+            ( state_machine::ext_op_params( idx, buf, entry ) );
+    }
+    precommit_index_ = last_idx;
+    commit(last_idx);
     resp->accept(log_store_->next_slot());
     return resp;
 }

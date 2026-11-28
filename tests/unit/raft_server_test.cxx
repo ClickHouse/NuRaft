@@ -24,6 +24,8 @@ limitations under the License.
 #include "raft_params.hxx"
 #include "test_common.h"
 
+#include <algorithm>
+#include <set>
 #include <stdio.h>
 #include <string>
 
@@ -1474,6 +1476,255 @@ int stale_joiner_response_after_role_change_test()
             s1.fNet->getServerToJoinNextLogIdx(s1.raftServer.get()) );
     CHK_EQ( s3_matched_idx,
             s1.fNet->getServerToJoinMatchedIdx(s1.raftServer.get()) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int log_sync_pre_commits_entries_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    // `RaftPkg` defaults without snapshots, so only the log sync and
+    // append_entries carry entries to S2.
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(0);
+    params.with_log_sync_stopping_gap(1);
+    CHK_Z( launch_servers( pkgs, &params ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    s1.raftServer->add_srv(*s2.getTestMgr()->get_srv_config());
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+
+    ptr<req_msg> sync_req = s1.fNet->getFirstPendingReq(s2.myEndpoint);
+    CHK_NONNULL( sync_req.get() );
+    CHK_EQ( msg_type::sync_log_request, sync_req->get_type() );
+    CHK_TRUE( s1.fNet->delieverReqTo(s2.myEndpoint) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // The same request again, as the leader resends it after an RPC error.
+    s2.fNet->gotMsg(sync_req);
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Finish the join.
+    CHK_TRUE( s1.fNet->handleRespFrom(s2.myEndpoint) );
+    for (size_t ii = 0; ii < 20; ++ii)
+    {
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        if ( !s1.fNet->getNumPendingReqs(s2.myEndpoint) &&
+             !s1.fNet->getNumPendingResps(s2.myEndpoint) ) break;
+    }
+    // Heartbeats carry the new configuration's commit to S2.
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s1.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_NONNULL( s1.raftServer->get_config()->get_server(s2.myId).get() );
+    CHK_FALSE( s2.raftServer->is_catching_up() );
+
+    const std::list<uint64_t>& idxs = s2.getTestSm()->getPreCommitIdxs();
+    std::string idxs_str;
+    for (uint64_t idx: idxs) idxs_str += std::to_string(idx) + " ";
+    _msg("S2 pre-commit indices: %s\n", idxs_str.c_str());
+
+    // S2 committed only entries it had pre-committed, with the same payload.
+    CHK_Z( s2.getTestSm()->getNumCommitsWithoutPreCommit() );
+    // Every entry S2 committed was pre-committed, with the leader's payload.
+    CHK_TRUE( s2.getTestSm()->isSame(*s1.getTestSm(), true) );
+    // Nothing was pre-committed twice, and pre-commits came in log order.
+    std::set<uint64_t> idxs_set(idxs.begin(), idxs.end());
+    CHK_EQ( idxs.size(), idxs_set.size() );
+    CHK_TRUE( std::is_sorted(idxs.begin(), idxs.end()) );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int log_sync_rolls_back_replaced_entries_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    raft_params params;
+    params.with_election_timeout_lower(0);
+    params.with_election_timeout_upper(10000);
+    params.with_hb_interval(5000);
+    params.with_client_req_timeout(1000000);
+    params.with_reserved_log_items(0);
+    params.with_snapshot_enabled(0);
+    params.with_log_sync_stopping_gap(1);
+    CHK_Z( launch_servers( pkgs, &params ) );
+    CHK_Z( make_group( pkgs ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (auto& entry: pkgs)
+    {
+        raft_params param = entry->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        entry->raftServer->update_params(param);
+    }
+
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        CHK_TRUE( append_one(s1, 1)->get_accepted() );
+    }
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    uint64_t idx_before_div =
+        s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    CHK_EQ( idx_before_div, s1.raftServer->get_committed_log_idx() );
+
+    // S1 pre-commits a tail that nobody else receives.
+    const size_t MORE1 = 3;
+    for (size_t ii = 0; ii < MORE1; ++ii)
+    {
+        std::string test_msg = "more" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        s1.raftServer->append_entries( {msg} );
+    }
+    uint64_t idx_after_div =
+        s1.getTestMgr()->load_log_store()->next_slot() - 1;
+    CHK_EQ( idx_before_div + MORE1, idx_after_div );
+    CHK_EQ( idx_after_div, s1.getTestSm()->getPreCommitIdxs().back() );
+
+    // S2 becomes the leader with S3's vote.
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    for (size_t ii = 0; ii < 4; ++ii)
+    {
+        s2.fNet->execReqResp( s3_addr );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    s2.fNet->makeReqFailAll( s1_addr );
+    s3.fNet->makeReqFailAll( s1_addr );
+    s3.fNet->makeReqFailAll( s2_addr );
+
+    // S2 removes S1, which does not respond.
+    s2.raftServer->remove_srv( s1.myId );
+    s2.fNet->execReqResp( s3_addr );
+    s2.fNet->makeReqFailAll( s1_addr );
+    for (size_t ii = 0; ii < 10; ++ii)
+    {
+        s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s2.fNet->execReqResp( s3_addr );
+        s2.fNet->makeReqFailAll( s1_addr );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    {
+        std::vector< ptr<srv_config> > configs;
+        s2.raftServer->get_srv_config_all(configs);
+        CHK_EQ( 2, configs.size() );
+    }
+
+    // The cluster commits entries that replace S1's tail.
+    const size_t MORE2 = MORE1 + 2;
+    for (size_t ii = 0; ii < MORE2; ++ii)
+    {
+        std::string test_msg = "diverged" + std::to_string(ii);
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        s2.raftServer->append_entries( {msg} );
+    }
+    for (size_t ii = 0; ii < 3; ++ii)
+    {
+        s2.fNet->execReqResp( s3_addr );
+        s2.fNet->makeReqFailAll( s1_addr );
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_GT( s2.raftServer->get_committed_log_idx(), idx_after_div + 1 );
+
+    // S2 adds S1 back; the log sync starts inside S1's pre-committed tail.
+    s2.raftServer->add_srv( *s1.getTestMgr()->get_srv_config() );
+    CHK_TRUE( s2.fNet->delieverReqTo( s1_addr ) );
+    CHK_TRUE( s2.fNet->handleRespFrom( s1_addr ) );
+
+    ptr<req_msg> sync_req = s2.fNet->getFirstPendingReq( s1_addr );
+    CHK_NONNULL( sync_req.get() );
+    CHK_EQ( msg_type::sync_log_request, sync_req->get_type() );
+    CHK_GTEQ( idx_after_div, sync_req->get_last_log_idx() + 1 );
+    CHK_TRUE( s2.fNet->delieverReqTo( s1_addr ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Finish the join.
+    CHK_TRUE( s2.fNet->handleRespFrom( s1_addr ) );
+    for (size_t ii = 0; ii < 20; ++ii)
+    {
+        s2.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+        if ( !s2.fNet->getNumPendingReqs(s1_addr) &&
+             !s2.fNet->getNumPendingResps(s1_addr) ) break;
+    }
+    for (size_t ii = 0; ii < 2; ++ii)
+    {
+        s2.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s2.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+    CHK_NONNULL( s2.raftServer->get_config()->get_server(s1.myId).get() );
+    CHK_FALSE( s1.raftServer->is_catching_up() );
+
+    const std::list<uint64_t>& r_idxs = s1.getTestSm()->getRollbackIdxs();
+    const std::list<uint64_t>& p_idxs = s1.getTestSm()->getPreCommitIdxs();
+    std::string r_str, p_str;
+    for (uint64_t idx: r_idxs) r_str += std::to_string(idx) + " ";
+    for (uint64_t idx: p_idxs) p_str += std::to_string(idx) + " ";
+    _msg("S1 rollback indices: %s\n", r_str.c_str());
+    _msg("S1 pre-commit indices: %s\n", p_str.c_str());
+
+    // S1 committed and rolled back only entries it had pre-committed, with
+    // the same payload.
+    CHK_Z( s1.getTestSm()->getNumCommitsWithoutPreCommit() );
+    CHK_Z( s1.getTestSm()->getNumRollbacksWithoutPreCommit() );
+    // S1 pre-committed and committed what the cluster did.
+    CHK_TRUE( s1.getTestSm()->isSame(*s2.getTestSm(), true) );
+    // S1 rolled back its replaced tail, backwards.
+    CHK_EQ( MORE1, r_idxs.size() );
+    for (uint64_t idx: r_idxs)
+    {
+        CHK_EQ( idx_after_div--, idx );
+    }
+    CHK_EQ( idx_before_div, idx_after_div );
 
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
@@ -3080,6 +3331,12 @@ int main(int argc, char** argv) {
 
     ts.doTest( "stale joiner response after role change test",
                stale_joiner_response_after_role_change_test );
+
+    ts.doTest( "log sync pre-commits entries test",
+               log_sync_pre_commits_entries_test );
+
+    ts.doTest( "log sync rolls back replaced entries test",
+               log_sync_rolls_back_replaced_entries_test );
 
     ts.doTest( "completed join response cannot affect later join test",
                completed_join_response_cannot_affect_later_join_test );
