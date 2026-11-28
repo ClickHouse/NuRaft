@@ -2192,6 +2192,15 @@ private:
                                  std::placeholders::_1,
                                  std::placeholders::_2 ),
                       use_strand_ ? &ssl_strand_ : nullptr );
+        } else if (flags & (INCLUDE_META | INCLUDE_HINT | INCLUDE_RESULT_CODE)) {
+            // The flags advertise meta/hint/result-code fields, but the response
+            // carries no body to parse them from. Reject it instead of reporting
+            // success with default field values (e.g. an unsent `OK` result code).
+            receive_timer_.cancel();
+            std::string err_msg =
+                sstrfmt( "received a malformed response from peer %d, %s:%s" )
+                    .fmt( req->get_dst(), host_.c_str(), port_.c_str() );
+            handle_error( req, err_msg, when_done );
         } else {
             post_read(req, rsp, when_done);
         }
@@ -2266,7 +2275,20 @@ private:
         }
 
         // 3) Context.
-        assert(remaining_len >= 0);
+        // A malformed response can declare meta/hint lengths that exceed the
+        // bytes actually received, making `remaining_len` negative; used as an
+        // unsigned size below it would wrap and allocate/copy a huge buffer.
+        // Reject such a response instead of trusting the declared lengths.
+        const int trailing_len =
+            (flags & INCLUDE_RESULT_CODE) ? (int)sizeof(int32_t) : 0;
+        if (remaining_len < trailing_len) {
+            receive_timer_.cancel();
+            std::string err_msg =
+                sstrfmt( "received a malformed response from peer %d, %s:%s" )
+                    .fmt( req->get_dst(), host_.c_str(), port_.c_str() );
+            handle_error( req, err_msg, when_done );
+            return;
+        }
         size_t ctx_len = remaining_len;
         if (flags & INCLUDE_RESULT_CODE) {
             ctx_len -= sizeof(int32_t);
