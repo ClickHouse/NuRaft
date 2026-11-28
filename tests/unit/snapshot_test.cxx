@@ -1657,6 +1657,241 @@ int snapshot_stops_stream_mode_test() {
     return 0;
 }
 
+int snapshot_install_discards_diverged_log_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    raft_params custom_params;
+    custom_params.election_timeout_lower_bound_ = 0;
+    custom_params.election_timeout_upper_bound_ = 1000;
+    custom_params.heart_beat_interval_ = 500;
+    custom_params.snapshot_distance_ = 100;
+    CHK_Z( launch_servers( pkgs, &custom_params ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        if (pp->raftServer->get_id() == 2) {
+            param.reserved_log_items_ = 0;
+        }
+        pp->raftServer->update_params(param);
+    }
+
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+    ptr<inmem_log_store> s1_log = s1.getTestMgr()->get_inmem_log_store();
+    uint64_t idx_before_div = s1_log->next_slot() - 1;
+
+    // S1 appends a config change and more logs that never leave it.
+    CHK_EQ( cmd_result_code::OK,
+            s1.raftServer->flip_learner_flag(3, true)->get_result_code() );
+    const size_t NUM_DIVERGED = 10;
+    for (size_t ii = 0; ii < NUM_DIVERGED; ++ii) {
+        s1.raftServer->append_entries
+            ( { make_test_msg("diverged" + std::to_string(ii)) } );
+    }
+    uint64_t s1_last_idx = s1_log->next_slot() - 1;
+    CHK_EQ( idx_before_div + 1 + NUM_DIVERGED, s1_last_idx );
+    CHK_TRUE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+
+    // S2 becomes the leader with S3's vote.
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    s3.fTimer->invoke( timer_task_type::election_timer );
+    s2.fNet->execReqResp( s3_addr );
+    s2.fNet->execReqResp( s3_addr );
+    s2.fNet->execReqResp( s3_addr );
+    s2.fNet->execReqResp( s3_addr );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    s2.fNet->makeReqFailAll( s1_addr );
+    s3.fNet->makeReqFailAll( s1_addr );
+    s3.fNet->makeReqFailAll( s2_addr );
+
+    // S1's requests are rejected for the old term, S1 becomes a follower.
+    s1.fNet->execReqResp();
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    // S2 commits new logs with S3, then creates a snapshot inside S1's
+    // diverged range and compacts its log up to it.
+    for (size_t ii = 0; ii < 5; ++ii) {
+        s2.raftServer->append_entries
+            ( { make_test_msg("new" + std::to_string(ii)) } );
+    }
+    for (size_t ii = 0; ii < 4; ++ii) {
+        s2.fNet->execReqResp( s3_addr );
+    }
+    s2.fNet->makeReqFailAll( s1_addr );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    uint64_t snp_idx = s2.raftServer->create_snapshot();
+    CHK_GT( snp_idx, idx_before_div + 1 );
+    CHK_GT( s1_last_idx, snp_idx );
+    CHK_EQ( snp_idx + 1,
+            s2.getTestMgr()->get_inmem_log_store()->start_index() );
+
+    for (size_t ii = 0; ii < 3; ++ii) {
+        s2.raftServer->append_entries
+            ( { make_test_msg("after" + std::to_string(ii)) } );
+    }
+    for (size_t ii = 0; ii < 4; ++ii) {
+        s2.fNet->execReqResp( s3_addr );
+    }
+    s2.fNet->makeReqFailAll( s1_addr );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // S2 sends its snapshot to S1.
+    size_t num_rollbacks = s1.getTestSm()->getRollbackIdxs().size();
+    s2.fNet->makeReqFailAll( s1_addr );
+    CHK_TRUE( s2.fNet->forceRecreatePeerRpc(s2.raftServer.get(), 1) );
+    s2.fNet->setPeerNextLogIdx(s2.raftServer.get(), 1, snp_idx);
+    s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+    do {
+        CHK_TRUE( s2.fNet->execReqResp( s1_addr ) );
+    } while (s1.raftServer->is_receiving_snapshot());
+    CHK_NONNULL( s1.getTestSm()->last_snapshot().get() );
+    CHK_EQ( snp_idx, s1.getTestSm()->last_snapshot()->get_last_log_idx() );
+
+    // The whole diverged log is gone, and its logs after the snapshot are
+    // rolled back in reverse order.
+    CHK_EQ( snp_idx + 1, s1_log->start_index() );
+    CHK_EQ( snp_idx + 1, s1_log->next_slot() );
+    CHK_FALSE( s1.fNet->isConfigChanging(s1.raftServer.get()) );
+    const std::list<uint64_t> r_idxs = s1.getTestSm()->getRollbackIdxs();
+    CHK_EQ( num_rollbacks + (s1_last_idx - snp_idx), r_idxs.size() );
+    auto r_itr = r_idxs.begin();
+    std::advance(r_itr, num_rollbacks);
+    for (uint64_t idx = s1_last_idx; idx > snp_idx; --idx) {
+        CHK_EQ( idx, *r_itr );
+        ++r_itr;
+    }
+
+    // S2 replicates the rest.
+    for (size_t ii = 0; ii < 4; ++ii) {
+        s2.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_EQ( s2.getTestMgr()->get_inmem_log_store()->next_slot(),
+            s1_log->next_slot() );
+    CHK_OK( s1.getTestSm()->isSame( *s2.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s2.getTestSm() ) );
+    CHK_EQ( r_idxs.size(), s1.getTestSm()->getRollbackIdxs().size() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int snapshot_install_keeps_log_continuing_snapshot_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        param.snapshot_distance_ = 100;
+        if (pp->raftServer->get_id() == 1) {
+            param.reserved_log_items_ = 0;
+        }
+        pp->raftServer->update_params(param);
+    }
+
+    CHK_Z( append_and_replicate(s1, pkgs, 0, 3) );
+    ptr<inmem_log_store> s2_log = s2.getTestMgr()->get_inmem_log_store();
+    uint64_t s2_commit_idx = s2.raftServer->get_committed_log_idx();
+
+    // S3 gets 3 new logs, S2 gets those and 3 more, both before S1 commits
+    // any of them.
+    CHK_TRUE( s1.fNet->makePeerBusy(s1.raftServer.get(), 2) );
+    for (size_t ii = 0; ii < 2; ++ii) {
+        std::vector< ptr<buffer> > msgs;
+        for (size_t jj = 0; jj < 3; ++jj) {
+            msgs.push_back
+                ( make_test_msg("new" + std::to_string(ii * 3 + jj)) );
+        }
+        CHK_TRUE( s1.raftServer->append_entries(msgs)->get_accepted() );
+    }
+    uint64_t last_idx = s1.getTestMgr()->get_inmem_log_store()->next_slot() - 1;
+    s1.fNet->setPeerFree(s1.raftServer.get(), 2);
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    CHK_TRUE( s1.fNet->delieverReqTo(s2_addr) );
+    CHK_EQ( last_idx + 1, s2_log->next_slot() );
+
+    // S1 commits the first 3 with S3 and creates a snapshot there.
+    CHK_TRUE( s1.fNet->execReqResp( s3_addr ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    uint64_t snp_idx = s1.raftServer->create_snapshot();
+    CHK_EQ( last_idx - 3, snp_idx );
+    CHK_GT( snp_idx, s2_commit_idx );
+    CHK_EQ( s2_commit_idx, s2.raftServer->get_committed_log_idx() );
+    CHK_EQ( snp_idx + 1, s1.getTestMgr()->get_inmem_log_store()->start_index() );
+
+    // Force the snapshot on S2, whose log continues it.
+    CHK_TRUE( s1.fNet->handleRespFrom(s2_addr) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    s1.fNet->makeReqFailAll( s2_addr );
+    CHK_TRUE( s1.fNet->forceRecreatePeerRpc(s1.raftServer.get(), 2) );
+    s1.fNet->setPeerNextLogIdx(s1.raftServer.get(), 2, snp_idx);
+    size_t num_rollbacks = s2.getTestSm()->getRollbackIdxs().size();
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    do {
+        CHK_TRUE( s1.fNet->execReqResp( s2_addr ) );
+    } while (s2.raftServer->is_receiving_snapshot());
+    CHK_NONNULL( s2.getTestSm()->last_snapshot().get() );
+    CHK_EQ( snp_idx, s2.getTestSm()->last_snapshot()->get_last_log_idx() );
+
+    CHK_EQ( snp_idx + 1, s2_log->start_index() );
+    CHK_EQ( last_idx + 1, s2_log->next_slot() );
+    CHK_EQ( num_rollbacks, s2.getTestSm()->getRollbackIdxs().size() );
+
+    for (size_t ii = 0; ii < 4; ++ii) {
+        s1.fNet->execReqResp();
+    }
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_OK( s2.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_OK( s3.getTestSm()->isSame( *s1.getTestSm() ) );
+    CHK_EQ( num_rollbacks, s2.getTestSm()->getRollbackIdxs().size() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int append_rejection_unmarked_ahead_next_index_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3132,6 +3367,12 @@ int main(int argc, char* argv[]) {
 
     ts.doTest( "snapshot stops stream mode test",
                snapshot_stops_stream_mode_test );
+
+    ts.doTest( "snapshot install discards diverged log test",
+               snapshot_install_discards_diverged_log_test );
+
+    ts.doTest( "snapshot install keeps log continuing snapshot test",
+               snapshot_install_keeps_log_continuing_snapshot_test );
 
     ts.doTest( "append rejection unmarked ahead next index test",
                append_rejection_unmarked_ahead_next_index_test );

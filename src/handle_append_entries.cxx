@@ -813,6 +813,39 @@ static void deny_not_rewind(resp_msg& resp) {
     resp.set_next_batch_size_hint_in_bytes(-1);
 }
 
+void raft_server::fail_pending_follower_resps() {
+    auto_lock(pending_follower_resps_lock_);
+    if (!pending_follower_resps_.empty()) {
+        p_in( "rollback: discarding %zu pending pipelined responses",
+            pending_follower_resps_.size() );
+        for (pending_follower_resp& resp: pending_follower_resps_) {
+            ptr<buffer> empty_buf;
+            ptr<std::exception> no_err;
+            resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
+        }
+        pending_follower_resps_.clear();
+    }
+}
+
+void raft_server::rollback_log_entry(ulong idx, ptr<log_entry>& entry) {
+    ptr<buffer> buf = entry->get_buf_ptr();
+    if (entry->get_val_type() == log_val_type::app_log) {
+        buf->pos(0);
+        state_machine_->rollback_ext
+            ( state_machine::ext_op_params( idx, buf, entry ) );
+        p_in( "rollback log %" PRIu64 ", term %" PRIu64,
+              idx, entry->get_term() );
+
+    } else if (entry->get_val_type() == log_val_type::conf) {
+        ptr<cluster_config> conf_to_rollback =
+            cluster_config::deserialize(*buf);
+        state_machine_->rollback_config(idx, conf_to_rollback);
+        p_in( "revert from a prev config change to config at %" PRIu64,
+              get_config()->get_log_idx() );
+        config_changing_ = false;
+    }
+}
+
 ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     ptr<raft_params> params = ctx_->get_params();
@@ -1185,39 +1218,12 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
             // Fail any pending async append_entries requests: any entries they refer to
             // are likely being rolled back, and leader term has changed.
-            {
-                auto_lock(pending_follower_resps_lock_);
-                if (!pending_follower_resps_.empty()) {
-                    p_in( "rollback: discarding %zu pending pipelined responses",
-                        pending_follower_resps_.size() );
-                    for (pending_follower_resp& resp: pending_follower_resps_) {
-                        ptr<buffer> empty_buf;
-                        ptr<std::exception> no_err;
-                        resp.promise->set_result(empty_buf, no_err, cmd_result_code::TERM_MISMATCH);
-                    }
-                    pending_follower_resps_.clear();
-                }
-            }
+            fail_pending_follower_resps();
 
             for ( uint64_t ii = 0; ii < my_last_log_idx - log_idx + 1; ++ii ) {
                 uint64_t idx = my_last_log_idx - ii;
                 ptr<log_entry> old_entry = log_store_->entry_at(idx);
-                ptr<buffer> buf = old_entry->get_buf_ptr();
-                if (old_entry->get_val_type() == log_val_type::app_log) {
-                    buf->pos(0);
-                    state_machine_->rollback_ext
-                        ( state_machine::ext_op_params( idx, buf, old_entry ) );
-                    p_in( "rollback log %" PRIu64 ", term %" PRIu64,
-                          idx, old_entry->get_term() );
-
-                } else if (old_entry->get_val_type() == log_val_type::conf) {
-                    ptr<cluster_config> conf_to_rollback =
-                        cluster_config::deserialize(*buf);
-                    state_machine_->rollback_config(idx, conf_to_rollback);
-                    p_in( "revert from a prev config change to config at %" PRIu64,
-                          get_config()->get_log_idx() );
-                    config_changing_ = false;
-                }
+                rollback_log_entry(idx, old_entry);
             }
         }
 
