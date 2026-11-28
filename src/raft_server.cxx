@@ -828,6 +828,19 @@ ptr<resp_msg> raft_server::process_req(req_msg& req,
         return nullptr;
     }
 
+    if ( req.get_type() == msg_type::request_vote_request &&
+         !is_known_cluster_member(req.get_src()) ) {
+        // A vote request from a server that is not part of this cluster must not
+        // reach `update_term`: otherwise an unconfigured sender can push our
+        // persisted term to an arbitrary value (e.g. `UINT64_MAX`, which later
+        // wraps to 0 on `inc_term`) and leave the cluster unable to elect a
+        // leader. Membership includes in-flight changes (see the helper) so a
+        // member being added can still win an election.
+        p_wn("received a vote request from unconfigured peer %d (term %" PRIu64
+             "), ignoring", req.get_src(), req.get_term());
+        return nullptr;
+    }
+
     if ( req.get_type() == msg_type::append_entries_request ||
          req.get_type() == msg_type::request_vote_request ||
          req.get_type() == msg_type::install_snapshot_request ) {
@@ -1813,6 +1826,42 @@ void raft_server::become_follower() {
     }
 
     restart_election_timer();
+}
+
+bool raft_server::is_known_cluster_member(int32 srv_id) {
+    // Caller holds `lock_`. A server is a member if it is in the active config,
+    // the pending (uncommitted) config, or the newest not-yet-committed
+    // configuration entry in the log. A follower that receives a membership change
+    // by replication keeps the pending config in its log (it does not populate
+    // `uncommitted_config_`), so the log is consulted to recognise a voter whose
+    // addition is still in flight. A crafted sender absent from every config is
+    // not a member.
+    if (get_config()->get_server(srv_id)) return true;
+    if (uncommitted_config_ && uncommitted_config_->get_server(srv_id)) return true;
+
+    // Only a config change in flight can leave a pending config in the log that
+    // is not yet in the active config; skip the scan otherwise so a large
+    // unapplied backlog is not walked on every request.
+    if (config_changing_)
+    {
+        // Walk back from the log tail to the first (newest) configuration entry:
+        // that is the authoritative pending membership. Ignore any entry that is
+        // not newer than the active config (a superseded config can appear in the
+        // unapplied range during recovery and must not re-admit a removed voter).
+        const ulong active_log_idx = get_config()->get_log_idx();
+        const ulong lower = sm_commit_index_ + 1;
+        for (ulong ii = log_store_->next_slot(); ii > lower; --ii)
+        {
+            const ulong idx = ii - 1;
+            if (!log_store_->is_conf(idx)) continue;
+            ptr<log_entry> le = log_store_->entry_at(idx);
+            le->get_buf().pos(0);
+            ptr<cluster_config> conf = cluster_config::deserialize(le->get_buf());
+            if (conf->get_log_idx() <= active_log_idx) break;
+            return conf->get_server(srv_id) != nullptr;
+        }
+    }
+    return false;
 }
 
 bool raft_server::update_term(ulong term) {
