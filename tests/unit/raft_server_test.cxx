@@ -19,6 +19,7 @@ limitations under the License.
 #include "fake_network.hxx"
 #include "raft_package_fake.hxx"
 #include "fake_executer.hxx"
+#include "handle_custom_notification.hxx"
 
 #include "event_awaiter.hxx"
 #include "raft_params.hxx"
@@ -1304,6 +1305,471 @@ int rejoin_discards_pending_removal_config_test()
     CHK_NULL(next_removal->get_server(s1.myId).get());
     CHK_NONNULL(next_removal->get_server(s2.myId).get());
     CHK_NONNULL(next_removal->get_server(s3.myId).get());
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+// S1 leads S1, S2 and S3, then hands leadership over to S2. On return S2 leads
+// in `new_term` > `old_term`, and S3 has voted for S2 and follows it.
+static int hand_leadership_to_s2(const std::vector<RaftPkg*>& pkgs,
+                                 ulong& old_term,
+                                 ulong& new_term)
+{
+    RaftPkg& s1 = *pkgs[0];
+    RaftPkg& s2 = *pkgs[1];
+    RaftPkg& s3 = *pkgs[2];
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+    old_term = s1.raftServer->get_term();
+
+    s1.raftServer->yield_leadership(false, s2.myId);
+    s1.fTimer->invoke(timer_task_type::heartbeat_timer);
+    s1.fNet->execReqResp();
+    s1.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    // Commit S2's first log entry, so that S3 follows S2 and S2 can change
+    // the configuration.
+    for (size_t ii = 0; ii < 2; ++ii) {
+        s2.fTimer->invoke(timer_task_type::heartbeat_timer);
+        s2.fNet->execReqResp();
+        s2.fNet->execReqResp();
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    new_term = s2.raftServer->get_term();
+    CHK_GT( new_term, old_term );
+    CHK_FALSE( s2.fNet->isConfigChanging(s2.raftServer.get()) );
+    CHK_EQ( new_term, s3.raftServer->get_term() );
+    CHK_EQ( s2.myId, s3.getTestMgr()->read_state()->get_voted_for() );
+    CHK_EQ( s2.myId, s3.raftServer->get_leader() );
+    return 0;
+}
+
+// Delivers `req` from `src` to `dst` the way a delayed packet arrives, and
+// handles the response.
+static int deliver_by_hand(RaftPkg& src,
+                           RaftPkg& dst,
+                           ptr<req_msg> req,
+                           bool& accepted)
+{
+    bool responded = false;
+    rpc_handler handler = [&](ptr<resp_msg>& resp, ptr<rpc_exception>&) {
+        responded = resp != nullptr;
+        accepted = resp && resp->get_accepted();
+    };
+    ptr<FakeClient> client = src.fNet->findClient(dst.myEndpoint);
+    CHK_NONNULL( client.get() );
+    CHK_EQ( 0, src.fNet->getNumPendingReqs(dst.myEndpoint) );
+    client->send(req, handler);
+    CHK_TRUE( src.fNet->delieverReqTo(dst.myEndpoint) );
+    CHK_TRUE( src.fNet->handleRespFrom(dst.myEndpoint) );
+    CHK_TRUE( responded );
+    return 0;
+}
+
+// A join request from `src` in `term`, carrying `src`'s configuration.
+static ptr<req_msg> make_join_req(RaftPkg& src, RaftPkg& dst, ulong term)
+{
+    ptr<req_msg> req = cs_new<req_msg>(
+        term,
+        msg_type::join_cluster_request,
+        src.myId,
+        dst.myId,
+        0,
+        src.raftServer->get_last_log_idx(),
+        src.raftServer->get_committed_log_idx());
+    req->log_entries().push_back(
+        cs_new<log_entry>(term,
+                          src.raftServer->get_config()->serialize(),
+                          log_val_type::conf));
+    return req;
+}
+
+// A custom notification from `src` in `term`, built as the leader builds it.
+static ptr<req_msg> make_notification_req(RaftPkg& src,
+                                          RaftPkg& dst,
+                                          ulong term,
+                                          custom_notification_msg::type type,
+                                          ptr<buffer> ctx = nullptr)
+{
+    ptr<req_msg> req = cs_new<req_msg>(
+        term,
+        msg_type::custom_notification_request,
+        src.myId,
+        dst.myId,
+        0,
+        src.raftServer->get_last_log_idx(),
+        src.raftServer->get_committed_log_idx());
+    ptr<custom_notification_msg> msg = cs_new<custom_notification_msg>(type);
+    msg->ctx_ = ctx;
+    req->log_entries().push_back(
+        cs_new<log_entry>(0, msg->serialize(), log_val_type::custom));
+    return req;
+}
+
+int stale_term_join_request_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    ulong old_term = 0;
+    ulong new_term = 0;
+    CHK_Z( hand_leadership_to_s2(pkgs, old_term, new_term) );
+
+    // S1's join request from `old_term`, sent before S1 lost leadership,
+    // arrives at S3. S3 keeps its term, its vote and its leader.
+    bool accepted = true;
+    CHK_Z( deliver_by_hand(s1, s3, make_join_req(s1, s3, old_term), accepted) );
+    CHK_EQ( new_term, s3.raftServer->get_term() );
+    CHK_EQ( new_term, s3.getTestMgr()->read_state()->get_term() );
+    CHK_EQ( s2.myId, s3.getTestMgr()->read_state()->get_voted_for() );
+    CHK_EQ( s2.myId, s3.raftServer->get_leader() );
+    CHK_FALSE( accepted );
+
+    // S3 cannot vote twice in `new_term`: it denies S1 first, then grants the
+    // same request to S2, which it voted for, so the denial is not the log check.
+    auto make_vote_req = [&](RaftPkg& candidate) {
+        return cs_new<req_msg>(new_term,
+                               msg_type::request_vote_request,
+                               candidate.myId,
+                               s3.myId,
+                               s3.raftServer->get_last_log_term(),
+                               s3.raftServer->get_last_log_idx(),
+                               s3.raftServer->get_committed_log_idx());
+    };
+    CHK_Z( deliver_by_hand(s1, s3, make_vote_req(s1), accepted) );
+    CHK_FALSE( accepted );
+    CHK_Z( deliver_by_hand(s2, s3, make_vote_req(s2), accepted) );
+    CHK_TRUE( accepted );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_join_mutual_add_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    // Two single-node clusters whose terms are unrelated: S2's is higher.
+    auto init_cb = [&](RaftPkg* pp) {
+        if (pp == &s2) {
+            pp->getTestMgr()->save_state(srv_state(5, -1, true, false, false));
+        }
+    };
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb_default, init_cb ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_GT( s2.raftServer->get_term(), s1.raftServer->get_term() );
+
+    // They add each other at the same time, as in `add_node_race_test`.
+    // The lower ID wins even though its term is lower.
+    s1.raftServer->add_srv( *(s2.getTestMgr()->get_srv_config()) );
+    s2.raftServer->add_srv( *(s1.getTestMgr()->get_srv_config()) );
+    s1.fNet->delieverReqTo(s2_addr);
+    s2.fNet->delieverStaleReqTo(s1_addr);
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    s1.fNet->handleRespFrom(s2_addr);
+    s2.fNet->handleRespFrom(s1_addr);
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    for (size_t ii = 0; ii < 5; ++ii) {
+        s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+        s1.fNet->delieverReqTo(s2_addr);
+        s2.fNet->delieverReqTo(s1_addr);
+        s1.fNet->handleRespFrom(s2_addr);
+        s2.fNet->handleRespFrom(s1_addr);
+        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    }
+
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+    CHK_EQ( s1.myId, s2.raftServer->get_leader() );
+    CHK_EQ( 2, s1.raftServer->get_config()->get_servers().size() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_join_standalone_server_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    // S2 starts alone in its configuration with a higher term than S1's.
+    auto init_cb = [&](RaftPkg* pp) {
+        if (pp == &s2) {
+            pp->getTestMgr()->save_state(srv_state(5, -1, true, false, false));
+        }
+    };
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb_default, init_cb ) );
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_GT( s2.raftServer->get_term(), s1.raftServer->get_term() );
+
+    // Only S1 adds S2. S2 accepts the join from S1's lower term.
+    CHK_Z( make_group( {&s1, &s2} ) );
+
+    CHK_TRUE( s1.raftServer->is_leader() );
+    CHK_FALSE( s2.raftServer->is_leader() );
+    CHK_EQ( s1.myId, s2.raftServer->get_leader() );
+    CHK_EQ( 2, s1.raftServer->get_config()->get_servers().size() );
+    CHK_EQ( s1.raftServer->get_term(), s2.raftServer->get_term() );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_join_while_adding_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    ulong old_term = 0;
+    ulong new_term = 0;
+    CHK_Z( hand_leadership_to_s2(pkgs, old_term, new_term) );
+
+    // S2 is adding S4, and its join request to S4 is not delivered yet.
+    CHK_Z( launch_servers( {&s4} ) );
+    ptr<raft_result> ret =
+        s2.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+    CHK_TRUE( ret->get_accepted() );
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s4.myEndpoint) );
+    int voted_for = s2.getTestMgr()->read_state()->get_voted_for();
+
+    // S1's join request from `old_term` comes from a lower ID than S2's, but
+    // S2 is not adding S1, so S2 keeps its leadership and its term.
+    bool accepted = true;
+    CHK_Z( deliver_by_hand(s1, s2, make_join_req(s1, s2, old_term), accepted) );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_EQ( new_term, s2.raftServer->get_term() );
+    CHK_EQ( voted_for, s2.getTestMgr()->read_state()->get_voted_for() );
+    CHK_FALSE( accepted );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_catch_up_requests_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    RaftPkg s4(f_base, 4, "S4");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    ulong old_term = 0;
+    ulong new_term = 0;
+    CHK_Z( hand_leadership_to_s2(pkgs, old_term, new_term) );
+
+    // S4 accepts S2's join and catches up under S2 in `new_term`.
+    CHK_Z( launch_servers( {&s4} ) );
+    CHK_Z( wait_for_sm_exec( {&s4}, COMMIT_TIMEOUT_SEC ) );
+    ptr<raft_result> ret =
+        s2.raftServer->add_srv( *(s4.getTestMgr()->get_srv_config()) );
+    CHK_TRUE( ret->get_accepted() );
+    CHK_TRUE( s2.fNet->delieverReqTo(s4.myEndpoint) );
+    CHK_TRUE( s2.fNet->handleRespFrom(s4.myEndpoint) );
+    CHK_TRUE( s4.getTestMgr()->read_state()->is_catching_up() );
+    CHK_EQ( new_term, s4.raftServer->get_term() );
+
+    // Catch-up requests that S1 sent while it was adding S4 in `old_term`
+    // arrive now. S4 ignores them.
+    s1.fNet->create_client(s4.myEndpoint);
+    ulong last_idx = s4.raftServer->get_last_log_idx();
+    ulong commit_idx = s4.raftServer->get_target_committed_log_idx();
+    ptr<log_store> s1_log = s1.getTestMgr()->load_log_store();
+    CHK_GT( s1_log->next_slot(), last_idx + 1 );
+
+    // (a) A log sync request.
+    ptr<req_msg> sync_req = cs_new<req_msg>(
+        old_term,
+        msg_type::sync_log_request,
+        s1.myId,
+        s4.myId,
+        0,
+        last_idx,
+        s1.raftServer->get_committed_log_idx());
+    sync_req->log_entries().push_back(
+        cs_new<log_entry>(old_term,
+                          s1_log->pack(last_idx + 1,
+                                       s1_log->next_slot() - last_idx - 1),
+                          log_val_type::log_pack));
+    bool accepted = true;
+    CHK_Z( deliver_by_hand(s1, s4, sync_req, accepted) );
+    CHK_EQ( last_idx, s4.raftServer->get_last_log_idx() );
+    CHK_EQ( commit_idx, s4.raftServer->get_target_committed_log_idx() );
+    CHK_FALSE( accepted );
+
+    // (b) The first object of a snapshot newer than S4's commit index.
+    ulong snp_idx = s1.raftServer->get_committed_log_idx();
+    CHK_GT( snp_idx, s4.raftServer->get_target_committed_log_idx() );
+    ptr<snapshot> snp = cs_new<snapshot>(snp_idx,
+                                         s1_log->term_at(snp_idx),
+                                         s1.raftServer->get_config());
+    ptr<buffer> snp_data = buffer::alloc(sizeof(ulong) * 2);
+    buffer_serializer bs(snp_data);
+    bs.put_u64(1);
+    bs.put_u64(snp_idx);
+    snapshot_sync_req snp_sync(snp, 0, snp_data, false);
+    ptr<req_msg> snp_req = cs_new<req_msg>(
+        old_term,
+        msg_type::install_snapshot_request,
+        s1.myId,
+        s4.myId,
+        snp->get_last_log_term(),
+        snp->get_last_log_idx(),
+        s1.raftServer->get_committed_log_idx());
+    snp_req->log_entries().push_back(
+        cs_new<log_entry>(old_term,
+                          snp_sync.serialize(),
+                          log_val_type::snp_sync_req));
+    CHK_FALSE( s4.getTestMgr()->read_state()->is_receiving_snapshot() );
+    accepted = true;
+    CHK_Z( deliver_by_hand(s1, s4, snp_req, accepted) );
+    CHK_FALSE( s4.getTestMgr()->read_state()->is_receiving_snapshot() );
+    CHK_FALSE( accepted );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    s4.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_leave_request_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    ulong old_term = 0;
+    ulong new_term = 0;
+    CHK_Z( hand_leadership_to_s2(pkgs, old_term, new_term) );
+
+    // S1's leave request from `old_term` arrives at S3. S3 does not step down
+    // after the two election timeouts that a removal waits for.
+    ptr<req_msg> leave_req = cs_new<req_msg>(
+        old_term,
+        msg_type::leave_cluster_request,
+        s1.myId,
+        s3.myId,
+        0,
+        s1.raftServer->get_last_log_idx(),
+        s1.raftServer->get_committed_log_idx());
+    bool accepted = true;
+    CHK_Z( deliver_by_hand(s1, s3, leave_req, accepted) );
+    CHK_EQ( 0, s3.fNet->getStepsToDown(s3.raftServer.get()) );
+    s3.fTimer->invoke(timer_task_type::election_timer);
+    s3.fTimer->invoke(timer_task_type::election_timer);
+    CHK_TRUE( s3.getTestMgr()->read_state()->is_election_timer_allowed() );
+    CHK_FALSE( accepted );
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+    f_base->destroy();
+
+    return 0;
+}
+
+int stale_term_leader_notifications_test()
+{
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    RaftPkg s1(f_base, 1, "S1");
+    RaftPkg s2(f_base, 2, "S2");
+    RaftPkg s3(f_base, 3, "S3");
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    ulong old_term = 0;
+    ulong new_term = 0;
+    CHK_Z( hand_leadership_to_s2(pkgs, old_term, new_term) );
+
+    // S1's out-of-log-range warning from `old_term` does not mark S3 out of
+    // log range.
+    out_of_log_msg ool_msg;
+    ool_msg.start_idx_of_leader_ = s1.raftServer->get_last_log_idx() + 1;
+    bool accepted = false;
+    CHK_Z( deliver_by_hand(
+               s1, s3,
+               make_notification_req(s1, s3, old_term,
+                                     custom_notification_msg::out_of_log_range_warning,
+                                     ool_msg.serialize()),
+               accepted) );
+    CHK_FALSE( s3.fNet->isServerOutOfLogRange(s3.raftServer.get()) );
+
+    // S1's leadership takeover request from `old_term` does not make S3 start
+    // an election.
+    CHK_EQ( 0, s3.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_EQ( 0, s3.fNet->getNumPendingReqs(s2.myEndpoint) );
+    CHK_Z( deliver_by_hand(
+               s1, s3,
+               make_notification_req(s1, s3, old_term,
+                                     custom_notification_msg::leadership_takeover),
+               accepted) );
+    CHK_EQ( new_term, s3.raftServer->get_term() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+    CHK_EQ( 0, s3.fNet->getNumPendingReqs(s1.myEndpoint) );
+    CHK_EQ( 0, s3.fNet->getNumPendingReqs(s2.myEndpoint) );
 
     s1.raftServer->shutdown();
     s2.raftServer->shutdown();
@@ -3071,6 +3537,27 @@ int main(int argc, char** argv) {
 
     ts.doTest( "rejoin discards pending removal config test",
                rejoin_discards_pending_removal_config_test );
+
+    ts.doTest( "stale term join request test",
+               stale_term_join_request_test );
+
+    ts.doTest( "stale term join mutual add test",
+               stale_term_join_mutual_add_test );
+
+    ts.doTest( "stale term join standalone server test",
+               stale_term_join_standalone_server_test );
+
+    ts.doTest( "stale term join while adding test",
+               stale_term_join_while_adding_test );
+
+    ts.doTest( "stale term catch up requests test",
+               stale_term_catch_up_requests_test );
+
+    ts.doTest( "stale term leave request test",
+               stale_term_leave_request_test );
+
+    ts.doTest( "stale term leader notifications test",
+               stale_term_leader_notifications_test );
 
     ts.doTest( "deferred free from replaced RPC cannot free new request test",
                deferred_free_from_replaced_rpc_cannot_free_new_request_test );

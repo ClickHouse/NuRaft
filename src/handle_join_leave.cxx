@@ -166,6 +166,17 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
         return resp;
     }
 
+    // A server alone in its configuration forms its own cluster:
+    // its term is unrelated to the sender's.
+    ptr<cluster_config> my_conf = get_config();
+    bool own_cluster = my_conf->get_servers().size() == 1 && my_conf->get_server(id_);
+    if (!own_cluster && req.get_term() < state_->get_term()) {
+        p_wn("ignore join cluster request from %d with stale term %" PRIu64
+             ", my term %" PRIu64,
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     // Handle Race Condition: Simultaneous Add Server
     // Problem: Two single-node clusters try to add each other at the same time.
     // Both set srv_to_join_ (busy state) and send JoinRequests.
@@ -418,6 +429,13 @@ ptr<resp_msg> raft_server::handle_log_sync_req(req_msg& req) {
         return resp;
     }
 
+    if (req.get_term() < state_->get_term()) {
+        p_wn("ignore log sync request from %d with stale term %" PRIu64
+             ", my term %" PRIu64,
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     if (!state_->is_catching_up()) {
         p_wn("This server is ready for cluster, ignore the request, "
              "my next log idx %" PRIu64 "", resp->get_next_idx());
@@ -539,6 +557,13 @@ ptr<resp_msg> raft_server::handle_leave_cluster_req(req_msg& req) {
                             msg_type::leave_cluster_response,
                             id_,
                             req.get_src() ) );
+    if (req.get_term() < state_->get_term()) {
+        p_wn("ignore leave cluster request from %d with stale term %" PRIu64
+             ", my term %" PRIu64,
+             req.get_src(), req.get_term(), state_->get_term());
+        return resp;
+    }
+
     if (!config_changing_) {
         p_db("leave cluster, set steps to down to 2");
         // NOTE: We don't call `RemovedFromCluster` callback here,
