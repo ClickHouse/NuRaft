@@ -234,6 +234,16 @@ ptr< cmd_result< ptr<buffer> > > raft_server::send_msg_to_leader
     bool is_blocking_mode = (params->return_method_ == raft_params::blocking);
 
     ptr<cluster_config> c_conf = get_config();
+    // `nullptr` if the leader is not in the config or no client can be created.
+    auto connect_to_leader = [this, &c_conf, leader_id]() -> ptr<rpc_client> {
+        ptr<srv_config> srv_conf = c_conf->get_server(leader_id);
+        if (!srv_conf) {
+            p_wn("cannot forward the request: leader %d is not in the cluster config",
+                 leader_id);
+            return nullptr;
+        }
+        return ctx_->rpc_cli_factory_->create_client(srv_conf->get_endpoint());
+    };
     ptr<rpc_client> rpc_cli;
     ptr<auto_fwd_pkg> cur_pkg = nullptr;
     {
@@ -264,9 +274,8 @@ ptr< cmd_result< ptr<buffer> > > raft_server::send_msg_to_leader
             if ( cur_pkg->rpc_client_idle_.size() +
                  cur_pkg->rpc_client_in_use_.size() < max_conns ) {
                 // We can create more connections.
-                ptr<srv_config> srv_conf = c_conf->get_server(leader_id);
-                rpc_cli = ctx_->rpc_cli_factory_->create_client
-                          ( srv_conf->get_endpoint() );
+                rpc_cli = connect_to_leader();
+                if (!rpc_cli) break;
                 cur_pkg->rpc_client_in_use_.insert(rpc_cli);
                 p_tr("created a new connection %" PRIu64, rpc_cli->get_id());
 
@@ -299,9 +308,8 @@ ptr< cmd_result< ptr<buffer> > > raft_server::send_msg_to_leader
             rpc_cli = *e_rpc;
             if (rpc_cli->is_abandoned()) {
                 // Abandoned connection, need to reconnect.
-                ptr<srv_config> srv_conf = c_conf->get_server(leader_id);
-                rpc_cli = ctx_->rpc_cli_factory_->create_client
-                          ( srv_conf->get_endpoint() );
+                rpc_cli = connect_to_leader();
+                if (!rpc_cli) break;
             }
             cur_pkg->rpc_client_idle_.pop_front();
             cur_pkg->rpc_client_in_use_.insert(rpc_cli);
@@ -311,7 +319,7 @@ ptr< cmd_result< ptr<buffer> > > raft_server::send_msg_to_leader
     } while(true);
 
     if (!rpc_cli) {
-        return cs_new< cmd_result< ptr<buffer> > >(result);
+        return cs_new< cmd_result< ptr<buffer> > >(result, cmd_result_code::NOT_LEADER);
     }
 
     ptr< cmd_result< ptr<buffer> > >
