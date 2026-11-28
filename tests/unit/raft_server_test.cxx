@@ -1895,6 +1895,246 @@ int custom_user_context_test() {
     return 0;
 }
 
+ptr<srv_config> srv_config_with_aux(RaftPkg& leader,
+                                    int32 srv_id,
+                                    const std::string& aux)
+{
+    ptr<srv_config> s_conf = leader.raftServer->get_srv_config(srv_id);
+    return cs_new<srv_config>( s_conf->get_id(),
+                               s_conf->get_dc_id(),
+                               s_conf->get_endpoint(),
+                               aux,
+                               s_conf->is_learner(),
+                               s_conf->get_priority() );
+}
+
+int commit_all(RaftPkg& leader, const std::vector<RaftPkg*>& pkgs) {
+    CHK_Z( drain_and_commit(leader, pkgs) );
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( leader.raftServer->get_last_log_idx(),
+                pp->raftServer->get_committed_log_idx() );
+    }
+    return 0;
+}
+
+int update_srv_config_blocks_overlapping_change_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Flip S3 to learner while the update of S2 is not committed.
+    CHK_TRUE( s1.raftServer->update_srv_config(*srv_config_with_aux(s1, 2, "a2")) );
+    cmd_result_code rc = s1.raftServer->flip_learner_flag(3, true)->get_result_code();
+    CHK_Z( commit_all(s1, pkgs) );
+    if (rc == cmd_result_code::CONFIG_CHANGING) {
+        CHK_EQ( cmd_result_code::OK,
+                s1.raftServer->flip_learner_flag(3, true)->get_result_code() );
+        CHK_Z( commit_all(s1, pkgs) );
+    }
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("a2"),
+                pp->raftServer->get_config()->get_server(2)->get_aux() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_TRUE( pp->raftServer->get_config()->get_server(3)->is_learner() );
+    }
+    CHK_EQ( cmd_result_code::CONFIG_CHANGING, rc );
+
+    // Set a user context while the next update of S2 is not committed.
+    CHK_TRUE( s1.raftServer->update_srv_config(*srv_config_with_aux(s1, 2, "b2")) );
+    s1.raftServer->set_user_ctx("ctx");
+    CHK_Z( commit_all(s1, pkgs) );
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("b2"),
+                pp->raftServer->get_config()->get_server(2)->get_aux() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("ctx"), pp->raftServer->get_user_ctx() );
+    }
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int pending_config_change_is_not_reverted_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Update S2 and set a user context while the flip of S3 is not committed.
+    ptr<raft_result> flip = s1.raftServer->flip_learner_flag(3, true);
+    CHK_EQ( cmd_result_code::OK, flip->get_result_code() );
+    bool flip_accepted = flip->get_accepted();
+    bool updated = s1.raftServer->update_srv_config(*srv_config_with_aux(s1, 2, "a2"));
+    s1.raftServer->set_user_ctx("ctx");
+    CHK_Z( commit_all(s1, pkgs) );
+    if (!updated) {
+        CHK_TRUE( s1.raftServer->update_srv_config(*srv_config_with_aux(s1, 2, "a2")) );
+        CHK_Z( commit_all(s1, pkgs) );
+    }
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_TRUE( pp->raftServer->get_config()->get_server(3)->is_learner() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("ctx"), pp->raftServer->get_user_ctx() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("a2"),
+                pp->raftServer->get_config()->get_server(2)->get_aux() );
+    }
+    CHK_FALSE( updated );
+    CHK_TRUE( flip_accepted );
+
+    // A flip to the current value appends nothing.
+    ulong last_idx = s1.raftServer->get_last_log_idx();
+    ptr<raft_result> noop_flip = s1.raftServer->flip_learner_flag(3, true);
+    CHK_EQ( cmd_result_code::OK, noop_flip->get_result_code() );
+    CHK_TRUE( noop_flip->get_accepted() );
+    CHK_EQ( last_idx, s1.raftServer->get_last_log_idx() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int config_change_builds_on_pending_user_ctx_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Update S2 while the user context is not committed.
+    s1.raftServer->set_user_ctx("c1");
+    CHK_TRUE( s1.raftServer->update_srv_config(*srv_config_with_aux(s1, 2, "a2")) );
+    CHK_Z( commit_all(s1, pkgs) );
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("c1"), pp->raftServer->get_user_ctx() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("a2"),
+                pp->raftServer->get_config()->get_server(2)->get_aux() );
+    }
+
+    // Flip S3 to learner while the next user context is not committed.
+    s1.raftServer->set_user_ctx("c2");
+    CHK_EQ( cmd_result_code::OK,
+            s1.raftServer->flip_learner_flag(3, true)->get_result_code() );
+    CHK_Z( commit_all(s1, pkgs) );
+
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("c2"), pp->raftServer->get_user_ctx() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_TRUE( pp->raftServer->get_config()->get_server(3)->is_learner() );
+    }
+    for (RaftPkg* pp: pkgs) {
+        CHK_EQ( std::string("a2"),
+                pp->raftServer->get_config()->get_server(2)->get_aux() );
+    }
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
+int user_ctx_on_follower_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (RaftPkg* pp: pkgs) {
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    // The follower's call must not take the slot of the leader's next entry.
+    s2.raftServer->set_user_ctx("x");
+    CHK_TRUE( append_one(s1, 8)->get_accepted() );
+    ulong appended_idx = s1.raftServer->get_last_log_idx();
+    CHK_Z( commit_all(s1, pkgs) );
+    CHK_GTEQ( s1.getTestSm()->last_commit_index(), appended_idx );
+
+    CHK_TRUE( s2.getTestSm()->isSame(*s1.getTestSm()) );
+    CHK_EQ( s1.raftServer->get_user_ctx(), s2.raftServer->get_user_ctx() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int follower_reconnect_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -3095,6 +3335,18 @@ int main(int argc, char** argv) {
 
     ts.doTest( "custom user context test",
                custom_user_context_test );
+
+    ts.doTest( "update srv config blocks overlapping change test",
+               update_srv_config_blocks_overlapping_change_test );
+
+    ts.doTest( "pending config change is not reverted test",
+               pending_config_change_is_not_reverted_test );
+
+    ts.doTest( "config change builds on pending user ctx test",
+               config_change_builds_on_pending_user_ctx_test );
+
+    ts.doTest( "user ctx on follower test",
+               user_ctx_on_follower_test );
 
     ts.doTest( "follower reconnect test",
                follower_reconnect_test );

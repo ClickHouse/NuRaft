@@ -2056,8 +2056,20 @@ ulong raft_server::term_for_log(ulong log_idx) {
 }
 
 void raft_server::set_user_ctx(const std::string& ctx) {
+    recur_lock(lock_);
+    if (!is_leader()) {
+        p_er("cannot set user context: this node is not a leader");
+        return;
+    }
+
     // Clone current cluster config.
     ptr<cluster_config> c_conf = get_config();
+    if (uncommitted_config_) {
+        p_in("uncommitted config exists at log %" PRIu64 ", prev log %" PRIu64,
+             uncommitted_config_->get_log_idx(),
+             uncommitted_config_->get_prev_log_idx());
+        c_conf = uncommitted_config_;
+    }
     ptr<buffer> enc_conf = c_conf->serialize();
     ptr<cluster_config> cloned_config = cluster_config::deserialize(*enc_conf);
 
@@ -2072,6 +2084,10 @@ void raft_server::set_user_ctx(const std::string& ctx) {
                              log_val_type::conf,
                              timer_helper::get_timeofday_us() );
     store_log_entry(entry);
+
+    // A user context change does not block a membership change.
+    uncommitted_config_ = cloned_config;
+
     request_append_entries();
 }
 
@@ -2117,13 +2133,25 @@ void raft_server::get_srv_config_all
 }
 
 bool raft_server::update_srv_config(const srv_config& new_config) {
+    recur_lock(lock_);
     if (!is_leader()) {
         p_er("cannot update server config: this node is not a leader");
         return false;
     }
 
+    if (config_changing_) {
+        p_wn("cannot update server config: previous config has not committed yet");
+        return false;
+    }
+
     // Clone current cluster config.
     ptr<cluster_config> c_conf = get_config();
+    if (uncommitted_config_) {
+        p_in("uncommitted config exists at log %" PRIu64 ", prev log %" PRIu64,
+             uncommitted_config_->get_log_idx(),
+             uncommitted_config_->get_prev_log_idx());
+        c_conf = uncommitted_config_;
+    }
     ptr<buffer> enc_conf = c_conf->serialize();
     ptr<cluster_config> cloned_config = cluster_config::deserialize(*enc_conf);
 
@@ -2173,6 +2201,8 @@ bool raft_server::update_srv_config(const srv_config& new_config) {
                              log_val_type::conf,
                              timer_helper::get_timeofday_us() );
     store_log_entry(entry);
+    config_changing_ = true;
+    uncommitted_config_ = cloned_config;
     request_append_entries();
 
     p_in("appended new server config for server %d",
